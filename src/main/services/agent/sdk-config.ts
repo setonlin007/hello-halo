@@ -19,6 +19,7 @@ import {
 } from '../../openai-compat-router'
 import type { ApiCredentials, ResolvedModelCapabilities } from './types'
 import { inferOpenAIWireApi, credentialsToBackendConfig, getHeadlessElectronPath } from './helpers'
+import { shouldProxyHost } from '../proxy-fetch'
 import { resolveModelId } from '../../../shared/types/ai-sources'
 import { buildSystemPrompt, DEFAULT_ALLOWED_TOOLS } from './system-prompt'
 import { createCanUseTool } from './permission-handler'
@@ -101,6 +102,12 @@ export interface SdkEnvParams {
    * that don't have a resolved model can omit this safely).
    */
   capabilities?: ResolvedModelCapabilities
+  /**
+   * SDK-shaped MCP servers of the session being started. Only used to keep
+   * http/sse endpoints that our routing rules reach directly out of the
+   * subprocess proxy.
+   */
+  mcpServers?: Record<string, unknown>
 }
 
 // ============================================
@@ -572,11 +579,49 @@ export function getCleanUserEnv(): Record<string, string | undefined> {
 }
 
 /**
+ * NO_PROXY value for a subprocess that inherits Halo's proxy setting.
+ *
+ * The CLI and the MCP servers it spawns receive HTTP_PROXY but know nothing
+ * about `network.proxyOnly`, so on a split network they would push an intranet
+ * model gateway or MCP endpoint through an egress proxy that cannot reach it.
+ *
+ * Entries are bare hostnames plus the user's own bypass patterns: NO_PROXY is
+ * interpreted by each consuming tool with its own matching rules, not ours.
+ */
+export function buildSubprocessNoProxy(
+  baseUrl: string | undefined,
+  mcpServers?: Record<string, unknown>
+): string {
+  const hosts = new Set(['localhost', '127.0.0.1'])
+  for (const pattern of getConfig().network?.noProxy ?? []) hosts.add(pattern)
+
+  const addIfDirect = (url: string | undefined): void => {
+    if (!url) return
+    let hostname: string
+    try {
+      hostname = new URL(url).hostname
+    } catch {
+      return
+    }
+    if (!shouldProxyHost(hostname)) hosts.add(hostname)
+  }
+
+  addIfDirect(baseUrl)
+  for (const server of Object.values(mcpServers ?? {})) {
+    const { type, url } = (server ?? {}) as { type?: string; url?: string }
+    if (type === 'http' || type === 'sse') addIfDirect(url)
+  }
+
+  return [...hosts].join(',')
+}
+
+/**
  * Build env for CC subprocess.
  * Inherits user env (PATH, HOME, SSH, proxy, etc.) for toolchain compat,
  * strips AI SDK vars, then sets exactly what CC needs.
  */
 export function buildSdkEnv(params: SdkEnvParams): Record<string, string | number> {
+  const noProxy = buildSubprocessNoProxy(params.anthropicBaseUrl, params.mcpServers)
   const env: Record<string, string | number | undefined> = {
     ...getCleanUserEnv(),
 
@@ -600,9 +645,10 @@ export function buildSdkEnv(params: SdkEnvParams): Record<string, string | numbe
       return configDir
     })(),
 
-    // Localhost bypasses proxy (for OpenAI compat router)
-    NO_PROXY: 'localhost,127.0.0.1',
-    no_proxy: 'localhost,127.0.0.1',
+    // Localhost (the OpenAI compat router) plus every host our own routing
+    // rules would reach directly.
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
 
     // Disable non-essential traffic
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -825,6 +871,7 @@ export function buildBaseSdkOptions(params: BaseSdkOptionsParams): Record<string
     customConfigDir: params.customConfigDir,
     enableTeams: params.enableTeams,
     capabilities: credentials.capabilities,
+    mcpServers: mcpServers ?? undefined,
   })
 
   const cliPath = resolveClaudeCodeCliPath()

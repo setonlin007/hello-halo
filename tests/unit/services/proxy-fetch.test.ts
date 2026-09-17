@@ -53,7 +53,7 @@ const originalFetchMock = vi.fn(async () => new Response('direct-body', { status
 ;(globalThis as { fetch: typeof fetch }).fetch = originalFetchMock as unknown as typeof fetch
 
 // Dynamic import after mocks + global patch are in place.
-const { proxyFetch, clearProxyCache } = await import('../../../src/main/services/proxy-fetch')
+const { proxyFetch, resolveProxyAgent, clearProxyCache } = await import('../../../src/main/services/proxy-fetch')
 
 describe('proxyFetch — DIRECT path', () => {
   beforeEach(() => {
@@ -75,6 +75,48 @@ describe('proxyFetch — DIRECT path', () => {
     await proxyFetch('http://localhost:1234/ping')
     expect(resolveProxy).not.toHaveBeenCalled()
     expect(originalFetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('resolveProxyAgent', () => {
+  beforeEach(() => {
+    resolveProxy.mockClear()
+    resolveProxy.mockResolvedValue('DIRECT')
+    clearProxyCache()
+  })
+  afterEach(() => {
+    networkChangeHandler?.({ proxy: '', browserUseProxy: false })
+    clearProxyCache()
+  })
+
+  it('returns null when the target resolves DIRECT', async () => {
+    expect(await resolveProxyAgent('https://api.example.com')).toBeNull()
+  })
+
+  it('resolves wss:// through the https equivalent', async () => {
+    resolveProxy.mockResolvedValue('PROXY 10.107.100.64:9090')
+    const resolved = await resolveProxyAgent('wss://openws.work.weixin.qq.com')
+    expect(resolveProxy).toHaveBeenCalledWith('https://openws.work.weixin.qq.com/')
+    expect(resolved?.endpoint).toBe('http://10.107.100.64:9090')
+  })
+
+  it('reuses one agent per proxy endpoint', async () => {
+    resolveProxy.mockResolvedValue('PROXY 10.107.100.64:9090')
+    const a = await resolveProxyAgent('wss://openws.work.weixin.qq.com')
+    const b = await resolveProxyAgent('https://work.weixin.qq.com/example')
+    expect(a?.agent).toBe(b?.agent)
+  })
+
+  it('prefers the app-level proxy and strips credentials from the logged endpoint', async () => {
+    networkChangeHandler?.({ proxy: 'http://user:secret@10.0.0.1:8080', browserUseProxy: false })
+    const resolved = await resolveProxyAgent('wss://openws.work.weixin.qq.com')
+    expect(resolveProxy).not.toHaveBeenCalled()
+    expect(resolved?.endpoint).toBe('http://10.0.0.1:8080')
+  })
+
+  it('bypasses the proxy for loopback targets', async () => {
+    networkChangeHandler?.({ proxy: 'http://10.0.0.1:8080', browserUseProxy: false })
+    expect(await resolveProxyAgent('ws://localhost:9000/socket')).toBeNull()
   })
 })
 

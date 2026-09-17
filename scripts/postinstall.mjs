@@ -13,7 +13,7 @@ import { unlinkSync, symlinkSync, lstatSync } from 'fs'
 
 const run = (cmd) => execSync(cmd, { stdio: 'inherit' })
 
-// 1. Apply patches to @anthropic-ai/claude-agent-sdk
+// 1. Apply every patch under patches/
 run('patch-package')
 
 // 2. Deduplicate CLI binary: agent-sdk ships its own cli.js (~13MB) identical

@@ -22,10 +22,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
 
-// ── Mock external side-effect dependency (desktop notification) ──
+// ── Mock external side-effect dependencies ──
 const notifyAppEventMock = vi.fn()
 vi.mock('../../../../../src/main/services/notification.service', () => ({
   notifyAppEvent: (...args: unknown[]) => notifyAppEventMock(...args),
+}))
+
+// Desktop mode never resolves a proxy, but the module graph still pulls in
+// proxy-fetch, which imports electron.
+vi.mock('../../../../../src/main/services/proxy-fetch', () => ({
+  resolveProxyAgent: vi.fn(async () => null),
 }))
 
 // ── Mock the WeCom SDK ──
@@ -129,6 +135,12 @@ function latestClient(): FakeWSClient {
   return createdClients[createdClients.length - 1]
 }
 
+/** Desktop mode opens the client synchronously inside start(). */
+function startAndConnect(inst: InstanceWithInternals): FakeWSClient {
+  inst.start()
+  return latestClient()
+}
+
 /** Drive the active-mode supersede storm until the instance yields to standby. */
 function forceYield(client: FakeWSClient): void {
   // Default arbiter threshold is 3 supersedes within the window.
@@ -155,8 +167,7 @@ describe('WecomBotInstance connMode state machine', () => {
 
   it('(c) reports standby while yielding and connecting once probing', () => {
     const inst = makeInstance()
-    inst.start()
-    const client = latestClient()
+    const client = startAndConnect(inst)
     client.goAuthenticated()
     expect(inst.getConnectionState()).toBe('online')
 
@@ -171,8 +182,7 @@ describe('WecomBotInstance connMode state machine', () => {
 
   it('(d) marks in-flight stream sessions broken on active-mode disconnect', () => {
     const inst = makeInstance()
-    inst.start()
-    const client = latestClient()
+    const client = startAndConnect(inst)
     client.goAuthenticated()
 
     const session = { markStreamBroken: vi.fn() }
@@ -188,8 +198,7 @@ describe('WecomBotInstance connMode state machine', () => {
 
   it('(b) recovers to active after a probe survives the confirm window, flushing pending pushes', () => {
     const inst = makeInstance()
-    inst.start()
-    forceYield(latestClient())
+    forceYield(startAndConnect(inst))
     expect(inst.connMode).toBe('yielding')
 
     // Advance to fire the scheduled probe → a fresh client connects.
@@ -223,8 +232,7 @@ describe('WecomBotInstance connMode state machine', () => {
 
   it('(a) probe drop mid-confirm reschedules the probe and does NOT recover', () => {
     const inst = makeInstance()
-    inst.start()
-    forceYield(latestClient())
+    forceYield(startAndConnect(inst))
 
     // Fire the first probe.
     vi.runOnlyPendingTimers()
@@ -258,8 +266,7 @@ describe('WecomBotInstance connMode state machine', () => {
   it('does not recover if the confirm timer fires after leaving yielding mode', () => {
     // Guard: recoverToActive is gated on connMode still being 'yielding'.
     const inst = makeInstance()
-    inst.start()
-    forceYield(latestClient())
+    forceYield(startAndConnect(inst))
     vi.runOnlyPendingTimers()
     const probeClient = latestClient()
     probeClient.goAuthenticated()

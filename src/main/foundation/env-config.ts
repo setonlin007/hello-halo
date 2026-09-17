@@ -17,6 +17,12 @@
  *   HALO_AI_API_URL        LLM endpoint base URL (the deployment's own model gateway)
  *   HALO_AI_API_KEY        LLM API key
  *   HALO_AI_MODEL          model id
+ *   HALO_PROXY             egress proxy URL; falls back to HTTPS_PROXY / HTTP_PROXY
+ *   HALO_PROXY_ONLY        comma-separated host patterns that are the ONLY ones
+ *                          proxied; "*" proxies everything, unset keeps the
+ *                          product.json default
+ *   HALO_NO_PROXY          comma-separated host patterns always reached directly;
+ *                          falls back to NO_PROXY
  */
 import { v4 as uuidv4 } from 'uuid'
 import type { AISource, ProviderId } from '../../shared/types'
@@ -26,9 +32,18 @@ const DEFAULT_SERVICE_PASSWORD = 'halo123'
 const FALLBACK_MODEL = 'claude-opus-4-5-20251101'
 const FALLBACK_API_URL = 'https://api.anthropic.com'
 
-function env(name: string): string | undefined {
-  const v = process.env[name]
-  return v != null && v.trim() !== '' ? v.trim() : undefined
+function env(...names: string[]): string | undefined {
+  for (const name of names) {
+    const v = process.env[name]
+    if (v != null && v.trim() !== '') return v.trim()
+  }
+  return undefined
+}
+
+function envList(...names: string[]): string[] | undefined {
+  const raw = env(...names)
+  if (raw === undefined) return undefined
+  return raw.split(',').map(s => s.trim()).filter(Boolean)
 }
 
 /**
@@ -78,6 +93,22 @@ export function applyEnvConfig(): void {
     // Keep the legacy api field consistent for any code path still reading it.
     const legacyProvider = provider === 'openai' ? 'openai' : provider === 'anthropic' ? 'anthropic' : 'custom'
     overrides.api = { provider: legacyProvider, apiKey, apiUrl, model }
+  }
+
+  // --- Egress proxy ---
+  // In a container the UI is unreachable, so env is the only way to configure
+  // the proxy at all. `proxyOnly` stays absent unless set so the product.json
+  // default still applies; "*" is how a deployment opts back into proxying
+  // everything.
+  const network: Record<string, unknown> = {}
+  const proxy = env('HALO_PROXY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy')
+  if (proxy) network.proxy = proxy
+  const proxyOnly = envList('HALO_PROXY_ONLY')
+  if (proxyOnly) network.proxyOnly = proxyOnly.includes('*') ? [] : proxyOnly
+  const noProxy = envList('HALO_NO_PROXY', 'NO_PROXY', 'no_proxy')
+  if (noProxy) network.noProxy = noProxy
+  if (Object.keys(network).length > 0) {
+    overrides.network = { ...cfg.network, ...network }
   }
 
   if (Object.keys(overrides).length > 0) {

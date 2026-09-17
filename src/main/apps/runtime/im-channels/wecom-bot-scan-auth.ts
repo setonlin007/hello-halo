@@ -28,6 +28,8 @@
 
 import { request as httpsRequest } from 'https'
 import { platform } from 'os'
+import { resolveProxyAgent } from '../../../services/proxy-fetch'
+import { isServerMode } from '../../../foundation/runtime-mode'
 
 // ============================================
 // Constants
@@ -153,8 +155,16 @@ export function getPlatCode(): number {
  *   rejecting with kind=cancelled when aborted.
  * - Enforces a request-level read timeout independent of the polling deadline.
  * - Surfaces non-2xx responses with their status code and a short body sample.
+ * - In server mode, routes through the platform proxy: `https.request` ignores
+ *   proxy environment variables, so without an explicit agent this call escapes
+ *   the container's egress path. The desktop connects directly (see the same
+ *   split in wecom-bot.provider.ts start()).
  */
-function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const proxy = isServerMode()
+    ? await resolveProxyAgent(`https://${WECOM_QC_HOST}${path}`).catch(() => null)
+    : null
+
   return new Promise<T>((resolve, reject) => {
     if (signal?.aborted) {
       reject(new ScanAuthError('cancelled', 'Aborted before request'))
@@ -176,6 +186,7 @@ function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
         path,
         method: 'GET',
         timeout: HTTPS_REQUEST_TIMEOUT_MS,
+        agent: proxy?.agent,
         headers: {
           // The official CLI sends no special headers. We add User-Agent for
           // server-side telemetry hygiene (helps WeCom distinguish clients).

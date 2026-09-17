@@ -49,6 +49,7 @@ import AiBot, {
 import { readFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join, basename, extname } from 'path'
+import type http from 'node:http'
 import type {
   ImChannelProvider,
   ImChannelInstance,
@@ -76,6 +77,8 @@ import { ensureUtf8 } from './wecom-content-utf8'
 import { ConnectionArbiter } from './connection-arbiter'
 import { stageMediaFile, pruneMediaTempDir } from './media-temp-files'
 import { notifyAppEvent } from '../../../services/notification.service'
+import { resolveProxyAgent } from '../../../services/proxy-fetch'
+import { isServerMode } from '../../../foundation/runtime-mode'
 import { fetchWecomIdentityDirectory } from './wecom-identity-resolve'
 
 // ============================================
@@ -320,6 +323,8 @@ class WecomBotInstance implements ImChannelInstance {
   }
   /** Timestamp instance was started, for uptime in snapshots. */
   private startedAt = 0
+  /** Proxy agent for the WS transport; server mode only, see start(). */
+  private wsAgent: http.Agent | null = null
 
   constructor(instanceId: string, config: WecomBotProviderConfig) {
     this.instanceId = instanceId
@@ -363,7 +368,15 @@ class WecomBotInstance implements ImChannelInstance {
       })
       return
     }
-    this.openClient()
+    // Egress differs by deployment, not by channel: a container gets its proxy
+    // from the platform's environment, which neither `ws` nor node:https reads.
+    // The desktop connects directly — its configured proxy is typically an
+    // AI-API relay with no rule engine, which domestic WeCom traffic must avoid.
+    if (isServerMode()) {
+      void this.resolveWsAgentThenOpen()
+    } else {
+      this.openClient()
+    }
     this.cacheCleanupTimer = setInterval(
       () => this.cleanupExpiredFrames(),
       REQ_ID_CLEANUP_INTERVAL_MS,
@@ -530,6 +543,35 @@ class WecomBotInstance implements ImChannelInstance {
 
   // ── SDK client lifecycle ──────────────────────────────────────
 
+  /**
+   * Resolve the WS proxy before the first connection. Kept out of start()
+   * because ImChannelInstance.start() is synchronous for every provider;
+   * subsequent openClient() calls reuse the agent resolved here.
+   *
+   * A reconnect() can land inside the resolution window and open its own
+   * client, so the teardown below is what keeps that one from surviving
+   * unnoticed and auto-reconnecting forever alongside ours.
+   */
+  private async resolveWsAgentThenOpen(): Promise<void> {
+    const wsUrl = this.config.wsUrl || DEFAULT_WS_URL
+    let resolved: Awaited<ReturnType<typeof resolveProxyAgent>> = null
+    try {
+      resolved = await resolveProxyAgent(wsUrl)
+    } catch (err) {
+      logEvent(this.instanceId, 'warn', 'ws_proxy_resolve_failed', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    if (!this.active) return
+    this.wsAgent = resolved?.agent ?? null
+    logEvent(this.instanceId, 'info', 'ws_egress', {
+      wsUrl,
+      via: resolved?.endpoint ?? 'direct',
+    })
+    this.teardownClient()
+    this.openClient()
+  }
+
   private openClient(): void {
     const wsUrl = this.config.wsUrl || DEFAULT_WS_URL
 
@@ -543,6 +585,11 @@ class WecomBotInstance implements ImChannelInstance {
       maxReconnectAttempts: -1,
       heartbeatInterval: 30_000,
       logger: sdkLogger,
+      wsOptions: this.wsAgent ? { agent: this.wsAgent } : undefined,
+      // Media URLs are handed out by WeCom at runtime on hosts we cannot know
+      // up front, so the agent is resolved per download rather than once like
+      // the WS one.
+      httpAgentResolver: async (url) => (await resolveProxyAgent(url))?.agent ?? null,
     })
 
     // Ignore events from a superseded client object. teardownClient() /

@@ -31,6 +31,9 @@ import http from 'node:http'
 import zlib from 'node:zlib'
 import { ProxyAgent } from 'proxy-agent'
 import { getConfig, onNetworkConfigChange } from '../foundation/config.service'
+import { matchDomainPattern } from '../foundation/host-pattern'
+import { getNetworkPolicy } from '../foundation/product-config'
+import { isServerMode } from '../foundation/runtime-mode'
 import { isHttpLoggingEnabled, logHttpRequest, logHttpResponse, logHttpResponseBody } from '../foundation/logging'
 
 // ============================================================================
@@ -231,8 +234,9 @@ function applyProxyToBrowserSession(proxy: string | null): void {
   }
 }
 
-onNetworkConfigChange(({ proxy, browserUseProxy }) => {
+onNetworkConfigChange(({ proxy, browserUseProxy, proxyOnly, noProxy }) => {
   _appProxy = proxy?.trim() || null
+  _hostRules = buildHostRules(proxyOnly, noProxy)
   // AI Browser only follows Settings proxy when explicitly opted-in;
   // otherwise it uses the system proxy (Electron default behavior).
   applyProxyToBrowserSession(browserUseProxy ? _appProxy : null)
@@ -251,6 +255,126 @@ function getAppProxy(): string | null {
     applyProxyToBrowserSession(browserUseProxy ? _appProxy : null)
   }
   return _appProxy
+}
+
+// ============================================================================
+// Per-host routing rules
+//
+// A split network (reachable intranet + a few public endpoints behind an
+// egress proxy) cannot use an all-or-nothing proxy: proxying everything
+// breaks the intranet, proxying nothing breaks the public endpoints.
+// `proxyOnly` inverts the default so only matching hosts are proxied.
+//
+// These rules govern Node-side traffic only. The AI Browser has its own
+// Electron session whose proxy is set wholesale by `browserUseProxy`;
+// Chromium's proxy config cannot express "proxy only these hosts".
+// ============================================================================
+
+interface HostRules {
+  proxyOnly: string[]
+  noProxy: string[]
+}
+
+function buildHostRules(proxyOnly: string[] | undefined, noProxy: string[] | undefined): HostRules {
+  // The product default is server-mode only: on the desktop a non-empty
+  // proxyOnly would silently exclude everything else — the model API
+  // included — from a proxy the user believes is global.
+  const builtin = isServerMode() ? getNetworkPolicy()?.proxyOnly : undefined
+  return {
+    proxyOnly: proxyOnly ?? builtin ?? [],
+    noProxy: noProxy ?? [],
+  }
+}
+
+let _hostRules: HostRules | undefined = undefined
+
+function getHostRules(): HostRules {
+  if (!_hostRules) {
+    const network = getConfig().network
+    _hostRules = buildHostRules(network?.proxyOnly, network?.noProxy)
+    if (_hostRules.proxyOnly.length > 0) {
+      console.log(`[ProxyFetch] Proxy restricted to: ${_hostRules.proxyOnly.join(', ')}`)
+    }
+    if (_hostRules.noProxy.length > 0) {
+      console.log(`[ProxyFetch] Proxy bypassed for: ${_hostRules.noProxy.join(', ')}`)
+    }
+  }
+  return _hostRules
+}
+
+/**
+ * Whether traffic to a hostname is eligible for the proxy at all.
+ *
+ * Exported so callers that hand a proxy configuration to a child process
+ * (the agent CLI, stdio MCP servers) can derive a matching NO_PROXY instead
+ * of re-deriving the policy.
+ */
+export function shouldProxyHost(hostname: string): boolean {
+  if (BYPASS_HOSTS.has(hostname)) return false
+
+  const { proxyOnly, noProxy } = getHostRules()
+  if (noProxy.some(p => matchDomainPattern(hostname, p))) return false
+  if (proxyOnly.length === 0) return true
+  return proxyOnly.some(p => matchDomainPattern(hostname, p))
+}
+
+// ============================================================================
+// Proxy resolution (shared by proxyFetch and non-fetch transports)
+// ============================================================================
+
+/**
+ * Resolve the effective proxy URL for a target: host routing rules decide
+ * whether the target is proxied at all, then the app-level setting wins over
+ * Chromium's resolution engine.
+ *
+ * WebSocket schemes are normalized to their HTTP equivalents: Chromium
+ * resolves ws/wss through the same rules, but the normalized form is also
+ * what `ProxyAgent` needs to pick an http vs https tunnel.
+ */
+async function resolveProxyUrl(url: string): Promise<string | null> {
+  let target: URL
+  try {
+    target = new URL(url)
+  } catch {
+    return null
+  }
+
+  if (target.protocol === 'wss:') target.protocol = 'https:'
+  else if (target.protocol === 'ws:') target.protocol = 'http:'
+
+  if (!shouldProxyHost(target.hostname)) return null
+
+  const appProxy = getAppProxy()
+  if (appProxy) return appProxy
+  return resolveSystemProxy(target.toString())
+}
+
+/** Proxy endpoint with any credentials stripped — safe to log. */
+function redactProxyUrl(proxyUrl: string): string {
+  try {
+    const u = new URL(proxyUrl)
+    return `${u.protocol}//${u.host}`
+  } catch {
+    return '(unparsable proxy url)'
+  }
+}
+
+export interface ResolvedProxy {
+  agent: http.Agent
+  endpoint: string
+}
+
+/**
+ * Resolve a reusable proxy agent for transports that do not go through
+ * `proxyFetch` — raw `https.request`, the `ws` client, and any other Node
+ * library that ignores proxy environment variables entirely.
+ *
+ * Returns null when the target should be reached directly.
+ */
+export async function resolveProxyAgent(url: string): Promise<ResolvedProxy | null> {
+  const proxyUrl = await resolveProxyUrl(url)
+  if (!proxyUrl) return null
+  return { agent: getOrCreateAgent(proxyUrl), endpoint: redactProxyUrl(proxyUrl) }
 }
 
 // ============================================================================
@@ -416,20 +540,7 @@ export async function proxyFetch(
 ): Promise<Response> {
   const urlStr = typeof url === 'string' ? url : url.toString()
 
-  // App-level proxy (in-memory cache, zero disk reads after first call)
-  const appProxy = getAppProxy()
-
-  let proxyUrl: string | null
-  if (appProxy) {
-    // Manual proxy configured — still respect localhost bypass
-    const hostname = (() => {
-      try { return new URL(urlStr).hostname } catch { return '' }
-    })()
-    proxyUrl = BYPASS_HOSTS.has(hostname) ? null : appProxy
-  } else {
-    // Auto-detect from Chromium's proxy resolution engine
-    proxyUrl = await resolveSystemProxy(urlStr)
-  }
+  const proxyUrl = await resolveProxyUrl(urlStr)
 
   const method = (init?.method || 'GET').toUpperCase()
   const logging = isHttpLoggingEnabled()

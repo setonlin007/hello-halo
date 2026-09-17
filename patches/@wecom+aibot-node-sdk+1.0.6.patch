@@ -1,0 +1,106 @@
+diff --git a/node_modules/@wecom/aibot-node-sdk/dist/index.cjs.js b/node_modules/@wecom/aibot-node-sdk/dist/index.cjs.js
+index c703ae4..c9a150f 100644
+--- a/node_modules/@wecom/aibot-node-sdk/dist/index.cjs.js
++++ b/node_modules/@wecom/aibot-node-sdk/dist/index.cjs.js
+@@ -126,8 +126,9 @@ exports.EventType = void 0;
+  * 仅负责文件下载等 HTTP 辅助功能，消息收发均走 WebSocket 通道
+  */
+ class WeComApiClient {
+-    constructor(logger, timeout = 10000) {
++    constructor(logger, timeout = 10000, agentResolver) {
+         this.logger = logger;
++        this.agentResolver = agentResolver;
+         this.httpClient = axios.create({
+             timeout,
+             headers: {
+@@ -141,8 +142,10 @@ class WeComApiClient {
+     async downloadFileRaw(url) {
+         this.logger.info('Downloading file...');
+         try {
++            const agent = this.agentResolver ? await this.agentResolver(url) : null;
+             const response = await this.httpClient.get(url, {
+                 responseType: 'arraybuffer',
++                ...(agent ? { httpAgent: agent, httpsAgent: agent, proxy: false } : {}),
+             });
+             // 从 Content-Disposition 头中解析文件名
+             const contentDisposition = response.headers['content-disposition'];
+@@ -921,7 +924,7 @@ class WSClient extends eventemitter3.EventEmitter {
+         };
+         this.logger = this.options.logger;
+         // 初始化 API 客户端（仅用于文件下载）
+-        this.apiClient = new WeComApiClient(this.logger, this.options.requestTimeout);
++        this.apiClient = new WeComApiClient(this.logger, this.options.requestTimeout, this.options.httpAgentResolver);
+         // 初始化 WebSocket 管理器
+         this.wsManager = new WsConnectionManager(this.logger, this.options.heartbeatInterval, this.options.reconnectInterval, this.options.maxReconnectAttempts, this.options.wsUrl || undefined, this.options.wsOptions, this.options.maxReplyQueueSize, this.options.maxAuthFailureAttempts);
+         // 设置认证凭证
+diff --git a/node_modules/@wecom/aibot-node-sdk/dist/index.d.ts b/node_modules/@wecom/aibot-node-sdk/dist/index.d.ts
+index 9166274..74eea4b 100644
+--- a/node_modules/@wecom/aibot-node-sdk/dist/index.d.ts
++++ b/node_modules/@wecom/aibot-node-sdk/dist/index.d.ts
+@@ -1,5 +1,12 @@
+ import { EventEmitter } from 'eventemitter3';
+ import { ClientOptions } from 'ws';
++import { Agent } from 'node:http';
++
++/**
++ * Resolves the egress proxy agent for a media download URL; null = direct.
++ * Media downloads use axios, which the SDK otherwise gives no agent hook for.
++ */
++type HttpAgentResolver = (url: string) => Promise<Agent | null> | Agent | null;
+ 
+ /**
+  * 通用基础类型定义
+@@ -60,6 +67,8 @@ interface WSClientOptions {
+     wsUrl?: string;
+     /** 传递给底层 WebSocket 的连接选项（如 TLS 证书配置 ca、cert、key、rejectUnauthorized 等） */
+     wsOptions?: ClientOptions;
++    /** Proxy agent resolver for media downloads (mirrors wsOptions.agent for the WS channel) */
++    httpAgentResolver?: HttpAgentResolver;
+     /** 单个 req_id 的回复队列最大长度，超过后新消息将被拒绝，默认 500 */
+     maxReplyQueueSize?: number;
+     /** 自定义日志函数 */
+@@ -808,7 +817,8 @@ interface WSClientEventMap {
+ declare class WeComApiClient {
+     private httpClient;
+     private logger;
+-    constructor(logger: Logger, timeout?: number);
++    private agentResolver?;
++    constructor(logger: Logger, timeout?: number, agentResolver?: HttpAgentResolver);
+     /**
+      * 下载文件（返回原始 Buffer 及文件名）
+      */
+diff --git a/node_modules/@wecom/aibot-node-sdk/dist/index.esm.js b/node_modules/@wecom/aibot-node-sdk/dist/index.esm.js
+index 380f2a3..ca81a88 100644
+--- a/node_modules/@wecom/aibot-node-sdk/dist/index.esm.js
++++ b/node_modules/@wecom/aibot-node-sdk/dist/index.esm.js
+@@ -122,8 +122,9 @@ var EventType;
+  * 仅负责文件下载等 HTTP 辅助功能，消息收发均走 WebSocket 通道
+  */
+ class WeComApiClient {
+-    constructor(logger, timeout = 10000) {
++    constructor(logger, timeout = 10000, agentResolver) {
+         this.logger = logger;
++        this.agentResolver = agentResolver;
+         this.httpClient = axios.create({
+             timeout,
+             headers: {
+@@ -137,8 +138,10 @@ class WeComApiClient {
+     async downloadFileRaw(url) {
+         this.logger.info('Downloading file...');
+         try {
++            const agent = this.agentResolver ? await this.agentResolver(url) : null;
+             const response = await this.httpClient.get(url, {
+                 responseType: 'arraybuffer',
++                ...(agent ? { httpAgent: agent, httpsAgent: agent, proxy: false } : {}),
+             });
+             // 从 Content-Disposition 头中解析文件名
+             const contentDisposition = response.headers['content-disposition'];
+@@ -917,7 +920,7 @@ class WSClient extends EventEmitter {
+         };
+         this.logger = this.options.logger;
+         // 初始化 API 客户端（仅用于文件下载）
+-        this.apiClient = new WeComApiClient(this.logger, this.options.requestTimeout);
++        this.apiClient = new WeComApiClient(this.logger, this.options.requestTimeout, this.options.httpAgentResolver);
+         // 初始化 WebSocket 管理器
+         this.wsManager = new WsConnectionManager(this.logger, this.options.heartbeatInterval, this.options.reconnectInterval, this.options.maxReconnectAttempts, this.options.wsUrl || undefined, this.options.wsOptions, this.options.maxReplyQueueSize, this.options.maxAuthFailureAttempts);
+         // 设置认证凭证

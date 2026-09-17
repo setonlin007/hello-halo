@@ -517,6 +517,8 @@ export function onApiConfigChange(handler: ApiConfigChangeHandler): () => void {
 export interface NetworkConfigPayload {
   proxy: string | undefined
   browserUseProxy: boolean
+  proxyOnly: string[] | undefined
+  noProxy: string[] | undefined
 }
 
 type NetworkConfigChangeHandler = (network: NetworkConfigPayload) => void
@@ -749,6 +751,14 @@ interface HaloConfig {
   network?: {
     proxy?: string  // Manual proxy URL. Empty string or undefined = use system proxy.
     browserUseProxy?: boolean  // When true, AI Browser also uses the Settings proxy. Default false = system proxy.
+    /**
+     * Host patterns that are the ONLY ones routed through `proxy`; everything
+     * else goes direct. Empty/omitted keeps the default of proxying all
+     * traffic. Overrides the product.json `networkPolicy.proxyOnly` default.
+     */
+    proxyOnly?: string[]
+    /** Host patterns always reached directly, even when they match proxyOnly. */
+    noProxy?: string[]
   }
   // Browser configuration
   browser?: {
@@ -1352,6 +1362,8 @@ export function saveConfig(config: Partial<HaloConfig>): HaloConfig {
       const payload: NetworkConfigPayload = {
         proxy: newConfig.network?.proxy,
         browserUseProxy: newConfig.network?.browserUseProxy === true,
+        proxyOnly: newConfig.network?.proxyOnly,
+        noProxy: newConfig.network?.noProxy,
       }
       networkConfigChangeHandlers.forEach(handler => {
         try { handler(payload) } catch (e) {

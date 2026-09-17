@@ -68,6 +68,28 @@ export interface BrowserPolicy {
 }
 
 /**
+ * Network routing policy (enterprise feature).
+ *
+ * Only meaningful for deployments whose network is split: an intranet that is
+ * reachable directly and a handful of public endpoints that are reachable
+ * only through an egress proxy. Without it the proxy is all-or-nothing, which
+ * breaks intranet traffic the moment a proxy is configured.
+ *
+ * `proxyOnly` inverts the default: when non-empty, ONLY matching hosts are
+ * proxied and everything else goes direct. Patterns use the same syntax as
+ * `browserPolicy` (exact host, `*.suffix`, IPv4 CIDR) — note a bare domain
+ * does NOT cover subdomains.
+ *
+ * The built-in value is applied in server mode only. On the desktop a
+ * non-empty `proxyOnly` would silently stop the user's proxy from covering
+ * anything else (the model API included), so the desktop requires an explicit
+ * opt-in through `network.proxyOnly` in config.json.
+ */
+export interface NetworkPolicy {
+  proxyOnly?: string[]
+}
+
+/**
  * Per-registry override entry in product.json.
  *
  * Allows enterprise/custom builds to override specific built-in registry
@@ -218,6 +240,8 @@ export interface ProductConfig {
   updateConfig?: UpdateConfig
   /** Browser network access policy (optional, unrestricted when omitted) */
   browserPolicy?: BrowserPolicy
+  /** Proxy routing policy (optional, server mode only; proxy everything when omitted) */
+  networkPolicy?: NetworkPolicy
   /**
    * Announcement feed URL (optional; omitted/empty disables the feature).
    *
@@ -506,6 +530,15 @@ export function getOfficialContentBaseUrl(): string {
  */
 export function getNotifyChannelsConfig(): NotifyChannelsProductConfig | undefined {
   return loadProductConfig().notifyChannels
+}
+
+/**
+ * Get the proxy routing policy from product.json.
+ * Returns undefined when not configured (open-source builds) — the proxy then
+ * applies to every host, which is the right default outside a split network.
+ */
+export function getNetworkPolicy(): NetworkPolicy | undefined {
+  return loadProductConfig().networkPolicy
 }
 
 /**

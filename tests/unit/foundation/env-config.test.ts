@@ -29,6 +29,15 @@ const ENV_KEYS = [
   'HALO_AI_API_URL',
   'HALO_AI_API_KEY',
   'HALO_AI_MODEL',
+  'HALO_PROXY',
+  'HALO_PROXY_ONLY',
+  'HALO_NO_PROXY',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+  'NO_PROXY',
+  'no_proxy',
 ]
 
 function setConfig(cfg: Record<string, unknown>): void {
@@ -118,6 +127,59 @@ describe('env-config', () => {
       const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
       expect(saved.api.provider).toBe('custom')
       expect(saved.aiSources.sources[0].provider).toBe('gemini')
+    })
+  })
+
+  describe('egress proxy', () => {
+    it('HALO_PROXY wins over the standard fallbacks', () => {
+      setConfig({ remoteAccess: { password: 'x' } })
+      process.env.HTTPS_PROXY = 'http://fallback:1'
+      process.env.HALO_PROXY = 'http://egress:8080'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect(saved.network.proxy).toBe('http://egress:8080')
+    })
+
+    it('falls back to HTTPS_PROXY then HTTP_PROXY', () => {
+      setConfig({ remoteAccess: { password: 'x' } })
+      process.env.HTTP_PROXY = 'http://plain:3128'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect(saved.network.proxy).toBe('http://plain:3128')
+    })
+
+    it('unset HALO_PROXY_ONLY leaves the product default in place', () => {
+      setConfig({ remoteAccess: { password: 'x' } })
+      process.env.HALO_PROXY = 'http://egress:8080'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect('proxyOnly' in saved.network).toBe(false)
+    })
+
+    it('HALO_PROXY_ONLY="*" opts back into proxying everything', () => {
+      setConfig({ remoteAccess: { password: 'x' } })
+      process.env.HALO_PROXY_ONLY = '*'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect(saved.network.proxyOnly).toEqual([])
+    })
+
+    it('parses comma-separated host patterns', () => {
+      setConfig({ remoteAccess: { password: 'x' } })
+      process.env.HALO_PROXY_ONLY = 'qyapi.weixin.qq.com, *.work.weixin.qq.com'
+      process.env.HALO_NO_PROXY = 'gw.intranet'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect(saved.network.proxyOnly).toEqual(['qyapi.weixin.qq.com', '*.work.weixin.qq.com'])
+      expect(saved.network.noProxy).toEqual(['gw.intranet'])
+    })
+
+    it('merges onto the persisted network config', () => {
+      setConfig({ remoteAccess: { password: 'x' }, network: { browserUseProxy: true } })
+      process.env.HALO_PROXY = 'http://egress:8080'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect(saved.network.browserUseProxy).toBe(true)
     })
   })
 

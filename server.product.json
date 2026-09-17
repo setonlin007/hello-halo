@@ -9,6 +9,13 @@
     "owner": "openkursar",
     "repo": "hello-halo"
   },
+  "networkPolicy": {
+    "proxyOnly": [
+      "qyapi.weixin.qq.com",
+      "work.weixin.qq.com",
+      "*.work.weixin.qq.com"
+    ]
+  },
   "authProviders": [
     {
       "type": "custom",

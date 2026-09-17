@@ -17,7 +17,7 @@ import {
   credentialsToBackendConfig
 } from './helpers'
 import { emitAgentBroadcast } from './events'
-import { getCleanUserEnv, resolveCredentialsForSdk } from './sdk-config'
+import { getCleanUserEnv, resolveCredentialsForSdk, buildSubprocessNoProxy } from './sdk-config'
 import { resolveModelId } from '../../../shared/types/ai-sources'
 import { analytics } from '../analytics/analytics.service'
 import { AnalyticsEvents } from '../analytics/types'
@@ -288,6 +288,8 @@ async function runMcpConnectionTest(): Promise<McpConnectionTestResult> {
 
     console.log('[Agent] MCP test config:', JSON.stringify(enabledMcpServers, null, 2))
 
+    const noProxy = buildSubprocessNoProxy(anthropicBaseUrl, enabledMcpServers)
+
     // Create query with proper configuration (matching sendMessage)
     // Use a simple prompt that will get a quick response
     const abortController = new AbortController()
@@ -310,8 +312,8 @@ async function runMcpConnectionTest(): Promise<McpConnectionTestResult> {
             ? { ANTHROPIC_CUSTOM_HEADERS: delegatedRoutingHeader }
             : { ANTHROPIC_API_KEY: anthropicApiKey }),
           ANTHROPIC_BASE_URL: anthropicBaseUrl,
-          NO_PROXY: 'localhost,127.0.0.1',
-          no_proxy: 'localhost,127.0.0.1',
+          NO_PROXY: noProxy,
+          no_proxy: noProxy,
           // Disable unnecessary API requests
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
           DISABLE_TELEMETRY: '1',
