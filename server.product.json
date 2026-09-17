@@ -11,9 +11,7 @@
   },
   "networkPolicy": {
     "proxyOnly": [
-      "qyapi.weixin.qq.com",
-      "work.weixin.qq.com",
-      "*.work.weixin.qq.com"
+      "*.weixin.qq.com"
     ]
   },
   "authProviders": [
