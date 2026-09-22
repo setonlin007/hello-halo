@@ -18,6 +18,10 @@ vi.mock('../../../src/main/services/remote', () => ({
   enableRemoteAccess: vi.fn(),
 }))
 
+vi.mock('../../../src/main/services/analytics', () => ({
+  initAnalytics: vi.fn(),
+}))
+
 vi.mock('../../../src/main/foundation/env-config', () => ({
   applyEnvConfig: vi.fn(),
 }))

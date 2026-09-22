@@ -26,6 +26,7 @@ import { createTelemetryProvider } from './providers/telemetry'
 import { getConfig, saveConfig } from '../../foundation/config.service'
 import { getAnalyticsConfig, getIdentitySource, getTelemetryConfig } from '../../foundation/product-config'
 import { getHostIdentity, type HostIdentity } from '../../foundation/host-identity'
+import { getInstanceId, isServerMode } from '../../foundation/runtime-mode'
 import { getCurrentSource } from '../../../shared/types'
 import { deriveErrorCode } from './error-code'
 
@@ -36,6 +37,10 @@ import { deriveErrorCode } from './error-code'
  * per-variant configuration committed in the variant repo, not secrets.
  * Missing/empty values disable the corresponding provider (open-source
  * builds omit both blocks entirely).
+ *
+ * Telemetry credentials additionally accept an environment override, so a
+ * container image can stay brand-neutral and receive its backend at deploy
+ * time — the same reason HALO_REMOTE_PASSWORD is not a product.json field.
  */
 function loadProviderConfig() {
   const analytics = getAnalyticsConfig()
@@ -49,8 +54,8 @@ function loadProviderConfig() {
       apiSecret: analytics?.ga?.apiSecret ?? ''
     },
     telemetry: {
-      endpoint: telemetry?.endpoint ?? '',
-      apiKey: telemetry?.apiKey ?? ''
+      endpoint: process.env.HALO_TELEMETRY_ENDPOINT || telemetry?.endpoint || '',
+      apiKey: process.env.HALO_TELEMETRY_API_KEY || telemetry?.apiKey || ''
     }
   }
 }
@@ -313,6 +318,18 @@ class AnalyticsService {
     const config = getConfig()
     const currentVersion = app.getVersion()
 
+    // Server mode takes its identity from the platform rather than from disk.
+    // A container filesystem is not a dependable anchor — a reset one makes
+    // every cold start look like a brand-new install — and a random UUID
+    // cannot be traced back to a deployment anyway. The hostname is the
+    // function id, the same string operators see in the console and in the
+    // access URL. Watermarks still come from disk: they record how far
+    // automation_runs forwarding got, and dropping them re-sends old runs.
+    const instanceId = getInstanceId()
+    if (instanceId) {
+      return { ...config.analytics, userId: instanceId, lastVersion: currentVersion }
+    }
+
     // Create new config if not exists
     if (!config.analytics) {
       const newAnalyticsConfig: AnalyticsConfig = {
@@ -336,6 +353,7 @@ class AnalyticsService {
   private buildUserContext(): UserContext {
     return {
       userId: this.config!.userId,
+      runtimeMode: isServerMode() ? 'server' : 'desktop',
       appVersion: app.getVersion(),
       platform: process.platform,
       arch: process.arch,

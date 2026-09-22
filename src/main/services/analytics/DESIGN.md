@@ -56,6 +56,35 @@ externally-meaningful UID from the active AI source via a dot-path
 cached by `(sourceId, path)` so switching the active source or editing the
 product config invalidates the cache on the next `track()`.
 
+### UserContext + runtime mode
+
+`userId` has two different sources. On the desktop it is the persisted UUID
+in `config.analytics.userId`. In server mode `loadOrCreateConfig()` replaces
+it with `foundation/runtime-mode.ts#getInstanceId()` — the container
+hostname, which on WFaaS is the function id visible in the access URL.
+
+Deriving it from the platform rather than from disk is deliberate. A
+container filesystem is not a dependable anchor: when it resets, the
+"persisted" UUID is regenerated and every cold start is ingested as a
+separate install, inflating install counts without bound. A random UUID
+also cannot be traced back to a deployment, which is what an operator
+actually needs. The function id is stable across cold starts and is a name
+they already recognize.
+
+Only the identity is platform-derived; the `lastSnapshot*` watermarks are
+still read from disk, because they track how far automation_runs forwarding
+got and losing them re-sends old runs. Server mode therefore never writes
+`userId` back to disk.
+
+Two consequences worth knowing. Scaling out gives one `userId` per replica,
+not per function. And `userId` in server mode identifies a deployment, not a
+person — one process serves every remote client through it, so distinct-user
+counts need a client-scoped id that does not exist yet.
+
+`runtimeMode` records which of the two shapes produced the event. It is the
+only signal that separates a Linux desktop build from a server one, since
+`platform` reads `linux` for both.
+
 ### UserContext + host identity (enterprise-internal only)
 
 When `product.json.telemetry.collectHostIdentity` is `true`, `track()` also
@@ -283,6 +312,9 @@ Startup (`main/index.ts` + `bootstrap/extended.ts`):
 
 1. `app.whenReady()` → create window.
 2. `ready-to-show` → `setImmediate(() => { initializeExtendedServices(); initAnalytics(); })`.
+   Headless deployments have no window, so `bootstrap/server-mode.ts` calls
+   both directly and does not await `initAnalytics()` — a telemetry backend
+   outage must not delay the server becoming reachable.
 3. `initializeExtendedServices()` registers IPC (`registerAnalyticsHandlers`)
    synchronously, then kicks off `initPlatformAndApps()` async.
 4. `initPlatformAndApps()` inits AppManager and Runtime, calls
@@ -311,9 +343,14 @@ Shutdown (`cleanupExtendedServices`):
 | `lastSnapshotRunId`  | Watermark for `app.run.replay` — most recent replayed runId         |
 | `lastSnapshotTs`     | Watermark for `app.run.replay` — most recent replayed finishedAt    |
 
+The telemetry endpoint and apiKey also accept `HALO_TELEMETRY_ENDPOINT` /
+`HALO_TELEMETRY_API_KEY`, which take precedence: a container image is built
+once and deployed against different backends, so baking them in would mean one
+image per environment.
+
 Provider identifiers (read from `product.json` at runtime via
 `getAnalyticsConfig()` / `getTelemetryConfig()` — per-variant configuration
-committed in the variant repo, never build-time env injection):
+committed in the variant repo):
 
 | product.json field         | Provider  |
 |----------------------------|-----------|

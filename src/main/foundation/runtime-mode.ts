@@ -6,6 +6,8 @@
  * display, no window, and no desktop session.
  */
 
+import { hostname } from 'os'
+
 /**
  * Headless server mode: the main process runs without a window/menu/tray and
  * serves the Remote Access HTTP+WebSocket stack instead. Gated on HALO_SERVER_MODE
@@ -24,4 +26,23 @@ export function getServerPort(): number {
   const raw = process.env.PORT || process.env.HALO_SERVER_PORT
   const n = raw ? parseInt(raw, 10) : NaN
   return Number.isFinite(n) && n > 0 ? n : 8080
+}
+
+/**
+ * Which deployment this process belongs to — the identity telemetry is
+ * attributed to in server mode.
+ *
+ * On WFaaS the container hostname is the function id (`sb-137f1ca9-65f`), the
+ * same string that appears in the access URL and the operator console, and it
+ * survives cold starts. Measured there as identical across `gethostname(2)`,
+ * `/proc/sys/kernel/hostname` and `$HOSTNAME`; `K_SERVICE` is not injected, so
+ * this is the only platform-provided handle. One replica per function is not
+ * guaranteed — scaling out yields one id per replica.
+ *
+ * Undefined on the desktop: the hostname there is the employee's own machine
+ * name, and `UserContext` never passes through the sanitize pass.
+ */
+export function getInstanceId(): string | undefined {
+  if (!isServerMode()) return undefined
+  return hostname() || undefined
 }

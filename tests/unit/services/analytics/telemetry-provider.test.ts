@@ -34,6 +34,7 @@ const TEST_API_KEY = 'test-api-key-1234'
 function makeContext(): UserContext {
   return {
     userId: 'user-001',
+    runtimeMode: 'desktop',
     appVersion: '1.0.0',
     platform: 'darwin',
     arch: 'arm64',
