@@ -16,6 +16,8 @@ import type { ActivityEntry, ActivityEntryType, ActivityEntryContent } from './t
 import { broadcastToAll } from '../../http/websocket'
 import { sendToRenderer } from '../../foundation/window.service'
 import { notifyAppEvent } from '../../services/notification.service'
+import { getOutputDir } from '../../services/space-scope'
+import { reclaimReportedFile } from './report-output'
 
 // ============================================
 // Types
@@ -31,8 +33,8 @@ export interface ReportToolContext {
   sessionKey: string
   /** Notification level: 'all' | 'important' | 'none'. Defaults to 'important'. */
   notificationLevel?: 'all' | 'important' | 'none'
-  /** Absolute path to the plans directory for file-based data_path guidance */
-  plansDir?: string
+  /** Space owning this run; bounds where reported files may live. */
+  spaceId?: string
 }
 
 /** Callback invoked when an escalation entry is created */
@@ -85,14 +87,17 @@ export function createReportToolServer(
     '2. Pass the absolute file path as data_path\n' +
     'This keeps the tool call lightweight and lets you Edit the file for revisions.'
 
-  // Inject the concrete plans directory path so the AI knows exactly where to write
-  const plansDirGuidance = runContext.plansDir
-    ? `\nBy default, write files to: ${runContext.plansDir}`
+  // Name the directory explicitly: the model has no way to infer which paths
+  // the user's readers can reach.
+  const outputDir = getOutputDir(runContext.spaceId)
+  const outputGuidance = outputDir
+    ? `\nWrite those files under: ${outputDir}\n` +
+      'Files written elsewhere are not visible to the user.'
     : ''
 
   const reportTool = tool(
     'report_to_user',
-    baseDescription + plansDirGuidance,
+    baseDescription + outputGuidance,
     {
       type: z.enum([
         'run_complete',
@@ -164,7 +169,9 @@ export function createReportToolServer(
 
       // Optional fields
       if (input.data) content.data = input.data
-      if (input.data_path) content.dataPath = input.data_path
+      if (input.data_path) {
+        content.dataPath = await reclaimReportedFile(input.data_path, runContext.spaceId)
+      }
       if (input.question) content.question = input.question
       if (input.choices) content.choices = input.choices
 

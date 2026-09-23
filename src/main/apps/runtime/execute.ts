@@ -12,7 +12,6 @@
  * - Stream processing: collect final result only
  */
 
-import { join } from 'path'
 import { tmpdir } from 'os'
 import { randomUUID } from 'crypto'
 import { createSession, query as agentSdkQuery } from '../../services/agent/resolved-sdk'
@@ -50,7 +49,8 @@ import { createOcrMcpServer } from '../../services/ocr'
 import { createApiRefMcpServer, HALO_API_TOOLSET_ID } from '../../services/api-ref'
 import { createOfficialDocsSession } from '../../services/official-docs-mcp'
 import { createEmailMcpServer } from '../../services/email-mcp'
-import { getConfig, resolveClaudeConfigDir } from '../../foundation/config.service'
+import { getConfig } from '../../foundation/config.service'
+import { logWriteOutsideSpace } from '../../services/space-scope'
 import { getSpace, getSpaceDir } from '../../services/space.service'
 import { openSessionWriter, type SessionWriter } from './session-store'
 import { registerActiveRun, unregisterActiveRun } from './active-runs'
@@ -373,18 +373,13 @@ export async function executeRun(options: ExecuteRunOptions): Promise<AppRunResu
     //    The AI uses native Read/Edit/Write on memory.md directly.
     const memoryMcpServer = createMemoryStatusMcpServer(memoryScope)
 
-    // Resolve plans directory for file-based data_path guidance in report_to_user.
-    // Uses the same CC config directory that the SDK session uses for consistency.
-    const configDir = resolveClaudeConfigDir(config.agent?.configDirMode)
-    const plansDir = join(configDir, 'plans')
-
     const reportContext: ReportToolContext = {
       appId: app.id,
       appName: app.spec.name,
       runId,
       sessionKey,
       notificationLevel: app.userOverrides.notificationLevel,
-      plansDir,
+      spaceId: app.spaceId!,
     }
 
     const reportMcpServer = createReportToolServer(
@@ -555,7 +550,7 @@ export async function executeRun(options: ExecuteRunOptions): Promise<AppRunResu
     })
 
     // ── 6. Process stream (headless: persist JSONL + detect report_to_user) ──
-    let streamResult = await processStream(session, initialMessage, abortController, runTag, sessionWriter)
+    let streamResult = await processStream(session, initialMessage, abortController, runTag, app.spaceId!, sessionWriter)
 
     // A free-text follow-up to an already-completed run (continue.interactive) is
     // a conversational turn: reply once and stop. The report_to_user auto-continue
@@ -585,7 +580,7 @@ export async function executeRun(options: ExecuteRunOptions): Promise<AppRunResu
         sessionWriter.writeTrigger(`[Auto-continue #${autoContinueCount}] ${AUTO_CONTINUE_FULL}`)
       }
 
-      const nextResult = await processStream(session, AUTO_CONTINUE_FULL, abortController, runTag, sessionWriter)
+      const nextResult = await processStream(session, AUTO_CONTINUE_FULL, abortController, runTag, app.spaceId!, sessionWriter)
 
       // Merge results: accumulate text and tokens, take latest flags
       streamResult = {
@@ -846,6 +841,7 @@ async function processStream(
   message: string,
   abortController: AbortController,
   runTag: string,
+  spaceId: string | undefined,
   writer?: SessionWriter
 ): Promise<StreamResult> {
   const result: StreamResult = {
@@ -891,6 +887,7 @@ async function processStream(
               if (typeof block.name === 'string' && block.name.includes('report_to_user')) {
                 result.reportToolCalled = true
               }
+              logWriteOutsideSpace(block.name, block.input ?? {}, spaceId, `[Runtime][${runTag}]`)
             }
           }
         }

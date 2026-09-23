@@ -47,6 +47,7 @@ import { isAppChatKey, parseAppChatKey } from '../../../shared/apps/im-keys'
 import { analytics } from '../analytics/analytics.service'
 import { AnalyticsEvents } from '../analytics/types'
 import { deriveErrorCode } from '../analytics/error-code'
+import { logWriteOutsideSpace } from '../space-scope'
 
 // Unified fallback error suffix - guides user to check logs
 const FALLBACK_ERROR_HINT = 'Check logs in Settings > System > Logs.'
@@ -824,6 +825,7 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
             }
             emitAgentEvent('agent:tool-call', spaceId, conversationId, toolCall as unknown as Record<string, unknown>)
             incrementToolCall(conversationId, blockState.toolName || '', toolInput)
+            logWriteOutsideSpace(blockState.toolName || '', toolInput, spaceId, `[Agent][${conversationId}]`)
 
             if (is.dev) {
               console.log(`[Agent][${conversationId}] Tool block complete [${blockState.toolName}], input: ${JSON.stringify(toolInput).substring(0, 100)}`)
