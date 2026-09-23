@@ -109,10 +109,9 @@ export function SettingsPage() {
                 <SystemSection config={config} setConfig={setConfig} />
               )}
 
-              {/* Advanced Section - Desktop only */}
-              {!isRemoteMode && (
-                <AdvancedSection config={config} setConfig={setConfig} />
-              )}
+              {/* Advanced Section - agent config, identical on both transports;
+                  its one desktop-only part self-gates */}
+              <AdvancedSection config={config} setConfig={setConfig} />
 
               {/* Remote Access Section - Desktop only */}
               {!isRemoteMode && (

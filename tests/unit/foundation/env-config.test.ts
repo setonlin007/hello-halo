@@ -5,6 +5,9 @@
  * env wins over persisted, absent env preserves persisted / seeds default,
  * aiKey OR aiUrl triggers source build, provider→legacy mapping, and the
  * no-op path when nothing is set.
+ *
+ * Agent Teams is the one concern that inverts the precedence — persisted wins —
+ * so its tests assert that direction explicitly.
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
@@ -38,6 +41,7 @@ const ENV_KEYS = [
   'http_proxy',
   'NO_PROXY',
   'no_proxy',
+  'HALO_ENABLE_TEAMS',
 ]
 
 function setConfig(cfg: Record<string, unknown>): void {
@@ -180,6 +184,43 @@ describe('env-config', () => {
       applyEnvConfig()
       const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
       expect(saved.network.browserUseProxy).toBe(true)
+    })
+  })
+
+  describe('Agent Teams (HALO_ENABLE_TEAMS)', () => {
+    it('seeds enableTeams when the config has no value yet', () => {
+      setConfig({ remoteAccess: { password: 'x' } })
+      process.env.HALO_ENABLE_TEAMS = '1'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect(saved.agent.enableTeams).toBe(true)
+    })
+
+    it('accepts "true" as well as "1", and anything else means off', () => {
+      setConfig({ remoteAccess: { password: 'x' } })
+      process.env.HALO_ENABLE_TEAMS = 'TRUE'
+      applyEnvConfig()
+      expect((saveConfig as unknown as MockFn).mock.calls[0][0].agent.enableTeams).toBe(true)
+
+      vi.clearAllMocks()
+      process.env.HALO_ENABLE_TEAMS = '0'
+      applyEnvConfig()
+      expect((saveConfig as unknown as MockFn).mock.calls[0][0].agent.enableTeams).toBe(false)
+    })
+
+    it('a value already chosen in Settings survives the next boot', () => {
+      setConfig({ remoteAccess: { password: 'x' }, agent: { enableTeams: false } })
+      process.env.HALO_ENABLE_TEAMS = '1'
+      applyEnvConfig()
+      expect((saveConfig as unknown as MockFn)).not.toHaveBeenCalled()
+    })
+
+    it('keeps sibling agent fields', () => {
+      setConfig({ remoteAccess: { password: 'x' }, agent: { maxTurns: 120 } })
+      process.env.HALO_ENABLE_TEAMS = '1'
+      applyEnvConfig()
+      const saved = (saveConfig as unknown as MockFn).mock.calls[0][0]
+      expect(saved.agent).toEqual({ maxTurns: 120, enableTeams: true })
     })
   })
 

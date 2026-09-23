@@ -7,6 +7,7 @@ import { useEffect, useState } from 'react'
 import { AlertTriangle, ChevronDown, ChevronUp, Cpu, Puzzle, RefreshCw, Terminal } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 import { api } from '../../api'
+import { isElectron } from '../../api/transport'
 import type { EngineAvailabilityReport, EngineId, HaloConfig } from '../../types'
 import { CLIConfigSection } from './CLIConfigSection'
 import { Switch } from '../ui/Switch'
@@ -338,13 +339,15 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
                   <RefreshCw className="w-4 h-4 shrink-0" />
                   <span>{t('Restart required for the engine change to take effect.')}</span>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleRelaunch}
-                  className="ml-3 shrink-0 px-3 py-1.5 text-xs font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 transition-colors"
-                >
-                  {t('Restart Now')}
-                </button>
+                {isElectron() && (
+                  <button
+                    type="button"
+                    onClick={handleRelaunch}
+                    className="ml-3 shrink-0 px-3 py-1.5 text-xs font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                  >
+                    {t('Restart Now')}
+                  </button>
+                )}
               </div>
               <p className="text-xs text-blue-600/80 dark:text-blue-400/80">
                 {t('The selected engine only applies to new conversations and new tasks. Existing conversations cannot switch engines.')}

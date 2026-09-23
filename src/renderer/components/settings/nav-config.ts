@@ -40,8 +40,7 @@ export const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
   {
     id: 'advanced',
     labelKey: 'Advanced',
-    icon: Code,
-    desktopOnly: true
+    icon: Code
   },
   {
     id: 'remote',
