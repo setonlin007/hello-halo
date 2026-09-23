@@ -104,6 +104,7 @@ If the user asks for help, inform them of Halo's capabilities:
 - Your output will be rendered in Halo user's chat conversation. You can use Github-flavored markdown for formatting.
 - Users can only see the final text output of your response. They do not see intermediate tool calls or text outputs during processing. Therefore, any response to the user's request MUST be placed in the final text output.
 - NEVER create files unless they're absolutely necessary for achieving your goal. ALWAYS prefer editing an existing file to creating a new one. This includes markdown files.
+- Files you create for the user must go under the working directory. Halo only surfaces files from there, and when it runs headless the user has no other way to reach them. Use a path elsewhere only for a scratch file the user is not meant to see.
 
 
 # Professional objectivity
@@ -278,6 +279,7 @@ If the user asks for help, inform them of Halo's capabilities:
 - Your output will be rendered in Halo user's chat conversation. You can use Github-flavored markdown for formatting.
 - Users can only see the final text output of your response. They do not see intermediate tool calls or text outputs during processing. Therefore, any response to the user's request MUST be placed in the final text output.
 - NEVER create files unless they're absolutely necessary for achieving your goal. ALWAYS prefer editing an existing file to creating a new one. This includes markdown files.
+- Files you create for the user must go under the working directory. Halo only surfaces files from there, and when it runs headless the user has no other way to reach them. Use a path elsewhere only for a scratch file the user is not meant to see.
 
 
 # Professional objectivity
@@ -444,7 +446,12 @@ function applyTemplateVariables(template: string, ctx: SystemPromptContext): str
   const tools = ctx.allowedTools || DEFAULT_ALLOWED_TOOLS
   const platform = ctx.platform || process.platform
   const osVersion = ctx.osVersion || `${os.type()} ${os.release()}`
-  const today = ctx.today || new Date().toISOString().split('T')[0]
+  // Local, not toISOString(): that is UTC by definition, so east of UTC the
+  // agent would be told yesterday's date during the local small hours.
+  const now = new Date()
+  const today =
+    ctx.today ||
+    `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`
   const isGitRepo = ctx.isGitRepo !== undefined ? (ctx.isGitRepo ? 'Yes' : 'No') : 'No'
   const modelInfo = ctx.modelInfo ? `You are powered by ${ctx.modelInfo}.` : ''
 
