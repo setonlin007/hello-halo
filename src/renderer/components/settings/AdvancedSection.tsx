@@ -13,6 +13,11 @@ import { CLIConfigSection } from './CLIConfigSection'
 import { Switch } from '../ui/Switch'
 import { useConfirmDialog } from '../../hooks/useConfirmDialog'
 import { DEFAULT_DISABLED_TOOLS } from '../../../shared/constants/disabled-tools'
+import {
+  TEAM_CIRCUIT_DEFAULTS,
+  TEAM_DEFAULT_TURN_TIMEOUT_MS,
+  TEAM_DEFAULT_MAX_CONCURRENT_TURNS,
+} from '../../../shared/apps/team-types'
 
 // ─── Agent SDK Engine ───────────────────────────────────────────────────────────
 
@@ -42,7 +47,7 @@ interface CapabilityGroup {
   /** CC SDK tools to add/remove from disabledTools (empty for MCP-only capabilities) */
   tools: readonly string[]
   /** Optional: dedicated AgentConfig boolean flag (for MCP servers, env vars, etc.) */
-  configKey?: 'enableTeams' | 'enableDigitalHumans'
+  configKey?: 'enableTeams' | 'enableDigitalHumans' | 'enableConversationInterop' | 'enableConversationSend'
   /** Default value when configKey is not set in config (default: false) */
   configDefault?: boolean
 }
@@ -87,6 +92,22 @@ const CAPABILITY_GROUPS: readonly CapabilityGroup[] = [
     configKey: 'enableDigitalHumans',
     configDefault: true,
   },
+  {
+    id: 'conversationInterop',
+    labelKey: 'Cross-Conversation Interop',
+    descKey: 'Let this conversation list, read, and message other conversations in the same space.',
+    tools: [],
+    configKey: 'enableConversationInterop',
+    configDefault: true,
+  },
+  {
+    id: 'conversationInteropSend',
+    labelKey: 'Cross-Conversation Sending',
+    descKey: 'Also allow delivering messages to other conversations, not just reading them. Only applies when Cross-Conversation Interop above is on.',
+    tools: [],
+    configKey: 'enableConversationSend',
+    configDefault: true,
+  },
 ]
 
 // ─── Component ──────────────────────────────────────────────────────────────────
@@ -122,6 +143,17 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
     return flags
   })
   const [developerMode, setDeveloperModeState] = useState(config?.agent?.developerMode ?? false)
+  const [teamTurnTimeoutMinutes, setTeamTurnTimeoutMinutesState] = useState(
+    Math.round((config?.agent?.teamTurnTimeoutMs ?? TEAM_DEFAULT_TURN_TIMEOUT_MS) / 60000)
+  )
+  const [teamCircuitLimits, setTeamCircuitLimitsState] = useState({
+    maxMessages: config?.agent?.teamCircuitLimits?.maxMessages ?? TEAM_CIRCUIT_DEFAULTS.maxMessages,
+    maxForwardDepth:
+      config?.agent?.teamCircuitLimits?.maxForwardDepth ?? TEAM_CIRCUIT_DEFAULTS.maxForwardDepth,
+  })
+  const [teamMaxConcurrentTurns, setTeamMaxConcurrentTurnsState] = useState(
+    config?.agent?.teamMaxConcurrentTurns ?? TEAM_DEFAULT_MAX_CONCURRENT_TURNS
+  )
   const [capsPanelOpen, setCapsPanelOpen] = useState(false)
   const [engineAvailability, setEngineAvailability] = useState<EngineAvailabilityReport | null>(null)
 
@@ -203,6 +235,47 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
     } catch (error) {
       console.error('[AdvancedSection] Failed to update maxTurns:', error)
       setMaxTurnsState(config?.agent?.maxTurns ?? 50)
+    }
+  }
+
+  const handleTeamTurnTimeoutChange = async (minutes: number) => {
+    const clamped = Math.max(5, Math.min(1440, minutes))
+    setTeamTurnTimeoutMinutesState(clamped)
+    try {
+      await saveAgentConfig({ teamTurnTimeoutMs: clamped * 60000 })
+    } catch (error) {
+      console.error('[AdvancedSection] Failed to update teamTurnTimeoutMs:', error)
+      setTeamTurnTimeoutMinutesState(
+        Math.round((config?.agent?.teamTurnTimeoutMs ?? TEAM_DEFAULT_TURN_TIMEOUT_MS) / 60000)
+      )
+    }
+  }
+
+  const handleTeamCircuitLimitChange = async (patch: Partial<typeof teamCircuitLimits>) => {
+    const previous = teamCircuitLimits
+    const next = { ...previous, ...patch }
+    setTeamCircuitLimitsState(next)
+    try {
+      await saveAgentConfig({
+        teamCircuitLimits: {
+          maxMessages: next.maxMessages,
+          maxForwardDepth: next.maxForwardDepth,
+        },
+      })
+    } catch (error) {
+      console.error('[AdvancedSection] Failed to update teamCircuitLimits:', error)
+      setTeamCircuitLimitsState(previous)
+    }
+  }
+
+  const handleTeamMaxConcurrentTurnsChange = async (value: number) => {
+    const clamped = Math.max(1, Math.min(100, value))
+    setTeamMaxConcurrentTurnsState(clamped)
+    try {
+      await saveAgentConfig({ teamMaxConcurrentTurns: clamped })
+    } catch (error) {
+      console.error('[AdvancedSection] Failed to update teamMaxConcurrentTurns:', error)
+      setTeamMaxConcurrentTurnsState(config?.agent?.teamMaxConcurrentTurns ?? TEAM_DEFAULT_MAX_CONCURRENT_TURNS)
     }
   }
 
@@ -444,6 +517,139 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
               }
             }}
             className="w-24 px-3 py-1.5 text-sm bg-secondary border border-border rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-primary/50"
+          />
+        </div>
+
+        {/* Team Turn Timeout */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pt-4 border-t border-border">
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <p className="font-medium">{t('Digital Team Turn Timeout')}</p>
+              <span
+                className="inline-flex items-center justify-center w-4 h-4 text-xs rounded-full bg-muted text-muted-foreground cursor-help"
+                title={t('Maximum time a digital team member may spend on one turn before it is stopped, in minutes')}
+              >
+                ?
+              </span>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              {t('Maximum time a digital team member may spend on one turn before it is stopped, in minutes')}
+            </p>
+          </div>
+          <input
+            type="number"
+            min={5}
+            max={1440}
+            value={teamTurnTimeoutMinutes}
+            onChange={(e) => {
+              const val = parseInt(e.target.value, 10)
+              if (!isNaN(val)) {
+                setTeamTurnTimeoutMinutesState(val)
+              }
+            }}
+            onBlur={(e) => {
+              const val = parseInt(e.target.value, 10)
+              if (!isNaN(val)) {
+                handleTeamTurnTimeoutChange(val)
+              }
+            }}
+            className="w-24 self-end sm:self-auto px-3 py-1.5 text-sm bg-secondary border border-border rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-primary/50"
+          />
+        </div>
+
+        {/* Team Circuit Breaker Limits */}
+        <div className="flex flex-col gap-3 pt-4 border-t border-border">
+          <div>
+            <div className="flex items-center gap-2">
+              <p className="font-medium">{t('Digital Team Circuit Breaker Limits')}</p>
+              <span
+                className="inline-flex items-center justify-center w-4 h-4 text-xs rounded-full bg-muted text-muted-foreground cursor-help"
+                title={t('Safety limits that automatically stop a digital team run if it loses control')}
+              >
+                ?
+              </span>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              {t('Safety limits that automatically stop a digital team run if it loses control')}
+            </p>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">{t('Max messages per run')}</span>
+              <input
+                type="number"
+                min={10}
+                max={5000}
+                value={teamCircuitLimits.maxMessages}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10)
+                  if (!isNaN(val)) setTeamCircuitLimitsState((prev) => ({ ...prev, maxMessages: val }))
+                }}
+                onBlur={(e) => {
+                  const val = parseInt(e.target.value, 10)
+                  if (!isNaN(val)) handleTeamCircuitLimitChange({ maxMessages: val })
+                }}
+                className="w-full px-3 py-1.5 text-sm bg-secondary border border-border rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">{t('Max chained replies')}</span>
+              <span className="text-[11px] text-muted-foreground/70">
+                {t('Digital humans replying back and forth without pause; resets when a person steps in')}
+              </span>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={teamCircuitLimits.maxForwardDepth}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10)
+                  if (!isNaN(val)) setTeamCircuitLimitsState((prev) => ({ ...prev, maxForwardDepth: val }))
+                }}
+                onBlur={(e) => {
+                  const val = parseInt(e.target.value, 10)
+                  if (!isNaN(val)) handleTeamCircuitLimitChange({ maxForwardDepth: val })
+                }}
+                className="w-full px-3 py-1.5 text-sm bg-secondary border border-border rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+            </label>
+          </div>
+        </div>
+
+        {/* Team Max Concurrent Turns */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pt-4 border-t border-border">
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <p className="font-medium">{t('Digital Team Concurrency Limit')}</p>
+              <span
+                className="inline-flex items-center justify-center w-4 h-4 text-xs rounded-full bg-muted text-muted-foreground cursor-help"
+                title={t('Maximum number of digital team member turns that may run at the same time on this machine')}
+              >
+                ?
+              </span>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              {t('Maximum number of digital team member turns that may run at the same time on this machine')}
+            </p>
+          </div>
+          <input
+            type="number"
+            min={1}
+            max={100}
+            value={teamMaxConcurrentTurns}
+            onChange={(e) => {
+              const val = parseInt(e.target.value, 10)
+              if (!isNaN(val)) {
+                setTeamMaxConcurrentTurnsState(val)
+              }
+            }}
+            onBlur={(e) => {
+              const val = parseInt(e.target.value, 10)
+              if (!isNaN(val)) {
+                handleTeamMaxConcurrentTurnsChange(val)
+              }
+            }}
+            className="w-24 self-end sm:self-auto px-3 py-1.5 text-sm bg-secondary border border-border rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-primary/50"
           />
         </div>
 

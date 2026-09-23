@@ -4,7 +4,9 @@
 import type { ChatSlice } from './internal'
 import { api, createEmptySessionState } from './internal'
 import type { AgentEventBase, Conversation, ConversationMeta, Thought, ToolCall } from './internal'
-import { isAppChatKey } from '../../../shared/apps/im-keys'
+import { isAppChatKey, parseTeamSessionKey } from '../../../shared/apps/im-keys'
+import { isRemoteMemberAppId } from '../team.store'
+import { nextTextBlockVersion } from './text-block-version'
 
 /**
  * Virtual conversation ids never represent a real user conversation and must
@@ -30,17 +32,19 @@ export const createAgentEventsSlice: ChatSlice<'handleAgentMessage' | 'handleAge
       const newSessions = new Map(state.sessions)
       const session = newSessions.get(conversationId) || createEmptySessionState()
 
-      // New text block signal: increment version number
-      // StreamingBubble detects version change to reset activeSnapshotLen
-      const newTextBlockVersion = isNewTextBlock
-        ? (session.textBlockVersion || 0) + 1
-        : (session.textBlockVersion || 0)
+      const prevContent = session.streamingContent || ''
 
       // Incremental mode: append delta to existing content
       // Full mode: replace directly (backward compatible)
       const newContent = delta
-        ? (session.streamingContent || '') + delta
-        : (content ?? session.streamingContent)
+        ? prevContent + delta
+        : (content ?? prevContent)
+
+      const newTextBlockVersion = nextTextBlockVersion(
+        session.textBlockVersion || 0,
+        isNewTextBlock,
+        prevContent.length
+      )
 
       newSessions.set(conversationId, {
         ...session,
@@ -118,12 +122,17 @@ export const createAgentEventsSlice: ChatSlice<'handleAgentMessage' | 'handleAge
     const { spaceId, conversationId } = data
     console.log(`[ChatStore] handleAgentComplete [${conversationId}]`)
 
-    // Check if user is currently viewing this conversation
+    // Check if user is currently viewing this conversation. `document.hasFocus()`
+    // guards against the window being backgrounded (minimized, another app
+    // focused) while sitting on this conversation — otherwise a task that
+    // finishes while the user stepped away gets silently marked "seen" and
+    // never shows up in the task panel.
     const state = get()
     const currentSpaceState = state.currentSpaceId ? state.spaceStates.get(state.currentSpaceId) : null
     const isUserViewingThisConversation =
       state.currentSpaceId === spaceId &&
-      currentSpaceState?.currentConversationId === conversationId
+      currentSpaceState?.currentConversationId === conversationId &&
+      document.hasFocus()
 
     // Track unseen completion if user is not viewing this conversation.
     // Skip virtual sessions (digital-human chat, IM, automation runs): they are
@@ -153,6 +162,8 @@ export const createAgentEventsSlice: ChatSlice<'handleAgentMessage' | 'handleAge
         newUnseenCompletions.set(conversationId, { spaceId, title })
         return { unseenCompletions: newUnseenCompletions }
       })
+      api.taskMarkUnseen(conversationId, spaceId, title).catch(err =>
+        console.error('[ChatStore] taskMarkUnseen error:', err))
     }
 
     // Capture turnId BEFORE any async work. If a new turn starts (sendMessage or
@@ -259,6 +270,12 @@ export const createAgentEventsSlice: ChatSlice<'handleAgentMessage' | 'handleAge
         // IMPORTANT: also clear thoughts and isThinking here — for IM sessions there is no
         // sendMessage call to reset these between turns, so stale thoughts from a previous
         // turn would otherwise accumulate and show up in the next turn's ThoughtProcess.
+        // A remote member has no local conversation to reload from, so the relayed
+        // stream is its only record — preserve it here and just stop the in-progress
+        // indicators, instead of clearing it like a local turn.
+        const teamSession = parseTeamSessionKey(conversationId)
+        const preserveRelayed = !!teamSession && isRemoteMemberAppId(teamSession.appId)
+
         set((state) => {
           const newSessions = new Map(state.sessions)
           const currentSession = newSessions.get(conversationId)
@@ -267,8 +284,8 @@ export const createAgentEventsSlice: ChatSlice<'handleAgentMessage' | 'handleAge
               ...currentSession,
               isGenerating: false,
               isThinking: false,
-              streamingContent: '',
-              thoughts: [],
+              streamingContent: preserveRelayed ? currentSession.streamingContent : '',
+              thoughts: preserveRelayed ? currentSession.thoughts : [],
               compactInfo: null,
               pendingQuestion: null,
               queuedMessages: [],  // Clear mid-turn queued messages
@@ -280,7 +297,7 @@ export const createAgentEventsSlice: ChatSlice<'handleAgentMessage' | 'handleAge
           }
           return { sessions: newSessions }
         })
-        console.log(`[ChatStore] No backend conversation for [${conversationId}], session state cleared`)
+        console.log(`[ChatStore] No backend conversation for [${conversationId}], session ${preserveRelayed ? 'preserved (remote member)' : 'cleared'}`)
       }
     } catch (error) {
       console.error('[ChatStore] Failed to reload conversation:', error)
@@ -443,6 +460,7 @@ export const createAgentEventsSlice: ChatSlice<'handleAgentMessage' | 'handleAge
         pendingQuestion: null,
         queuedMessages: [],
         turnId: (prevSession?.turnId ?? 0) + 1,
+        turnStartedAt: Date.now(),
       })
       return { sessions: newSessions }
     })

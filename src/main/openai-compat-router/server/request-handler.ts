@@ -48,6 +48,8 @@ export interface RequestHandlerOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
+// Some Anthropic models gate access on the reported Claude Code version.
+const CLAUDE_CODE_COMPAT_USER_AGENT = 'claude-cli/2.1.278 (external, cli)'
 
 /**
  * Anthropic error type to HTTP status code mapping
@@ -155,6 +157,13 @@ function linkAbortSignal(controller: AbortController, signal?: AbortSignal): voi
   signal.addEventListener('abort', () => controller.abort(), { once: true })
 }
 
+function getHeaderValue(
+  headers: Record<string, string> | undefined,
+  name: string
+): string | undefined {
+  return Object.entries(headers || {}).find(([key]) => key.toLowerCase() === name)?.[1]
+}
+
 /**
  * Make upstream request with OpenAI-style Authorization header
  */
@@ -243,8 +252,8 @@ async function fetchAnthropicUpstream(
     // management, etc.) and the provider adds its own (oauth, interleaved-
     // thinking). Both must be present — overwriting drops one side's betas,
     // causing API rejections.
-    const sdkBeta = Object.entries(sdkHeaders || {}).find(([k]) => k.toLowerCase() === 'anthropic-beta')?.[1]
-    const customBeta = Object.entries(customHeaders || {}).find(([k]) => k.toLowerCase() === 'anthropic-beta')?.[1]
+    const sdkBeta = getHeaderValue(sdkHeaders, 'anthropic-beta')
+    const customBeta = getHeaderValue(customHeaders, 'anthropic-beta')
     let mergedBeta: string | undefined
     if (sdkBeta && customBeta) {
       const seen = new Set<string>()
@@ -270,25 +279,27 @@ async function fetchAnthropicUpstream(
       ...(!hasAuthHeader && apiKey && { 'x-api-key': apiKey }),
     }
 
-    // Deduplicate content-type: sdkHeaders (lowercase from Express) and customHeaders
-    // (user-defined, any casing) may both contain content-type. When a plain object
-    // with two differently-cased keys like 'content-type' and 'Content-Type' is passed
-    // to fetch, undici normalizes both to the same header and joins the values with
-    // ", " — producing "application/json, application/json" which upstream APIs reject.
-    const contentTypeValue = Object.entries(headers).find(
-      ([k]) => k.toLowerCase() === 'content-type'
-    )?.[1]
+    // Provider headers explicitly override SDK headers. Remove every casing variant
+    // before restoring one canonical key, otherwise undici joins duplicate values.
+    const contentTypeValue = getHeaderValue(customHeaders, 'content-type')
+      ?? getHeaderValue(sdkHeaders, 'content-type')
+    const userAgentValue = getHeaderValue(customHeaders, 'user-agent')
+      ?? getHeaderValue(sdkHeaders, 'user-agent')
     for (const key of Object.keys(headers)) {
-      if (key.toLowerCase() === 'content-type') {
+      const normalizedKey = key.toLowerCase()
+      if (normalizedKey === 'content-type' || normalizedKey === 'user-agent') {
         delete headers[key]
       }
     }
     headers['content-type'] = contentTypeValue || 'application/json'
+    headers['user-agent'] = userAgentValue && !userAgentValue.startsWith('claude-cli/')
+      ? userAgentValue
+      : CLAUDE_CODE_COMPAT_USER_AGENT
 
     return await proxyFetch(targetUrl, {
       method: 'POST',
       headers,
-      body: Buffer.isBuffer(bodyOrBuffer) ? bodyOrBuffer : JSON.stringify(bodyOrBuffer),
+      body: (Buffer.isBuffer(bodyOrBuffer) ? bodyOrBuffer : JSON.stringify(bodyOrBuffer)) as BodyInit,
       signal: controller.signal
     })
   } finally {
@@ -583,7 +594,7 @@ async function handleOpenAIConversion(
     const adapterContext: AdapterContext = { originalRequest: requestToSend, sessionId: pickSessionId(sdkHeaders) }
     const adapter = applyProviderAdapter(
       backendUrl,
-      openaiRequest as Record<string, unknown>,
+      openaiRequest as unknown as Record<string, unknown>,
       requestHeaders,
       adapterId,
       adapterContext
@@ -614,7 +625,7 @@ async function handleOpenAIConversion(
       const rejectsSchemaRefs = errorLower.includes('$ref') || errorLower.includes('$defs')
 
       if (rejectsSchemaRefs) {
-        const rewritten = inlineToolSchemaRefs(openaiRequest as Record<string, unknown>)
+        const rewritten = inlineToolSchemaRefs(openaiRequest as unknown as Record<string, unknown>)
         if (rewritten > 0) {
           console.warn(`[RequestHandler] Upstream rejected $ref, retrying with ${rewritten} tool schema(s) inlined — consider a provider adapter for ${backendUrl}`)
 
@@ -641,7 +652,7 @@ async function handleOpenAIConversion(
           : convertAnthropicToOpenAIChat({ ...anthropicRequest, stream: true }, convertOptions).request
 
         // Re-apply provider adapter to retry request (reuse same headers and context)
-        applyProviderAdapter(backendUrl, retryRequest as Record<string, unknown>, requestHeaders, adapterId, adapterContext)
+        applyProviderAdapter(backendUrl, retryRequest as unknown as Record<string, unknown>, requestHeaders, adapterId, adapterContext)
 
         const oaiRetryStartTs = Date.now()
         upstreamResp = await fetchUpstream(backendUrl, apiKey, retryRequest, timeoutMs, clientAbort.signal, requestHeaders)

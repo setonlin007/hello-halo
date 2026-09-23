@@ -65,7 +65,10 @@ export default defineConfig({
   // Reporter to use
   reporter: [
     ['list'],
-    ['html', { open: 'never', outputFolder: 'e2e/report' }]
+    ['html', { open: 'never', outputFolder: 'e2e/report' }],
+    // Records perf scenarios that died before writing a result. It acts only on
+    // markers the current run created, so the e2e projects are unaffected.
+    ['./perf/reporter/in-flight.ts']
   ],
 
   // Global setup/teardown
@@ -74,6 +77,11 @@ export default defineConfig({
 
   // Projects - different test configurations
   projects: [
+    {
+      name: 'people-upgrade',
+      testMatch: ['**/people-upgrade.spec.ts', '**/people-capabilities.spec.ts', '**/people-settings.spec.ts', '**/people-tasks.spec.ts'],
+      use: { actionTimeout: 15000 }
+    },
     {
       name: 'smoke',
       testMatch: '**/smoke.spec.ts',
@@ -159,6 +167,70 @@ export default defineConfig({
       use: {
         // SkillHub tests make real network requests to api.skillhub.cn
         actionTimeout: 20000
+      }
+    },
+    {
+      name: 'team-render',
+      testMatch: '**/team-render.spec.ts',
+      use: {
+        actionTimeout: 15000
+      }
+    },
+    {
+      // Everything except the soaks. Bounded on purpose: a suite nobody can
+      // afford to run is a suite nobody runs, and this one has to be runnable
+      // from a release script.
+      name: 'perf',
+      testDir: './perf/specs',
+      testMatch: '**/*.spec.ts',
+      testIgnore: ['**/s9-*.spec.ts', '**/leak-*.spec.ts'],
+      // Perf scenarios launch the app themselves, stream real API replies
+      // (S2+), and some intentionally wait out a load timeout up to 90s
+      // (S5 csv extreme) before a 60s idle-CPU sample — give real headroom
+      // instead of the 30s default so a slow-but-succeeding measurement
+      // never gets killed by test-runner teardown before it can write out.
+      timeout: 240000,
+      use: {
+        actionTimeout: 30000
+      }
+    },
+    {
+      // What a release blocks on: the scenarios `RELEASE_GATE_SCENARIOS` in
+      // scripts/perf-gate/thresholds.mjs has a ceiling for, plus the crash
+      // observation. Deliberately narrower than `perf` — a release gate has to
+      // be short enough that nobody is tempted to skip it, and the scenarios
+      // left out (cold start, terminal, browser view, streaming) have no
+      // threshold that can be gated at any number.
+      name: 'perf-release',
+      testDir: './perf/specs',
+      testMatch: /s(4|5|10)-.*\.spec\.ts$/,
+      timeout: 240000,
+      use: {
+        actionTimeout: 30000
+      }
+    },
+    {
+      // Opt-in. The soaks measure growth per open/close cycle, so their cost is
+      // duration and their result is a rate — see S9_DURATION_MS in the specs
+      // for what a shorter run does and does not still tell you.
+      name: 'perf-soak',
+      testDir: './perf/specs',
+      testMatch: '**/s9-*.spec.ts',
+      timeout: 4200000,
+      use: {
+        actionTimeout: 30000
+      }
+    },
+    {
+      // Investigation, not measurement: these produce evidence about where a
+      // leak comes from and have no threshold, so they are kept out of `perf`
+      // rather than adding minutes to every run that only needs numbers.
+      name: 'perf-leak',
+      testDir: './perf/specs',
+      testMatch: '**/leak-*.spec.ts',
+      timeout: 1500000,
+      use: {
+        actionTimeout: 30000
       }
     },
     {

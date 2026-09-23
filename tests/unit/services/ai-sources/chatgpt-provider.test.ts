@@ -117,10 +117,11 @@ describe('ChatGPTProvider', () => {
     const arch = process.arch === 'x64' ? 'x86_64' : process.arch
     // "15.1" is padded to three components, and macOS is spelled "Mac OS" —
     // both exactly as the CLI's own macOS test (`default_client_tests.rs`) asserts.
-    const expected = {
+    const byPlatform: Partial<Record<NodeJS.Platform, string>> = {
       darwin: `codex_cli_rs/${CODEX_CLI_VERSION} (Mac OS 15.1.0; ${arch}) `,
       win32: `codex_cli_rs/${CODEX_CLI_VERSION} (Windows 15.1.0; ${arch}) `
-    }[process.platform]
+    }
+    const expected = byPlatform[process.platform]
 
     if (expected) {
       expect(userAgent).toMatch(new RegExp(`^${escapeRegExp(expected)}\\S+$`))

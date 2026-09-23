@@ -145,7 +145,6 @@ output:
 # -- Escalation --
 escalation:
   enabled: true
-  timeout_hours: 24
 
 # -- Permissions --
 permissions:
@@ -269,7 +268,7 @@ function formatInstallError(
   if (err instanceof AppApiError && err.code === 'ALREADY_INSTALLED') {
     return context === 'skill'
       ? t('A skill with the same name already exists. Uninstall it first or rename your skill before retrying.')
-      : t('A digital human with the same name already exists in this space. Uninstall it first or rename your digital human before retrying.')
+      : t('A digital human with the same name already exists in this workspace. Uninstall it first or rename your digital human before retrying.')
   }
   if (err instanceof Error) return err.message
   return t('Installation failed')
@@ -300,9 +299,16 @@ type ImportState =
 
 interface AppInstallDialogProps {
   onClose: () => void
+  /**
+   * Fired with the new app's id right after it's created/imported. Does not
+   * imply the dialog is closing — the bundle install path stays open on a
+   * 'partial' result to show which skills failed. Use `onClose` to react to
+   * dismissal.
+   */
+  onInstalled?: (appId: string) => void
 }
 
-export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
+export function AppInstallDialog({ onClose, onInstalled }: AppInstallDialogProps) {
   const { t } = useTranslation()
   const { installApp, importApp, loadApps, updateAppOverrides } = useAppsStore()
 
@@ -475,8 +481,9 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
   const handleYamlInstall = useCallback(async (yamlStr: string) => {
     setLoading(true)
     try {
-      await importApp(selectedSpaceId, yamlStr)
+      const appId = await importApp(selectedSpaceId, yamlStr)
       await loadApps()
+      if (appId) onInstalled?.(appId)
       void api.trackEvent('apps.create.submit', { mode: 'import', sourceType: 'yaml', result: 'success' })
       onClose()
     } catch (err) {
@@ -485,7 +492,7 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
     } finally {
       setLoading(false)
     }
-  }, [selectedSpaceId, importApp, loadApps, onClose, t])
+  }, [selectedSpaceId, importApp, loadApps, onClose, onInstalled, t])
 
   // ── Install: bundle (zip/folder) ──
   const handleBundleInstall = useCallback(async (result: ZipParseResult) => {
@@ -543,8 +550,9 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
     })
 
     try {
-      await importApp(selectedSpaceId, result.yamlContent)
+      const appId = await importApp(selectedSpaceId, result.yamlContent)
       await loadApps()
+      if (appId) onInstalled?.(appId)
       const failedSkills = skillResults.filter(s => !s.success)
       void api.trackEvent('apps.create.submit', {
         mode: 'import',
@@ -571,7 +579,7 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
         skillResults,
       })
     }
-  }, [selectedSpaceId, installApp, importApp, loadApps, t])
+  }, [selectedSpaceId, installApp, importApp, loadApps, onInstalled, t])
 
   // ── Install handler (visual / yaml modes) ──
   async function handleCreateInstall() {
@@ -622,6 +630,7 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
           await updateAppOverrides(appId, { modelSourceId, modelId })
         }
         await loadApps()
+        onInstalled?.(appId)
         trackSubmit('success')
         onClose()
       } else {
@@ -710,7 +719,7 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
               <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-primary/5 border border-primary/10">
                 <Sparkles className="w-3.5 h-3.5 text-primary mt-0.5 flex-shrink-0" />
                 <p className="text-xs text-muted-foreground">
-                  {t('You can also tell AI to create one for you through natural language in any space chat.')}
+                  {t('You can also tell AI to create one for you through natural language in any workspace chat.')}
                 </p>
               </div>
 
@@ -851,7 +860,7 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
                 onChange={e => setSelectedSpaceId(e.target.value)}
                 className="w-full px-3 py-2 text-sm bg-secondary border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
               >
-                <option value="" disabled>{t('Select a space')}</option>
+                <option value="" disabled>{t('Select a workspace')}</option>
                 {allSpaces.map(s => (
                   <option key={s.id} value={s.id}>{s.name}</option>
                 ))}
@@ -879,7 +888,7 @@ export function AppInstallDialog({ onClose }: AppInstallDialogProps) {
                   }`}
                 >
                   <FolderOpen className="w-3.5 h-3.5" />
-                  <span>{t('New Space')}</span>
+                  <span>{t('New Workspace')}</span>
                   <ChevronDown
                     className={`w-3 h-3 transition-transform duration-200 ${showCreateSpaceForm ? 'rotate-180' : ''}`}
                   />
@@ -1144,7 +1153,7 @@ function ImportTab({
             onChange={e => onSelectedSpaceChange(e.target.value)}
             className="w-full px-3 py-2 text-sm bg-secondary border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
           >
-            <option value="" disabled>{t('Select a space')}</option>
+            <option value="" disabled>{t('Select a workspace')}</option>
             {allSpaces.map(s => (
               <option key={s.id} value={s.id}>{s.name}</option>
             ))}

@@ -38,6 +38,8 @@ const SYNTHETIC_MESSAGE_TEXTS = new Set<string>([
 
 /** Minimal shape of a normalized assistant message this module reads. */
 interface RawAssistantMessage {
+  /** Frame discriminator carried by the SDK; unread here, declared so callers can pass the frame as-is. */
+  type?: string
   message?: {
     model?: string
     usage?: RawUsage

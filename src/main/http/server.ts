@@ -23,11 +23,17 @@ import {
 import { ACCESS_CODE_MIN_SUBMIT_LENGTH, PASSWORD_MAX_LENGTH } from '../../shared/auth/password-policy'
 import { initWebSocket, shutdownWebSocket, getClientCount } from './websocket'
 import { registerApiRoutes } from './routes'
+import { getInvitePage } from './invite-page'
+import { getTeamStore } from '../apps/team'
+import { getLocalIdentity } from './identity/index'
 import { getMainWindow as getMainWindowFromService } from '../foundation/window.service'
 
-// Vite dev server URL
-const VITE_DEV_SERVER = 'http://localhost:5173'
-const VITE_DEV_HOST = 'localhost'
+// Vite dev server URL. Pinned to 127.0.0.1, not 'localhost': electron.vite.config.ts
+// binds Vite to 127.0.0.1 only (see its comment), but Node 17+ on macOS resolves
+// 'localhost' to ::1 first — proxying through the hostname hit ECONNREFUSED
+// ::1:5173 even though Vite itself was up and reachable on IPv4.
+const VITE_DEV_SERVER = 'http://127.0.0.1:5173'
+const VITE_DEV_HOST = '127.0.0.1'
 const VITE_DEV_PORT = 5173
 
 // Server state
@@ -187,6 +193,30 @@ export async function startHttpServer(
       return res.sendStatus(200)
     }
     next()
+  })
+
+  // Office-invite landing page (public, before every auth gate). A shareable
+  // invite link opened in a BROWSER lands here instead of the remote-control
+  // login page: the page hands off into the installed app via halo://join, or
+  // guides installation. Token is never echoed server-side (see invite-page.ts).
+  expressApp.get('/', (req: Request, res: Response, next) => {
+    if (typeof req.query.office !== 'string' || typeof req.query.invite !== 'string') {
+      return next()
+    }
+    const officeId = req.query.office
+    let officeName: string | null = null
+    try {
+      officeName = getTeamStore()?.getTeamById(officeId)?.name ?? null
+    } catch {
+      /* team store not ready — the page renders with a neutral title */
+    }
+    let inviterName: string | null = null
+    try {
+      inviterName = getLocalIdentity().displayName
+    } catch {
+      /* identity not ready — neutral title */
+    }
+    res.send(getInvitePage({ officeName, inviterName }))
   })
 
   // Login endpoint (before auth middleware). Owns rate-limit + lockout
@@ -385,7 +415,9 @@ export async function startHttpServer(
     httpServer!.listen(listenPort, '0.0.0.0', () => {
       serverPort = listenPort
       console.log(`[HTTP] Server started on port ${listenPort}`)
-      console.log(`[HTTP] Access token: ${token}`)
+      // Never log the access token itself — the remote-access PIN must not
+      // reach logs — record only that one is active.
+      console.log(`[HTTP] Access token ${existingToken ? 'restored' : 'generated'} (len=${token.length})`)
       resolve({ port: listenPort, token })
     })
 

@@ -12,6 +12,7 @@
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import type { MockInstance } from 'vitest'
 
 // Newly reachable via ai-sources/manager.ts or mcp-manager.ts pulling in
 // analytics.service.ts (which statically imports providers/baidu.ts's
@@ -25,7 +26,7 @@ vi.mock('../../../../src/main/services/analytics/analytics.service', () => ({
 import { resolveSdkRuntimeLimits } from '../../../../src/main/services/agent/sdk-config'
 
 describe('resolveSdkRuntimeLimits', () => {
-  let warnSpy: ReturnType<typeof vi.spyOn>
+  let warnSpy: MockInstance<Parameters<typeof console.warn>, void>
 
   beforeEach(() => {
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})

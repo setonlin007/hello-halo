@@ -27,6 +27,7 @@ import { AppTypeIcon } from './AppTypeIcon'
 import { installVerb, installedVerb } from './install-verb'
 import { StoreDocumentation } from './StoreDocumentation'
 import { SkillFileTree } from './SkillFileTree'
+import { deriveSkillCommand } from '../../utils/skill-command'
 import type { AppType } from '../../../shared/apps/spec-types'
 
 function formatVersionDate(iso: string): string {
@@ -38,7 +39,7 @@ function formatVersionDate(iso: string): string {
  * inline) + reason as a sub-line, matching the mockup's `.req-card`. */
 function DependencyRow({ type, name, reason }: { type: AppType; name: string; reason?: string }) {
   return (
-    <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg border border-border/60 bg-background">
+    <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg border border-border/60 bg-card">
       <AppTypeIcon type={type} size="sm" />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5 min-w-0">
@@ -78,8 +79,9 @@ export function StoreDetail() {
   const setCurrentTab = useAppsPageStore(state => state.setCurrentTab)
   const consumeStoreAutoInstall = useAppsPageStore(state => state.consumeStoreAutoInstall)
   const checkUpdates = useAppsPageStore(state => state.checkUpdates)
-  const setView = useAppStore(state => state.setView)
+  const navigate = useAppStore(state => state.navigate)
   const spaces = useSpaceStore(state => state.spaces)
+  const haloSpace = useSpaceStore(state => state.haloSpace)
   const currentSpace = useSpaceStore(state => state.currentSpace)
   const setCurrentSpace = useSpaceStore(state => state.setCurrentSpace)
   const refreshCurrentSpace = useSpaceStore(state => state.refreshCurrentSpace)
@@ -183,24 +185,38 @@ export function StoreDetail() {
 
   // "Use" an already-installed app: digital humans open in their dedicated tab;
   // skills run inside a space conversation, so we open the space they're
-  // installed in (global installs fall back to the current/first space).
+  // installed in — checking both dedicated spaces and the built-in default
+  // space (haloSpace, tracked separately from `spaces`) — falling back to the
+  // current/first/default space for global installs.
   const handleUse = useCallback(() => {
     if (!installedApp || !entry) return
     if (entry.type === 'skill') {
       const target =
-        (installedApp.spaceId ? spaces.find(s => s.id === installedApp.spaceId) : null) ??
+        (installedApp.spaceId
+          ? (spaces.find(s => s.id === installedApp.spaceId) ??
+             (installedApp.spaceId === haloSpace?.id ? haloSpace : null))
+          : null) ??
         currentSpace ??
         spaces[0] ??
+        haloSpace ??
         null
       if (target) {
         setCurrentSpace(target)
         void refreshCurrentSpace()
         // Pre-fill the skill's slash command into that space's composer (consumed
-        // once by InputArea on arrival); same slugging as the composer's own list.
-        const command = `/${installedApp.spec.name.toLowerCase().replace(/\s+/g, '-')} `
-        useChatStore.setState({ pendingComposerInput: { spaceId: target.id, text: command } })
+        // once by InputArea on arrival); same slugging as SkillInfoCard's trigger display.
+        const slug = deriveSkillCommand(installedApp.spec.name).slice(1)
+        useChatStore.setState({
+          pendingComposerInput: {
+            spaceId: target.id,
+            text: `/${slug} `,
+            // Shown regardless of whether the target space's conversation
+            // session (if any) has announced this command itself.
+            slashPreview: { command: `/${slug}`, label: slug, description: entry.description },
+          }
+        })
       }
-      setView('space')
+      navigate('space')
       return
     }
     clearStoreSelection()
@@ -210,10 +226,11 @@ export function StoreDetail() {
     installedApp,
     entry,
     spaces,
+    haloSpace,
     currentSpace,
     setCurrentSpace,
     refreshCurrentSpace,
-    setView,
+    navigate,
     clearStoreSelection,
     setCurrentTab,
     selectApp,
@@ -408,7 +425,7 @@ export function StoreDetail() {
               <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 {t('Configuration')}
               </h2>
-              <div className="rounded-lg border border-border/60 bg-background overflow-hidden divide-y divide-border/60">
+              <div className="rounded-lg border border-border/60 bg-card overflow-hidden divide-y divide-border/60">
                 {(resolvedSpec?.config_schema ?? spec.config_schema)!.map(field => (
                   <div key={field.key} className="flex items-center gap-2.5 px-3.5 py-2.5">
                     <div className="min-w-0 flex-1">
@@ -480,7 +497,7 @@ export function StoreDetail() {
               <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 {t('System Prompt')}
               </h2>
-              <div className="rounded-lg border border-border/60 bg-background overflow-hidden">
+              <div className="rounded-lg border border-border/60 bg-card overflow-hidden">
                 <button
                   onClick={() => setShowSystemPrompt(!showSystemPrompt)}
                   className="flex w-full items-center gap-2 px-3.5 py-2.5 text-[13px] font-medium text-muted-foreground hover:text-foreground transition-colors"
@@ -515,7 +532,7 @@ export function StoreDetail() {
                 <SkillFileTree paths={automationSkillFilePaths} />
               )}
               {entry.tags.length > 0 && (
-                <div className="rounded-[10px] border border-border/60 bg-background p-3.5 space-y-2.5">
+                <div className="rounded-[10px] border border-border/60 bg-card p-3.5 space-y-2.5">
                   <h4 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                     {t('Tags')}
                   </h4>
@@ -532,7 +549,7 @@ export function StoreDetail() {
                 </div>
               )}
 
-              <div className="rounded-[10px] border border-border/60 bg-background p-3.5 space-y-2.5">
+              <div className="rounded-[10px] border border-border/60 bg-card p-3.5 space-y-2.5">
                 <h4 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                   {t('Details')}
                 </h4>
@@ -558,7 +575,7 @@ export function StoreDetail() {
 
               {/* Version history — collapsed by default, expands into a timeline */}
               {versions.length > 0 && (
-                <div className="rounded-[10px] border border-border/60 bg-background overflow-hidden">
+                <div className="rounded-[10px] border border-border/60 bg-card overflow-hidden">
                   <button
                     onClick={() => setShowVersions(!showVersions)}
                     className="flex w-full items-center gap-2 px-3.5 py-3 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"

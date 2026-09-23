@@ -31,6 +31,10 @@ type ResponsesEventType =
   | 'response.reasoning_summary_text.done'
   | 'response.reasoning_summary_part.added'
   | 'response.reasoning_summary_part.done'
+  // Non-spec spellings observed from OpenAI-compatible gateways
+  | 'response.done'
+  | 'response.error'
+  | 'done'
   | 'error'
 
 export class OpenAIResponsesStreamHandler extends BaseStreamHandler {

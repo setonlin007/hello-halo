@@ -5,6 +5,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { RpcContract, RpcClient } from '../shared/rpc/define'
 import type { CatalogModelCapability, ModelCapabilityOverride } from '../shared/types/model-capabilities'
+import type { EscalationResponse } from '../shared/apps/app-types'
+import type { UpdaterStatusPayload } from '../shared/types/updater'
 import { modelCapabilitiesRpc } from '../shared/rpc/contracts/model-capabilities.contract'
 import { onboardingRpc } from '../shared/rpc/contracts/onboarding.contract'
 import { securityRpc } from '../shared/rpc/contracts/security.contract'
@@ -31,13 +33,26 @@ import { wecomBotRpc } from '../shared/rpc/contracts/wecom-bot.contract'
 import { gitBashRpc } from '../shared/rpc/contracts/git-bash.contract'
 import { overlayRpc } from '../shared/rpc/contracts/overlay.contract'
 import { appRpc } from '../shared/rpc/contracts/app.contract'
+import { TEAM_IPC, TEAM_EVENTS } from '../shared/apps/team-types'
+import type {
+  CreateTeamInput,
+  UpdateTeamInput,
+  TeamMemberInput,
+  UpdateTeamMemberInput,
+  TeamEdge,
+  ProposedMember,
+  TeamRunTrigger,
+  TeamTriggerInput,
+} from '../shared/apps/team-types'
+import { taskRpc } from '../shared/rpc/contracts/task.contract'
 import type {
   HealthStatusResponse,
   HealthStateResponse,
   HealthRecoveryResponse,
   HealthReportResponse,
   HealthExportResponse,
-  HealthCheckResponse
+  HealthCheckResponse,
+  ImageAttachment
 } from '../shared/types'
 import type { NotifyChannelsProductConfig } from '../shared/types/notification-channels'
 import type { StoreInstallProgress, StoreCapabilities, CategoryTaxonomy, DiscoverLayout, ResolvedDiscover, MyPublication, StoreCollection, StoreSignInStatus } from '../shared/store/store-types'
@@ -103,11 +118,11 @@ export interface HaloAPI {
   // Space
   getHaloSpace: () => Promise<IpcResponse>
   listSpaces: () => Promise<IpcResponse>
-  createSpace: (input: { name: string; icon: string; customPath?: string }) => Promise<IpcResponse>
+  createSpace: (input: { name: string; icon: string; color?: string; customPath?: string }) => Promise<IpcResponse>
   deleteSpace: (spaceId: string) => Promise<IpcResponse>
   getSpace: (spaceId: string) => Promise<IpcResponse>
   openSpaceFolder: (spaceId: string) => Promise<IpcResponse>
-  updateSpace: (spaceId: string, updates: { name?: string; icon?: string }) => Promise<IpcResponse>
+  updateSpace: (spaceId: string, updates: { name?: string; icon?: string; color?: string }) => Promise<IpcResponse>
   getDefaultSpacePath: () => Promise<IpcResponse>
   selectFolder: () => Promise<IpcResponse>
   updateSpacePreferences: (spaceId: string, preferences: {
@@ -118,6 +133,8 @@ export interface HaloAPI {
   }) => Promise<IpcResponse>
   getSpacePreferences: (spaceId: string) => Promise<IpcResponse>
   reorderSpaces: (spaceIds: string[]) => Promise<IpcResponse>
+  listSpaceSummaries: () => Promise<IpcResponse>
+  forgetSpace: (spaceId: string) => Promise<IpcResponse>
 
   // Conversation
   listConversations: (spaceId: string) => Promise<IpcResponse>
@@ -353,8 +370,9 @@ export interface HaloAPI {
   // Updater
   checkForUpdates: () => Promise<IpcResponse>
   installUpdate: () => Promise<IpcResponse>
-  getVersion: () => Promise<IpcResponse>
-  onUpdaterStatus: (callback: (data: unknown) => void) => () => void
+  // Resolves the raw version string — this handler does not wrap in IpcResponse.
+  getVersion: () => Promise<string>
+  onUpdaterStatus: (callback: (data: UpdaterStatusPayload) => void) => () => void
 
   // Display scale (persistent UI zoom)
   getDisplayScale: () => Promise<IpcResponse>
@@ -483,6 +501,9 @@ export interface HaloAPI {
   imChannelsReload: () => Promise<IpcResponse>
   imChannelsProviders: () => Promise<IpcResponse>
   imChannelsPermissionDefaults: () => Promise<IpcResponse>
+  imChannelsSetInstanceApp: (instanceId: string, appId: string) => Promise<IpcResponse>
+  imChannelsCreateInstance: (instance: unknown) => Promise<IpcResponse>
+  imChannelsUnbindInstance: (instanceId: string) => Promise<IpcResponse>
 
   // IM Sessions
   imSessionsList: (appId?: string) => Promise<IpcResponse>
@@ -497,6 +518,19 @@ export interface HaloAPI {
   weixinIlinkDisconnect: (instanceId: string) => Promise<IpcResponse>
 
   // Apps Management
+  appGetStudioSummary: (language?: string) => Promise<IpcResponse<import('../shared/apps/people-directory').StudioSummary>>
+  appListPeople: (query?: import('../shared/apps/people-directory').PeopleDirectoryQuery) => Promise<IpcResponse<import('../shared/apps/people-directory').PeopleDirectoryPage>>
+  appGetAllStates: () => Promise<IpcResponse<Record<string, import('../shared/apps/app-types').AutomationAppState>>>
+  appGetActivityEntry: (input: { appId: string; entryId: string }) => Promise<IpcResponse<import('../shared/apps/app-types').ActivityEntry | null>>
+  appGetPendingEntries: (input: { appId: string; options?: import('../shared/apps/app-types').PendingDecisionQuery }) => Promise<IpcResponse<import('../shared/apps/app-types').ActivityEntry[]>>
+  appGetPendingInbox: (options?: import('../shared/apps/app-types').PendingDecisionQuery) => Promise<IpcResponse<import('../shared/apps/app-types').PendingDecisionInbox>>
+  appRetryEscalationContinuation: (input: { appId: string; entryId: string }) => Promise<IpcResponse>
+  appConfirmEscalationDeadline: (input: { appId: string; entryId: string; deadlineAt: number | null }) => Promise<IpcResponse>
+  appDismissEscalation: (input: { appId: string; entryId: string }) => Promise<IpcResponse>
+  appCloseRun: (input: { appId: string; runId: string }) => Promise<IpcResponse>
+  appStopRun: (input: { appId: string; runId: string }) => Promise<IpcResponse>
+  appGetCapabilityInventory: () => Promise<IpcResponse<import('../shared/apps/capability-inventory').CapabilityInventory>>
+  appPreviewSpaceChange: (input: { appId: string; newSpaceId: string }) => Promise<IpcResponse<import('../shared/apps/app-environment').AppSpaceChangePreview>>
   appList: (filter?: { spaceId?: string; status?: string; type?: string }) => Promise<IpcResponse>
   appGet: (appId: string) => Promise<IpcResponse>
   appInstall: (input: { spaceId: string | null; spec: unknown; userConfig?: Record<string, unknown> }) => Promise<IpcResponse>
@@ -506,10 +540,14 @@ export interface HaloAPI {
   appPause: (appId: string) => Promise<IpcResponse>
   appResume: (appId: string) => Promise<IpcResponse>
   appTrigger: (appId: string) => Promise<IpcResponse>
+  appStartRun: (appId: string) => Promise<IpcResponse<import('../shared/apps/app-types').AppRunStartInfo>>
   appGetState: (appId: string) => Promise<IpcResponse>
-  appGetActivity: (input: { appId: string; options?: { limit?: number; offset?: number; type?: string; since?: number } }) => Promise<IpcResponse>
+  appGetActivity: (input: { appId: string; options?: { limit?: number; offset?: number; type?: string; since?: number; teamId?: string; epochId?: string } }) => Promise<IpcResponse>
   appGetSession: (input: { appId: string; runId: string }) => Promise<IpcResponse>
-  appRespondEscalation: (input: { appId: string; escalationId: string; response: { ts: number; choice?: string; text?: string } }) => Promise<IpcResponse>
+  appRespondEscalation: (input: { appId: string; escalationId: string; response: EscalationResponse }) => Promise<IpcResponse>
+  appGetRuns: (input: { appId: string; options?: { limit?: number; offset?: number } }) => Promise<IpcResponse<import('../shared/apps/app-types').AutomationRunWithSummary[]>>
+  appGetRunStats: (input: { appId: string; window?: number }) => Promise<IpcResponse<import('../shared/apps/app-types').RunStats>>
+  appGetOverview: (input?: { spaceId?: string }) => Promise<IpcResponse<import('../shared/apps/app-types').AppOverviewEntry[]>>
   appContinueRun: (input: { appId: string; runId: string }) => Promise<IpcResponse>
   appInjectRun: (input: { appId: string; runId: string; text: string }) => Promise<IpcResponse>
   appUpdateConfig: (input: { appId: string; config: Record<string, unknown> }) => Promise<IpcResponse>
@@ -526,6 +564,8 @@ export interface HaloAPI {
   appOpenSkillFolder: (appId: string) => Promise<IpcResponse>
   appDeriveSkillCommandName: (name: string) => Promise<IpcResponse<string>>
   appListAvailableSkills: (appId: string) => Promise<IpcResponse<import('../shared/apps/app-types').AvailableSkill[]>>
+  appListAvailableSkillsForSpace: (spaceId: string) => Promise<IpcResponse<import('../shared/apps/app-types').AvailableSkill[]>>
+  appListEffectiveMcpApps: (spaceId: string) => Promise<IpcResponse<import('../shared/apps/app-types').InstalledApp[]>>
   appGetDataPath: (appId: string) => Promise<IpcResponse<{ path: string }>>
   appOpenDataFolder: (appId: string) => Promise<IpcResponse>
   appClearMemory: (appId: string) => Promise<IpcResponse<{ filesRemoved: number }>>
@@ -534,7 +574,7 @@ export interface HaloAPI {
   // App Chat
   // conversationId addresses a specific native/local session; omit for the app's
   // native default session.
-  appChatSend: (request: { appId: string; spaceId: string; message: string; images?: Array<{ type: string; mediaType: string; data: string; name?: string }>; thinkingEnabled?: boolean; conversationId?: string }) => Promise<IpcResponse<{ conversationId: string }>>
+  appChatSend: (request: { appId: string; spaceId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean; conversationId?: string; teamContext?: unknown }) => Promise<IpcResponse<{ conversationId: string }>>
   appChatStop: (appId: string, conversationId?: string) => Promise<IpcResponse>
   appChatStatus: (appId: string, conversationId?: string) => Promise<IpcResponse<{ isGenerating: boolean; conversationId: string }>>
   appChatMessages: (input: { appId: string; spaceId: string; conversationId?: string }) => Promise<IpcResponse>
@@ -543,7 +583,7 @@ export interface HaloAPI {
   appChatRestart: (appId: string) => Promise<IpcResponse<{ sessionsClosed: number }>>
   appImChatMessages: (input: { appId: string; spaceId: string; channel: string; chatType: 'direct' | 'group'; chatId: string }) => Promise<IpcResponse>
   appImChatClear: (input: { appId: string; spaceId: string; channel: string; chatType: 'direct' | 'group'; chatId: string }) => Promise<IpcResponse>
-  appImChatStop: (input: { appId: string; channel: string; chatType: 'direct' | 'group'; chatId: string }) => Promise<IpcResponse>
+  appImChatStop: (input: { appId: string; channel: string; chatType: 'direct' | 'group'; chatId: string }) => Promise<IpcResponse<{ stopped: boolean }>>
 
   // Native multi-session lifecycle. Listing/renaming reuse imSessionsList /
   // imSessionsSetCustomName (local sessions surface there with source==='local').
@@ -553,11 +593,89 @@ export interface HaloAPI {
 
   // App Event Listeners
   onAppStatusChanged: (callback: (data: unknown) => void) => () => void
+  onAppListChanged: (callback: (data: unknown) => void) => () => void
   onAppActivityEntry: (callback: (data: unknown) => void) => () => void
+  onAppEscalationResolved: (callback: (data: unknown) => void) => () => void
   onAppEscalation: (callback: (data: unknown) => void) => () => void
   onAppNavigate: (callback: (data: unknown) => void) => () => void
   onImSessionUpdated: (callback: (data: unknown) => void) => () => void
   onImChannelInstanceUpdated: (callback: (data: unknown) => void) => () => void
+
+  // Digital Team
+  teamList: (spaceId?: string) => Promise<IpcResponse>
+  teamGet: (teamId: string) => Promise<IpcResponse>
+  teamCreate: (input: { input: CreateTeamInput; confirmedProposal?: ProposedMember[] }) => Promise<IpcResponse>
+  teamUpdate: (input: { teamId: string; input: UpdateTeamInput }) => Promise<IpcResponse>
+  teamDissolve: (teamId: string) => Promise<IpcResponse>
+  teamAddMember: (input: { teamId: string; member: TeamMemberInput }) => Promise<IpcResponse>
+  teamUpdateMember: (input: { teamId: string; appId: string; input: UpdateTeamMemberInput }) => Promise<IpcResponse>
+  teamCancelCheck: (input: { teamId: string; checkId: string }) => Promise<IpcResponse>
+  teamRemoveMember: (input: { teamId: string; appId: string }) => Promise<IpcResponse>
+  teamSetEdges: (input: { teamId: string; edges: TeamEdge[] }) => Promise<IpcResponse>
+  teamProposeMembers: (input: { goal: string; owningSpaceId: string }) => Promise<IpcResponse>
+  teamRun: (teamId: string, trigger?: TeamRunTrigger) => Promise<IpcResponse>
+  teamPause: (teamId: string) => Promise<IpcResponse>
+  teamGetDetail: (teamId: string) => Promise<IpcResponse>
+  /** Triggers (team as a first-class triggerable entity). */
+  teamListTriggers: (teamId: string) => Promise<IpcResponse>
+  teamSetTrigger: (input: { teamId: string; trigger: TeamTriggerInput; triggerId?: string }) => Promise<IpcResponse>
+  teamRemoveTrigger: (input: { teamId: string; triggerId: string }) => Promise<IpcResponse>
+  teamListArtifacts: (teamId: string) => Promise<IpcResponse>
+  /** Load a member's team-channel chat history for one run (JSONL). */
+  teamChatMessages: (input: { appId: string; spaceId: string; teamId: string; epochId: string; sinceSeq?: number }) => Promise<IpcResponse>
+  /** Run history (epochs), newest first. */
+  teamListEpochs: (teamId: string) => Promise<IpcResponse>
+  /** Tasks/findings/members snapshot for one past run. */
+  teamEpochBoard: (input: { teamId: string; epochId: string }) => Promise<IpcResponse>
+  /** Products produced during one specific run. */
+  teamEpochArtifacts: (input: { teamId: string; epochId: string }) => Promise<IpcResponse>
+  /**
+   * Remote office: mint an invite link (host). An optional scope narrows what the
+   * joiner may see/contact/be-assigned (omitted = default-open). The scope shape is
+   * inlined here because the canonical OfficeScope lives in main and preload must
+   * not import across that boundary.
+   */
+  teamGenerateInvite: (input: {
+    teamId: string
+    ttlMs?: number
+    scope?: {
+      visibility: 'full' | 'assigned' | 'readonly'
+      contactable: 'all' | 'lead-only'
+      discoverable: boolean
+      canReinvite: boolean
+    }
+  }) => Promise<IpcResponse>
+  /** Remote office: revoke a previously issued invite. */
+  teamRevokeInvite: (input: { jti: string }) => Promise<IpcResponse>
+  /** Remote office: join an office hosted elsewhere, bringing local members (joiner). */
+  teamJoinOffice: (input: { officeId: string; serverUrl: string; inviteToken: string; bringAppIds: string[] }) => Promise<IpcResponse>
+  /** Remote office: leave a joined office, removing the local shadow (joiner). */
+  teamLeaveOffice: (input: { officeId: string }) => Promise<IpcResponse>
+  /** Send a message to a remote member via the office owner (team wake). */
+  teamSendToMember: (input: { teamId: string; appId: string; epochId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean }) => Promise<IpcResponse>
+  /** Conversations (office-shared session objects). */
+  teamListConversations: (teamId: string) => Promise<IpcResponse>
+  teamOpenConversation: (input: { teamId: string; title?: string; memberAppId?: string }) => Promise<IpcResponse>
+  teamRenameConversation: (input: { teamId: string; epochId: string; title: string | null }) => Promise<IpcResponse>
+  teamArchiveConversation: (input: { teamId: string; epochId: string }) => Promise<IpcResponse>
+  /** One-shot pull of an invite link that arrived via halo:// before the renderer was up. */
+  teamConsumePendingInvite: () => Promise<IpcResponse>
+
+  // Digital Team Event Listeners
+  onTeamUpdated: (callback: (data: unknown) => void) => () => void
+  onTeamBlackboard: (callback: (data: unknown) => void) => () => void
+  onTeamMessage: (callback: (data: unknown) => void) => () => void
+  onTeamPresence: (callback: (data: unknown) => void) => () => void
+  onTeamOfficeStatus: (callback: (data: unknown) => void) => () => void
+  onTeamInviteLink: (callback: (data: unknown) => void) => () => void
+  onTeamMemberHistory: (callback: (data: unknown) => void) => () => void
+  // Task panel bookkeeping (completed-but-unseen conversations, post-view grace period)
+  taskListState: () => Promise<IpcResponse<import('../main/platform/task-state').ConversationTaskState[]>>
+  taskMarkUnseen: (conversationId: string, spaceId: string, title: string) => Promise<IpcResponse>
+  taskMarkRead: (conversationId: string, spaceId: string, title: string, originalStatus: 'completed-unseen' | 'error') => Promise<IpcResponse>
+  taskSetKept: (conversationId: string, kept: boolean) => Promise<IpcResponse>
+  taskRemoveState: (conversationId: string) => Promise<IpcResponse>
+  onTaskStateChanged: (callback: (data: unknown) => void) => () => void
 
   // Notification (in-app toast)
   onNotificationToast: (callback: (data: unknown) => void) => () => void
@@ -622,6 +740,10 @@ interface IpcResponse<T = unknown> {
   // (e.g. TUNNEL_DISABLED_BY_POLICY, CREDENTIAL_RESTORE_FAILED) without
   // depending on the English `error` string.
   code?: string
+  // True when `data` is a cached/possibly-incomplete copy served because the
+  // live source was unreachable (currently: remote member history while the
+  // owner is offline). The renderer surfaces an "offline" notice.
+  stale?: boolean
 }
 
 // Type-safe event listener creator
@@ -860,11 +982,59 @@ const api: HaloAPI = {
 
   // App Event Listeners
   onAppStatusChanged: (callback) => createEventListener('app:status_changed', callback),
+  onAppListChanged: (callback) => createEventListener('app:list_changed', callback),
   onAppActivityEntry: (callback) => createEventListener('app:activity_entry:new', callback),
   onAppEscalation: (callback) => createEventListener('app:escalation:new', callback),
+  onAppEscalationResolved: (callback) => createEventListener('app:escalation:resolved', callback),
   onAppNavigate: (callback) => createEventListener('app:navigate', callback),
   onImSessionUpdated: (callback) => createEventListener('app:im-session-updated', callback),
   onImChannelInstanceUpdated: (callback) => createEventListener('im-channels:instance-updated', callback),
+
+  // Digital Team — request methods (thin invoke wrappers over TEAM_IPC channels)
+  teamList: (spaceId) => ipcRenderer.invoke(TEAM_IPC.list, spaceId),
+  teamGet: (teamId) => ipcRenderer.invoke(TEAM_IPC.get, teamId),
+  teamCreate: (input) => ipcRenderer.invoke(TEAM_IPC.create, input),
+  teamUpdate: (input) => ipcRenderer.invoke(TEAM_IPC.update, input),
+  teamDissolve: (teamId) => ipcRenderer.invoke(TEAM_IPC.dissolve, teamId),
+  teamAddMember: (input) => ipcRenderer.invoke(TEAM_IPC.addMember, input),
+  teamUpdateMember: (input) => ipcRenderer.invoke(TEAM_IPC.updateMember, input),
+  teamCancelCheck: (input) => ipcRenderer.invoke(TEAM_IPC.cancelCheck, input),
+  teamRemoveMember: (input) => ipcRenderer.invoke(TEAM_IPC.removeMember, input),
+  teamSetEdges: (input) => ipcRenderer.invoke(TEAM_IPC.setEdges, input),
+  teamProposeMembers: (input) => ipcRenderer.invoke(TEAM_IPC.proposeMembers, input),
+  teamRun: (teamId, trigger) => ipcRenderer.invoke(TEAM_IPC.run, teamId, trigger),
+  teamPause: (teamId) => ipcRenderer.invoke(TEAM_IPC.pause, teamId),
+  teamGetDetail: (teamId) => ipcRenderer.invoke(TEAM_IPC.getDetail, teamId),
+  teamListArtifacts: (teamId) => ipcRenderer.invoke(TEAM_IPC.listArtifacts, teamId),
+  teamListTriggers: (teamId) => ipcRenderer.invoke(TEAM_IPC.listTriggers, teamId),
+  teamSetTrigger: (input) => ipcRenderer.invoke(TEAM_IPC.setTrigger, input),
+  teamRemoveTrigger: (input) => ipcRenderer.invoke(TEAM_IPC.removeTrigger, input),
+  teamChatMessages: (input) => ipcRenderer.invoke('team:chat-messages', input),
+  teamListEpochs: (teamId) => ipcRenderer.invoke('team:list-epochs', teamId),
+  teamEpochBoard: (input) => ipcRenderer.invoke('team:epoch-board', input),
+  teamEpochArtifacts: (input) => ipcRenderer.invoke('team:epoch-artifacts', input),
+  teamGenerateInvite: (input) => ipcRenderer.invoke(TEAM_IPC.generateInvite, input),
+  teamRevokeInvite: (input) => ipcRenderer.invoke(TEAM_IPC.revokeInvite, input),
+  teamJoinOffice: (input) => ipcRenderer.invoke(TEAM_IPC.joinOffice, input),
+  teamLeaveOffice: (input) => ipcRenderer.invoke(TEAM_IPC.leaveOffice, input),
+  teamSendToMember: (input) => ipcRenderer.invoke(TEAM_IPC.sendToMember, input),
+  teamListConversations: (teamId) => ipcRenderer.invoke(TEAM_IPC.listConversations, teamId),
+  teamOpenConversation: (input) => ipcRenderer.invoke(TEAM_IPC.openConversation, input),
+  teamRenameConversation: (input) => ipcRenderer.invoke(TEAM_IPC.renameConversation, input),
+  teamArchiveConversation: (input) => ipcRenderer.invoke(TEAM_IPC.archiveConversation, input),
+  teamConsumePendingInvite: () => ipcRenderer.invoke(TEAM_IPC.consumePendingInvite),
+
+  // Digital Team Event Listeners
+  onTeamUpdated: (callback) => createEventListener(TEAM_EVENTS.updated, callback),
+  onTeamBlackboard: (callback) => createEventListener(TEAM_EVENTS.blackboard, callback),
+  onTeamMessage: (callback) => createEventListener(TEAM_EVENTS.message, callback),
+  onTeamPresence: (callback) => createEventListener(TEAM_EVENTS.presence, callback),
+  onTeamOfficeStatus: (callback) => createEventListener(TEAM_EVENTS.officeStatus, callback),
+  onTeamInviteLink: (callback) => createEventListener(TEAM_EVENTS.inviteLink, callback),
+  onTeamMemberHistory: (callback) => createEventListener(TEAM_EVENTS.memberHistory, callback),
+  // Task panel bookkeeping (all derived from taskRpc contract)
+  ...bindRpc(taskRpc),
+  onTaskStateChanged: (callback) => createEventListener('task:state_changed', callback),
 
   // Store (App Registry) — most methods derived from storeRpc contract;
   // storeInstall keeps its custom progress-listener wrapper below.

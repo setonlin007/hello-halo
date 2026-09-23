@@ -202,7 +202,7 @@ export class OpenAIChatStreamHandler extends BaseStreamHandler {
     const toolUseId = `srvtoolu_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`
 
     const results = annotations.map((ann) => ({
-      type: 'web_search_result',
+      type: 'web_search_result' as const,
       title: ann.url_citation?.title,
       url: ann.url_citation?.url
     }))

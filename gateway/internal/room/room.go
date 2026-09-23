@@ -1,0 +1,522 @@
+package room
+
+import (
+	"encoding/json"
+	"log/slog"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/openkursar/hello-halo/gateway/internal/metrics"
+	"github.com/openkursar/hello-halo/gateway/internal/session"
+	"github.com/openkursar/hello-halo/gateway/internal/wire"
+)
+
+// member is a joiner session and its admission state. Sessions start pending:
+// their frames flow only toward the host until the gateway observes the host
+// granting the join (§9.2 admission gate).
+type member struct {
+	sess       *session.Session
+	admitted   bool
+	admitTimer *time.Timer
+}
+
+// Room is one office's relay state: the host session (routing hub of the
+// star topology) plus the joiner members keyed by proven node id.
+type Room struct {
+	officeID string
+
+	mu           sync.Mutex
+	host         *session.Session
+	hostIdentity string
+	members      map[string]*member
+	retainTimer  *time.Timer
+	disbanded    bool
+	// Per-identity election-relay budgets for the hostless window (v2-gw).
+	electionBudget map[string]*relayBudget
+	// Last time an undeliverable-target report was emitted per target, so a host
+	// whose durable outbox retransmits every few seconds cannot flood the log.
+	lastNoMemberReport map[string]time.Time
+
+	cfg     Config
+	log     *slog.Logger
+	metrics *metrics.Metrics
+	onEmpty func(officeID string)
+}
+
+// Config carries room tunables (production defaults per §9.2).
+type Config struct {
+	AdmissionTimeout time.Duration
+	HostRetention    time.Duration
+	// Max election frames relayed per member per second while the room has no
+	// host (v2-gw hostless relay). The election vocabulary is tiny — claims,
+	// votes, a bounded catch-up — so the ceiling is generous yet starves a
+	// misbehaving member before it can amplify through the broadcast.
+	ElectionRelayPerSec int
+	// Office id to trace in full (bodies included), or "*" for every office.
+	// Empty disables tracing — see trace.go for why this is not a normal mode.
+	Trace string
+}
+
+// Minimum gap between undeliverable-target reports for the same node.
+const noMemberReportInterval = 30 * time.Second
+
+// relayBudget is a fixed one-second window counter for the election relay.
+type relayBudget struct {
+	windowStart time.Time
+	count       int
+}
+
+func (c *Config) fillDefaults() {
+	if c.AdmissionTimeout == 0 {
+		c.AdmissionTimeout = 60 * time.Second
+	}
+	if c.HostRetention == 0 {
+		c.HostRetention = 5 * time.Minute
+	}
+	if c.ElectionRelayPerSec == 0 {
+		c.ElectionRelayPerSec = 30
+	}
+}
+
+func newRoom(officeID string, cfg Config, log *slog.Logger, m *metrics.Metrics, onEmpty func(string)) *Room {
+	return &Room{
+		officeID:           officeID,
+		members:            make(map[string]*member),
+		electionBudget:     make(map[string]*relayBudget),
+		lastNoMemberReport: make(map[string]time.Time),
+		cfg:                cfg,
+		log:                log.With("office", officeID),
+		metrics:            m,
+		onEmpty:            onEmpty,
+	}
+}
+
+// addMember registers an authenticated session as a pending member. A second
+// connection with the same identity replaces (closes) the old one.
+func (r *Room) addMember(s *session.Session) {
+	nodeID := s.IdentityID()
+	r.mu.Lock()
+	if r.disbanded {
+		r.mu.Unlock()
+		s.Close()
+		return
+	}
+	if prev, ok := r.members[nodeID]; ok {
+		prev.stopTimer()
+		defer prev.sess.Close()
+	}
+	m := &member{sess: s}
+	m.admitTimer = time.AfterFunc(r.cfg.AdmissionTimeout, func() {
+		r.expireAdmission(nodeID, s)
+	})
+	r.members[nodeID] = m
+	// The node is back; a later disappearance is a new fact and must report at once
+	// rather than fall inside the previous one's quiet window.
+	delete(r.lastNoMemberReport, nodeID)
+	r.mu.Unlock()
+	r.log.Debug("member pending", "node", nodeID)
+}
+
+func (m *member) stopTimer() {
+	if m.admitTimer != nil {
+		m.admitTimer.Stop()
+		m.admitTimer = nil
+	}
+}
+
+func (r *Room) expireAdmission(nodeID string, s *session.Session) {
+	r.mu.Lock()
+	m, ok := r.members[nodeID]
+	if !ok || m.sess != s || m.admitted {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.members, nodeID)
+	delete(r.electionBudget, nodeID)
+	r.mu.Unlock()
+	r.log.Info("member admission timed out", "node", nodeID)
+	s.CloseWithGwError(wire.CodeAdmissionTimeout, "not admitted within timeout")
+}
+
+// attachHost declares s the host for this room and reports whether the attach
+// succeeded. Same identity replaces its own stale connection; a different
+// identity is rejected here as a defense in depth (the hub's pin gate is the
+// authoritative check).
+func (r *Room) attachHost(s *session.Session) bool {
+	nodeID := s.IdentityID()
+	r.mu.Lock()
+	if r.disbanded {
+		r.mu.Unlock()
+		s.Close()
+		return false
+	}
+	if r.host != nil && r.host != s {
+		if r.hostIdentity != nodeID {
+			r.mu.Unlock()
+			s.SendGwError(wire.CodeHostConflict, "room already has an active host")
+			return false
+		}
+		old := r.host
+		r.host = nil
+		defer old.Close()
+	}
+	if r.retainTimer != nil {
+		r.retainTimer.Stop()
+		r.retainTimer = nil
+	}
+	// The host is not a routed member of its own room.
+	if m, ok := r.members[nodeID]; ok && m.sess == s {
+		m.stopTimer()
+		delete(r.members, nodeID)
+	}
+	r.host = s
+	r.hostIdentity = nodeID
+	r.mu.Unlock()
+	s.SendEnvelope(wire.NewEnvelope(wire.TypeGwAttached, map[string]string{"role": "host"}))
+	r.log.Info("host attached", "node", nodeID)
+	return true
+}
+
+// routeFromMember forwards a member's federation frame to the host (§9.2:
+// member frames are always routed to the host; "to" is ignored). v2-gw: while
+// the room has NO host, the election control vocabulary is relayed
+// member-to-member instead, so the office can elect a successor through the
+// relay; every other kind still answers HOST_UNREACHABLE.
+func (r *Room) routeFromMember(s *session.Session, hdr *wire.FederationHeader, env *wire.Envelope) {
+	r.mu.Lock()
+	host := r.host
+	hostIdentity := r.hostIdentity
+	r.mu.Unlock()
+	if host == nil {
+		if wire.IsElectionKind(hdr.Kind) {
+			r.relayElectionFrame(s, env)
+			return
+		}
+		s.SendGwError(wire.CodeHostUnreachable, "host is not online")
+		return
+	}
+	// Stamp the proven session identity so frames without a payload fromNode
+	// (presence-update/stream-frames/turn-complete) keep their origin across
+	// the relay; the host reads envelope.from as authoritative (§9.2).
+	data := marshalForward(env, s.IdentityID())
+	if data == nil {
+		s.SendGwError(wire.CodeMalformed, "unencodable frame")
+		return
+	}
+	plane := wire.ClassifyPlane(hdr.Kind)
+	delivered := 0
+	if host.SendData(plane, data) {
+		r.metrics.FramesForwardedTotal[plane].Add(1)
+		delivered = 1
+	}
+	traceOut(r.log, &r.cfg, r.officeID, "member->host", hostIdentity, hdr.Kind, len(data), delivered)
+}
+
+// routeFromHost forwards a host frame: to == nodeId unicasts, to == nil
+// broadcasts to admitted members. join-grant / join-reject envelopes drive the
+// admission gate.
+func (r *Room) routeFromHost(s *session.Session, hdr *wire.FederationHeader, env *wire.Envelope) {
+	plane := wire.ClassifyPlane(hdr.Kind)
+	// Host→member frames need no from stamp: the member's single upstream peer
+	// IS the host, so origin is unambiguous.
+	data := marshalForward(env, "")
+	if data == nil {
+		s.SendGwError(wire.CodeMalformed, "unencodable frame")
+		return
+	}
+
+	if env.To != nil && *env.To != "" {
+		target := *env.To
+		r.mu.Lock()
+		m, ok := r.members[target]
+		if ok {
+			switch hdr.Kind {
+			case "join-grant":
+				if !m.admitted {
+					m.admitted = true
+					m.stopTimer()
+					r.log.Info("member admitted", "node", target)
+				}
+			case "join-reject":
+				m.stopTimer()
+				delete(r.members, target)
+			}
+		}
+		var roster []string
+		report := false
+		if !ok {
+			report = r.shouldReportNoMemberLocked(target)
+			if report {
+				roster = r.rosterLocked()
+			}
+		}
+		r.mu.Unlock()
+		if !ok {
+			// The host addressed a node this room has no session for. Silence here
+			// is indistinguishable at the host from a delivered frame: its outbox
+			// keeps waiting for an ack, the office looks connected, and nothing
+			// anywhere records the loss.
+			r.metrics.FramesDroppedNoMemberTotal.Add(1)
+			if report {
+				r.log.Warn("host frame dropped: addressed node has no session in this room",
+					"target", target, "kind", hdr.Kind, "roomMembers", len(roster), "members", roster)
+				s.SendGwError(wire.CodeMemberUnreachable, target)
+			}
+			traceOut(r.log, &r.cfg, r.officeID, "host->member DROPPED", target, hdr.Kind, len(data), 0)
+			return
+		}
+		delivered := 0
+		if m.sess.SendData(plane, data) {
+			r.metrics.FramesForwardedTotal[plane].Add(1)
+			delivered = 1
+		}
+		traceOut(r.log, &r.cfg, r.officeID, "host->member", target, hdr.Kind, len(data), delivered)
+		if hdr.Kind == "join-reject" {
+			m.sess.CloseGraceful()
+		}
+		return
+	}
+
+	r.mu.Lock()
+	targets := make([]*session.Session, 0, len(r.members))
+	for _, m := range r.members {
+		if m.admitted {
+			targets = append(targets, m.sess)
+		}
+	}
+	r.mu.Unlock()
+	delivered := 0
+	for _, t := range targets {
+		if t.SendData(plane, data) {
+			r.metrics.FramesForwardedTotal[plane].Add(1)
+			delivered++
+		}
+	}
+	traceOut(r.log, &r.cfg, r.officeID, "host->broadcast", "*", hdr.Kind, len(data), delivered)
+}
+
+// shouldReportNoMemberLocked rate-limits the undeliverable-target report to one
+// per target per window. A host's durable outbox retransmits an unacked entry
+// every few seconds, so reporting every frame would bury the first occurrence —
+// which is the one that says when the node went missing. Caller holds r.mu.
+func (r *Room) shouldReportNoMemberLocked(target string) bool {
+	now := time.Now()
+	if last, seen := r.lastNoMemberReport[target]; seen && now.Sub(last) < noMemberReportInterval {
+		return false
+	}
+	r.lastNoMemberReport[target] = now
+	return true
+}
+
+// rosterLocked lists who the room actually holds, with admission state. Printed
+// alongside a missing target because the useful question is never "is it there"
+// but "then who IS there" — a key that almost matches, or a room that emptied.
+// Caller holds r.mu.
+func (r *Room) rosterLocked() []string {
+	roster := make([]string, 0, len(r.members))
+	for id, m := range r.members {
+		state := "pending"
+		if m.admitted {
+			state = "admitted"
+		}
+		roster = append(roster, id+":"+state)
+	}
+	sort.Strings(roster)
+	return roster
+}
+
+// relayElectionFrame broadcasts one election frame from an ADMITTED member to
+// every other admitted member (hostless window only). The sender identity is
+// stamped as the envelope From (same proven-origin contract as host forwards);
+// pending members neither send nor receive — admission still requires a host.
+func (r *Room) relayElectionFrame(s *session.Session, env *wire.Envelope) {
+	nodeID := s.IdentityID()
+	r.mu.Lock()
+	m, ok := r.members[nodeID]
+	if !ok || !m.admitted {
+		r.mu.Unlock()
+		r.metrics.FramesRejectedTotal.Add(1)
+		return
+	}
+	if !r.allowElectionRelayLocked(nodeID) {
+		r.mu.Unlock()
+		r.metrics.RateLimitedTotal.Add(1)
+		s.SendGwError(wire.CodeRateLimited, "election relay budget exceeded")
+		return
+	}
+	// Addressed election traffic (votes, catch-up replies — the latter can
+	// carry full snapshots) goes ONLY to its target; a broadcast would amplify
+	// it to the whole room. Un-addressed claims/announces fan out.
+	targets := make([]*session.Session, 0, len(r.members))
+	if env.To != nil && *env.To != "" {
+		if peer, ok := r.members[*env.To]; ok && peer.admitted {
+			targets = append(targets, peer.sess)
+		}
+	} else {
+		for id, peer := range r.members {
+			if id == nodeID || !peer.admitted {
+				continue
+			}
+			targets = append(targets, peer.sess)
+		}
+	}
+	r.mu.Unlock()
+	data := marshalForward(env, nodeID)
+	if data == nil {
+		s.SendGwError(wire.CodeMalformed, "unencodable frame")
+		return
+	}
+	for _, t := range targets {
+		if t.SendData(wire.PlaneControl, data) {
+			r.metrics.FramesForwardedTotal[wire.PlaneControl].Add(1)
+		}
+	}
+}
+
+// allowElectionRelayLocked charges one frame against the member's fixed
+// one-second relay window. Caller holds r.mu.
+func (r *Room) allowElectionRelayLocked(nodeID string) bool {
+	now := time.Now()
+	b := r.electionBudget[nodeID]
+	if b == nil || now.Sub(b.windowStart) >= time.Second {
+		r.electionBudget[nodeID] = &relayBudget{windowStart: now, count: 1}
+		return true
+	}
+	if b.count >= r.cfg.ElectionRelayPerSec {
+		return false
+	}
+	b.count++
+	return true
+}
+
+// evict force-closes a member session on the host's request.
+func (r *Room) evict(nodeID string) {
+	r.mu.Lock()
+	m, ok := r.members[nodeID]
+	if ok {
+		m.stopTimer()
+		delete(r.members, nodeID)
+		delete(r.electionBudget, nodeID)
+	}
+	r.mu.Unlock()
+	if ok {
+		r.metrics.EvictionsTotal.Add(1)
+		r.log.Info("member evicted", "node", nodeID)
+		m.sess.CloseGraceful()
+	}
+}
+
+// onSessionClose cleans up after a disconnect. A lost host triggers
+// gw:host-lost to members and starts the retention window; the room disbands
+// when the window elapses without a (re-)attach.
+func (r *Room) onSessionClose(s *session.Session) {
+	nodeID := s.IdentityID()
+	r.mu.Lock()
+	if r.host == s {
+		r.host = nil
+		targets := make([]*session.Session, 0, len(r.members))
+		for _, m := range r.members {
+			targets = append(targets, m.sess)
+		}
+		r.retainTimer = time.AfterFunc(r.cfg.HostRetention, r.disband)
+		r.mu.Unlock()
+		r.log.Info("host lost, retaining room", "node", nodeID, "retention", r.cfg.HostRetention)
+		lost := wire.NewEnvelope(wire.TypeGwHostLost, map[string]any{})
+		for _, t := range targets {
+			t.SendEnvelope(lost)
+		}
+		return
+	}
+	if m, ok := r.members[nodeID]; ok && m.sess == s {
+		m.stopTimer()
+		delete(r.members, nodeID)
+		delete(r.electionBudget, nodeID)
+	}
+	empty := r.host == nil && len(r.members) == 0 && r.retainTimer == nil
+	r.mu.Unlock()
+	if empty {
+		r.markDisbanded()
+		r.onEmpty(r.officeID)
+	}
+}
+
+// disband closes every remaining session and releases the room (host never
+// returned within the retention window).
+func (r *Room) disband() {
+	r.mu.Lock()
+	if r.disbanded {
+		r.mu.Unlock()
+		return
+	}
+	r.disbanded = true
+	r.retainTimer = nil
+	sessions := make([]*session.Session, 0, len(r.members))
+	for _, m := range r.members {
+		m.stopTimer()
+		sessions = append(sessions, m.sess)
+	}
+	r.members = make(map[string]*member)
+	r.electionBudget = make(map[string]*relayBudget)
+	r.mu.Unlock()
+	r.log.Info("room disbanded after host retention timeout")
+	for _, s := range sessions {
+		s.CloseGraceful()
+	}
+	r.onEmpty(r.officeID)
+}
+
+func (r *Room) markDisbanded() {
+	r.mu.Lock()
+	r.disbanded = true
+	if r.retainTimer != nil {
+		r.retainTimer.Stop()
+		r.retainTimer = nil
+	}
+	r.mu.Unlock()
+}
+
+// closeAll tears down every session in the room (gateway shutdown).
+func (r *Room) closeAll() {
+	r.mu.Lock()
+	sessions := make([]*session.Session, 0, len(r.members)+1)
+	if r.host != nil {
+		sessions = append(sessions, r.host)
+	}
+	for _, m := range r.members {
+		m.stopTimer()
+		sessions = append(sessions, m.sess)
+	}
+	r.markDisbandedLocked()
+	r.mu.Unlock()
+	for _, s := range sessions {
+		s.Close()
+	}
+}
+
+func (r *Room) markDisbandedLocked() {
+	r.disbanded = true
+	if r.retainTimer != nil {
+		r.retainTimer.Stop()
+		r.retainTimer = nil
+	}
+}
+
+// isHost reports whether s is this room's current host connection.
+func (r *Room) isHost(s *session.Session) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.host == s
+}
+
+// marshalForward re-encodes an inbound federation envelope for delivery,
+// stripping the gateway-only "to" field and stamping "from" (empty = omit) with
+// the proven sender identity on member→host forwards.
+func marshalForward(env *wire.Envelope, from string) []byte {
+	out := wire.Envelope{Type: wire.TypeFederation, From: from, Payload: env.Payload}
+	data, err := json.Marshal(&out)
+	if err != nil {
+		return nil
+	}
+	return data
+}

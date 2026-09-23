@@ -103,6 +103,7 @@ export class SmitheryAdapter implements RegistryAdapter {
       },
       store: {
         slug: entry.slug,
+        tags: entry.tags ?? [],
         registry_id: source.id,
       },
     }

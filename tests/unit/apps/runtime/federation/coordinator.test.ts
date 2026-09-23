@@ -1,0 +1,679 @@
+/**
+ * Unit tests for apps/runtime/federation -- Coordinator (join + presence).
+ *
+ * Drives the host-side coordinator over a real in-memory FederationStore +
+ * TeamStore and an InMemoryFederationHub simulating a small LAN of nodes. The
+ * fake clock drives sendHeartbeat()/sweepPresence() deterministically — no real
+ * timers.
+ *
+ * Proven behaviors:
+ *   JOIN     — valid request persists office_nodes (online, joinedAt) + remote
+ *              team_members (owner_node_id, origin=remote, member_identity),
+ *              grants, broadcasts presence(online), fires onPresenceChange;
+ *              rejoin preserves original joinedAt.
+ *   REJECT   — invalid credential / office mismatch reject with no persistence.
+ *   PRESENCE — timeout sweeps to offline with member identities; heartbeat
+ *              before timeout keeps online; heartbeat after offline → online.
+ *   DUPLICATE members in bringMembers don't crash the handshake.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { createDatabaseManager } from '../../../../../src/main/platform/store/database-manager'
+import type { DatabaseManager } from '../../../../../src/main/platform/store/types'
+import { FederationStore } from '../../../../../src/main/apps/federation/store'
+import {
+  MIGRATION_NAMESPACE as FED_NS,
+  migrations as fedMigrations,
+} from '../../../../../src/main/apps/federation/migrations'
+import { TeamStore } from '../../../../../src/main/apps/team/store'
+import {
+  MIGRATION_NAMESPACE as TEAM_NS,
+  migrations as teamMigrations,
+} from '../../../../../src/main/apps/team/migrations'
+import { createFederationCoordinator } from '../../../../../src/main/apps/runtime/federation/coordinator'
+import {
+  InMemoryFederationHub,
+  InMemoryFederationLink,
+} from '../../../../../src/main/apps/runtime/federation/link'
+import type {
+  FederationMessage,
+  JoinRequest,
+  OfficeCredentialLike,
+  PresenceSnapshot,
+} from '../../../../../src/main/apps/runtime/federation'
+import { DEFAULT_OFFICE_SCOPE } from '../../../../../src/main/apps/federation/types'
+
+// ── Fixtures ──
+
+const OFFICE = 'office-1'
+const HOST = 'node-host'
+const BOB = 'node-bob'
+const CAROL = 'node-carol'
+// Two-threshold debounce (D3): suspect at 6s, confirmed-offline at 13s. Tests
+// drive sweepPresence() against the fake clock, so a silence that crosses
+// confirmed must first pass through suspect (no online→offline direct jump).
+const SUSPECT_MS = 6_000
+const CONFIRMED_MS = 13_000
+
+function makeJoinRequest(overrides?: Partial<JoinRequest>): JoinRequest {
+  return {
+    kind: 'join-request',
+    officeId: OFFICE,
+    fromNode: BOB,
+    identityId: 'identity-bob',
+    displayName: 'Bob',
+    credentialToken: 'valid-token',
+    bringMembers: [{ appId: 'app-bob-1', memberName: 'bob-writer', role: 'Writer' }],
+    ...overrides,
+  }
+}
+
+/** Captures frames a peer node receives off the hub. */
+function recordingPeer(hub: InMemoryFederationHub, nodeId: string) {
+  const link = new InMemoryFederationLink(nodeId, hub)
+  const received: Array<{ from: string; msg: FederationMessage }> = []
+  link.onMessage((from, msg) => received.push({ from, msg }))
+  return { link, received }
+}
+
+describe('FederationCoordinator', () => {
+  let dbManager: DatabaseManager
+  let federationStore: FederationStore
+  let teamStore: TeamStore
+  let hub: InMemoryFederationHub
+  let clock: number
+  const now = () => clock
+
+  beforeEach(() => {
+    dbManager = createDatabaseManager(':memory:')
+    const db = dbManager.getAppDatabase()
+    dbManager.runMigrations(db, FED_NS, fedMigrations)
+    dbManager.runMigrations(db, TEAM_NS, teamMigrations)
+    federationStore = new FederationStore(db)
+    teamStore = new TeamStore(db)
+    hub = new InMemoryFederationHub()
+    clock = 1_000_000
+  })
+
+  afterEach(() => {
+    dbManager.closeAll()
+  })
+
+  function makeHost(opts?: {
+    verify?: (token: string) => OfficeCredentialLike | null
+    onPresenceChange?: (snap: PresenceSnapshot) => void
+    onWake?: (request: { conversationId: string }) => Promise<{ finalMessage: string | null }>
+    onM2Frame?: (from: string, frame: FederationMessage) => void
+  }) {
+    const hostLink = new InMemoryFederationLink(HOST, hub)
+    const coordinator = createFederationCoordinator({
+      context: { officeId: OFFICE, selfNodeId: HOST },
+      link: hostLink,
+      federationStore,
+      teamStore,
+      verifyCredential:
+        opts?.verify ??
+        ((token) => (token === 'valid-token' ? { officeId: OFFICE, scope: DEFAULT_OFFICE_SCOPE } : null)),
+      now,
+      presence: { suspectAfterMs: SUSPECT_MS, confirmedOfflineMs: CONFIRMED_MS },
+      onPresenceChange: opts?.onPresenceChange,
+      onWake: opts?.onWake as never,
+      onM2Frame: opts?.onM2Frame as never,
+    })
+    coordinator.start()
+    return { coordinator, hostLink }
+  }
+
+  // ── JOIN (host admits) ──
+
+  describe('join handshake', () => {
+    it('admits a valid join-request: persists node + remote members, grants, broadcasts presence', () => {
+      const onPresenceChange = vi.fn()
+      makeHost({ onPresenceChange })
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(HOST, makeJoinRequest())
+
+      const node = federationStore.getNode(OFFICE, BOB)!
+      expect(node).toBeTruthy()
+      expect(node.status).toBe('online')
+      expect(node.identity).toBe('identity-bob')
+      expect(node.displayName).toBe('Bob')
+      expect(node.joinedAt).toBe(clock)
+      expect(node.officeId).toBe(OFFICE)
+
+      const members = teamStore.listMembersByTeam(OFFICE)
+      expect(members).toHaveLength(1)
+      expect(members[0]).toMatchObject({
+        appId: 'app-bob-1',
+        memberName: 'bob-writer',
+        role: 'Writer',
+        ownerNodeId: BOB,
+        origin: 'remote',
+        memberIdentity: 'identity-bob',
+        isLead: false,
+        aiProvisioned: false,
+      })
+
+      const grant = bob.received.find((r) => r.msg.kind === 'join-grant')
+      expect(grant?.msg).toMatchObject({ kind: 'join-grant', officeId: OFFICE, assignedNodeId: BOB })
+
+      const carol = recordingPeer(hub, CAROL) // joined after broadcast: no echo expected
+      expect(carol.received).toHaveLength(0)
+      expect(onPresenceChange).toHaveBeenCalledTimes(1)
+      const snap = onPresenceChange.mock.calls[0][0] as PresenceSnapshot
+      expect(snap.nodes.map((n) => n.nodeId)).toContain(BOB)
+    })
+
+    it('broadcasts presence(online) to an already-present peer', () => {
+      makeHost()
+      const carol = recordingPeer(hub, CAROL)
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(HOST, makeJoinRequest())
+
+      const presence = carol.received.find((r) => r.msg.kind === 'presence-update')
+      expect(presence?.msg).toMatchObject({
+        kind: 'presence-update',
+        nodeId: BOB,
+        status: 'online',
+        members: ['identity-bob'],
+      })
+    })
+
+    it('preserves original joinedAt on rejoin', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(HOST, makeJoinRequest())
+      const firstJoinedAt = federationStore.getNode(OFFICE, BOB)!.joinedAt
+
+      clock += 50_000
+      bob.link.send(HOST, makeJoinRequest({ displayName: 'Bob Renamed' }))
+
+      const node = federationStore.getNode(OFFICE, BOB)!
+      expect(node.joinedAt).toBe(firstJoinedAt) // stable join order
+      expect(node.lastSeen).toBe(clock) // refreshed
+      expect(node.displayName).toBe('Bob Renamed') // refreshed
+    })
+
+    it('rejects an invalid credential with no persistence', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(HOST, makeJoinRequest({ credentialToken: 'forged' }))
+
+      const reject = bob.received.find((r) => r.msg.kind === 'join-reject')
+      expect(reject?.msg).toMatchObject({ kind: 'join-reject', reason: 'CREDENTIAL_INVALID' })
+      expect(federationStore.getNode(OFFICE, BOB)).toBeNull()
+      expect(teamStore.listMembersByTeam(OFFICE)).toHaveLength(0)
+    })
+
+    it('rejects an office mismatch (credential office differs)', () => {
+      makeHost({ verify: () => ({ officeId: 'other-office', scope: DEFAULT_OFFICE_SCOPE }) })
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(HOST, makeJoinRequest())
+
+      const reject = bob.received.find((r) => r.msg.kind === 'join-reject')
+      expect(reject?.msg).toMatchObject({ kind: 'join-reject', reason: 'OFFICE_MISMATCH' })
+      expect(federationStore.getNode(OFFICE, BOB)).toBeNull()
+    })
+
+    it('negotiates a compatible protocol version: the grant echoes the negotiated pv + caps', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      // A current-version joiner (pv=3, min=3) is admitted and the grant carries
+      // the negotiated version and an effective cap mask.
+      bob.link.send(HOST, makeJoinRequest({ pv: 3, minSupported: 3, caps: 0xff }))
+
+      const grant = bob.received.find((r) => r.msg.kind === 'join-grant')
+      expect(grant?.msg).toMatchObject({ kind: 'join-grant', assignedNodeId: BOB, pv: 3 })
+      expect(typeof (grant?.msg as { caps?: number }).caps).toBe('number')
+      expect(federationStore.getNode(OFFICE, BOB)).toBeTruthy()
+    })
+
+    it('rejects a join whose PRESENT protocol version is below the floor (VERSION_INCOMPATIBLE)', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      // A legacy node that advertises pv=1/min=1 cannot satisfy the current floor.
+      bob.link.send(HOST, makeJoinRequest({ pv: 1, minSupported: 1 }))
+
+      const reject = bob.received.find((r) => r.msg.kind === 'join-reject')
+      expect(reject?.msg).toMatchObject({ kind: 'join-reject', reason: 'VERSION_INCOMPATIBLE' })
+      expect(federationStore.getNode(OFFICE, BOB)).toBeNull()
+      expect(teamStore.listMembersByTeam(OFFICE)).toHaveLength(0)
+    })
+
+    it('admits a join that omits pv (pre-negotiation peer / in-process link): gate is lenient on absent version', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      // No pv field at all — admitted (security is the WS-layer device-key proof,
+      // not the version gate).
+      bob.link.send(HOST, makeJoinRequest())
+
+      expect(federationStore.getNode(OFFICE, BOB)).toBeTruthy()
+    })
+
+    it('coalesced wakes on ONE session all get a turn-complete (K1): no waiter hangs to timeout', async () => {
+      // Two concurrent wakes aimed at the SAME member session (identical
+      // conversationId) — the owner absorbs them into one in-flight turn. The
+      // owner must reply turn-complete to BOTH correlationIds, not just the first.
+      let release!: (v: { finalMessage: string | null }) => void
+      const turn = new Promise<{ finalMessage: string | null }>((r) => { release = r })
+      makeHost({ onWake: () => turn })
+      const bob = recordingPeer(hub, BOB)
+
+      const convId = `app-chat:app-m:team:${OFFICE}:e1`
+      const wake = (correlationId: string) => ({
+        kind: 'wake' as const,
+        officeId: OFFICE,
+        correlationId,
+        request: {
+          appId: 'app-m', spaceId: 's', message: 'do', conversationId: convId,
+          teamContext: { teamId: OFFICE, epochId: 'e1', correlationId, fromAppId: null, wait: true, kind: 'message' as const },
+        },
+        fromNode: BOB,
+      })
+      hub.deliver(BOB, HOST, wake('corr-1'))
+      hub.deliver(BOB, HOST, wake('corr-2'))
+
+      // One turn resolves → BOTH correlations are acked with the same outcome.
+      release({ finalMessage: 'done' })
+      await turn
+      await new Promise((r) => setTimeout(r, 0))
+
+      const completes = bob.received.filter((r) => r.msg.kind === 'turn-complete')
+      const corrs = completes.map((r) => (r.msg as { correlationId: string }).correlationId).sort()
+      expect(corrs).toEqual(['corr-1', 'corr-2'])
+      for (const c of completes) {
+        expect((c.msg as { outcome: { kind: string; content?: string } }).outcome).toMatchObject({ kind: 'result', content: 'done' })
+      }
+    })
+
+    it('routes catch-up frames through the dispatch gate to onM2Frame (regression: M2_FRAME_KINDS drift)', () => {
+      // A catch-up frame arriving over the wire must pass the coordinator's
+      // isM2Frame gate and reach the authority module. This drives the REAL
+      // dispatch path (not handleM2Frame directly), catching the class of bug
+      // where a kind is in the M2Frame type union but missing from
+      // M2_FRAME_KINDS — which would silently drop it and leave C9 dead on the wire.
+      const onM2Frame = vi.fn()
+      makeHost({ onM2Frame })
+      const bob = recordingPeer(hub, BOB)
+
+      const request = {
+        kind: 'catchup-request',
+        officeId: OFFICE,
+        fromNode: BOB,
+        lastAckedSeq: 3,
+        fid: 'cu-1',
+      }
+      bob.link.send(HOST, request as unknown as FederationMessage)
+
+      expect(onM2Frame).toHaveBeenCalledTimes(1)
+      expect((onM2Frame.mock.calls[0][1] as { kind: string }).kind).toBe('catchup-request')
+    })
+
+    it('a re-delivered wake (same correlationId) never runs the turn twice — no double execution', async () => {
+      // A duplicate wake — a network dup, or a future sender-side retransmit —
+      // must NOT start a second turn. Double execution is a correctness bug.
+      let runs = 0
+      let release!: (v: { finalMessage: string | null }) => void
+      const turn = new Promise<{ finalMessage: string | null }>((r) => { release = r })
+      makeHost({ onWake: () => { runs++; return turn } })
+      const bob = recordingPeer(hub, BOB)
+
+      const convId = `app-chat:app-m:team:${OFFICE}:e1`
+      const wake = {
+        kind: 'wake' as const,
+        officeId: OFFICE,
+        correlationId: 'corr-dup',
+        request: {
+          appId: 'app-m', spaceId: 's', message: 'do', conversationId: convId,
+          teamContext: { teamId: OFFICE, epochId: 'e1', correlationId: 'corr-dup', fromAppId: null, wait: true, kind: 'message' as const },
+        },
+        fromNode: BOB,
+      }
+
+      // Delivered twice while in flight → runs exactly once.
+      hub.deliver(BOB, HOST, wake)
+      hub.deliver(BOB, HOST, wake)
+      expect(runs).toBe(1)
+
+      release({ finalMessage: 'done' })
+      await turn
+      await new Promise((r) => setTimeout(r, 0))
+      expect(bob.received.filter((r) => r.msg.kind === 'turn-complete')).toHaveLength(1)
+
+      // A duplicate AFTER completion re-acks (recovers a lost turn-complete) but
+      // still does not re-run the turn.
+      hub.deliver(BOB, HOST, wake)
+      await new Promise((r) => setTimeout(r, 0))
+      expect(runs).toBe(1)
+      expect(bob.received.filter((r) => r.msg.kind === 'turn-complete')).toHaveLength(2)
+    })
+
+    it('rejects an office mismatch (request office differs from context)', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(HOST, makeJoinRequest({ officeId: 'wrong-office' }))
+
+      const reject = bob.received.find((r) => r.msg.kind === 'join-reject')
+      expect(reject?.msg).toMatchObject({ kind: 'join-reject', reason: 'OFFICE_MISMATCH' })
+      expect(federationStore.getNode(OFFICE, BOB)).toBeNull()
+    })
+
+    it('re-admits a known node whose credential can no longer be verified (roster re-entry)', () => {
+      const { coordinator } = makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      // First admission rides a valid invite; then Bob goes confirmed-offline.
+      bob.link.send(HOST, makeJoinRequest())
+      clock += CONFIRMED_MS + 1
+      coordinator.sweepPresence()
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('offline')
+      bob.received.length = 0
+
+      // The re-driven join presents a token this authority cannot verify (e.g.
+      // the issuer's ledger is gone) — the existing office_nodes row admits it.
+      bob.link.send(HOST, makeJoinRequest({ credentialToken: 'stale' }))
+
+      expect(bob.received.some((r) => r.msg.kind === 'join-reject')).toBe(false)
+      expect(bob.received.some((r) => r.msg.kind === 'join-grant')).toBe(true)
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('online')
+    })
+
+    it('roster re-entry keeps existing members but never admits NEW ones without a credential', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+      bob.link.send(HOST, makeJoinRequest())
+      bob.received.length = 0
+
+      bob.link.send(
+        HOST,
+        makeJoinRequest({
+          credentialToken: 'stale',
+          bringMembers: [
+            { appId: 'app-bob-1', memberName: 'bob-writer', role: 'Writer' }, // rejoin
+            { appId: 'app-bob-new', memberName: 'bob-extra', role: 'Extra' }, // new → refused
+          ],
+        })
+      )
+
+      expect(bob.received.some((r) => r.msg.kind === 'join-grant')).toBe(true)
+      const members = teamStore.listMembersByTeam(OFFICE)
+      expect(members.map((m) => m.appId)).toEqual(['app-bob-1'])
+    })
+
+    it('stops nudging a confirmed-offline node whose re-join was terminally rejected (no 6s storm)', () => {
+      const { coordinator } = makeHost()
+      const bob = recordingPeer(hub, BOB)
+      bob.link.send(HOST, makeJoinRequest())
+      clock += CONFIRMED_MS + 1
+      coordinator.sweepPresence()
+      bob.received.length = 0
+
+      // Baseline: a heartbeat on the live session nudges the node to re-handshake.
+      hub.deliver(BOB, HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: BOB, ts: clock })
+      expect(bob.received.filter((r) => r.msg.kind === 'rejoin-request')).toHaveLength(1)
+
+      // The answered join is terminally rejected (incompatible version).
+      bob.link.send(HOST, makeJoinRequest({ pv: 1, minSupported: 1 }))
+      expect(bob.received.some((r) => r.msg.kind === 'join-reject')).toBe(true)
+
+      // Later heartbeats (past the nudge window) must NOT re-nudge — the node
+      // would only repeat the request that just failed.
+      clock += 10_000
+      hub.deliver(BOB, HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: BOB, ts: clock })
+      expect(bob.received.filter((r) => r.msg.kind === 'rejoin-request')).toHaveLength(1)
+
+      // An admitted join clears the suppression (the node presented something new).
+      bob.link.send(HOST, makeJoinRequest())
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('online')
+    })
+
+    it('joiner stops re-driving its join after a terminal reject; an explicit requestJoin re-arms it', () => {
+      // Joiner-side coordinator over a stub upstream link (production semantics:
+      // every send rides the upstream leg — no self-delivery like the hub).
+      const sent: FederationMessage[] = []
+      let inbound: (from: string, msg: FederationMessage) => void = () => {}
+      const joiner = createFederationCoordinator({
+        context: { officeId: OFFICE, selfNodeId: BOB },
+        link: {
+          send: (_to, msg) => sent.push(msg),
+          broadcast: (msg) => sent.push(msg),
+          onMessage: (h) => { inbound = h },
+          close: () => {},
+        },
+        federationStore,
+        teamStore,
+        verifyCredential: () => null,
+        now,
+        presence: { suspectAfterMs: SUSPECT_MS, confirmedOfflineMs: CONFIRMED_MS },
+      })
+      joiner.start()
+      // The joiner knows its host and has confirmed it offline after silence.
+      federationStore.upsertNode({
+        nodeId: HOST, officeId: OFFICE, identity: 'identity-host', displayName: 'Host',
+        joinedAt: clock, lastSeen: clock, status: 'online', advertisedUrl: null,
+      })
+      joiner.requestJoin(makeJoinRequest())
+      clock += CONFIRMED_MS + 1
+      joiner.sweepPresence()
+      const joinsSent = () => sent.filter((m) => m.kind === 'join-request').length
+      const before = joinsSent()
+
+      // Baseline: a heartbeat from the confirmed-offline host re-drives the join.
+      inbound(HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: HOST, ts: clock })
+      expect(joinsSent()).toBe(before + 1)
+
+      // Terminal reject → the re-drive latches off for heartbeats AND nudges.
+      inbound(HOST, { kind: 'join-reject', officeId: OFFICE, reason: 'CREDENTIAL_INVALID' })
+      clock += 10_000
+      inbound(HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: HOST, ts: clock })
+      inbound(HOST, { kind: 'rejoin-request', officeId: OFFICE })
+      expect(joinsSent()).toBe(before + 1)
+
+      // An explicit requestJoin (new socket/authority/credential) re-arms recovery.
+      joiner.requestJoin(makeJoinRequest())
+      clock += 10_000
+      inbound(HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: HOST, ts: clock })
+      expect(joinsSent()).toBe(before + 3) // the explicit send + the re-armed re-drive
+      joiner.stop()
+    })
+
+    it('does not crash the handshake on duplicate bringMembers; a name clash is admitted renamed', () => {
+      makeHost()
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(
+        HOST,
+        makeJoinRequest({
+          bringMembers: [
+            { appId: 'app-dup', memberName: 'same-name', role: 'A' },
+            { appId: 'app-dup', memberName: 'other-name', role: 'B' }, // repeated appId → duplicate, skipped
+            { appId: 'app-other', memberName: 'same-name', role: 'C' }, // name clash → renamed, admitted
+          ],
+        })
+      )
+
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('online')
+      expect(bob.received.some((r) => r.msg.kind === 'join-grant')).toBe(true)
+      // The repeated appId collapsed to one row; the name clash was admitted
+      // under a disambiguated name (owner display name) instead of being dropped.
+      const members = teamStore.listMembersByTeam(OFFICE)
+      expect(members).toHaveLength(2)
+      const byApp = new Map(members.map((m) => [m.appId, m]))
+      expect(byApp.get('app-dup')!.memberName).toBe('same-name')
+      expect(byApp.get('app-other')!.memberName).toBe('same-name·Bob')
+    })
+  })
+
+  // ── PRESENCE ──
+
+  describe('presence sweep + heartbeat (two-threshold debounce)', () => {
+    function joinBob() {
+      const bob = recordingPeer(hub, BOB)
+      bob.link.send(HOST, makeJoinRequest())
+      return bob
+    }
+
+    it('moves a node online→suspect→confirmed-offline as silence crosses each threshold', () => {
+      const onPresenceChange = vi.fn()
+      const { coordinator } = makeHost({ onPresenceChange })
+      const carol = recordingPeer(hub, CAROL)
+      joinBob()
+      onPresenceChange.mockClear()
+      carol.received.length = 0
+
+      clock += SUSPECT_MS + 1
+      coordinator.sweepPresence()
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('suspect')
+      expect(carol.received.some((r) => r.msg.kind === 'presence-update' && r.msg.status === 'suspect')).toBe(true)
+      expect(carol.received.some((r) => r.msg.kind === 'presence-update' && r.msg.status === 'offline')).toBe(false)
+      carol.received.length = 0
+
+      clock += CONFIRMED_MS - SUSPECT_MS
+      coordinator.sweepPresence()
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('offline')
+      const offline = carol.received.find(
+        (r) => r.msg.kind === 'presence-update' && r.msg.status === 'offline'
+      )
+      expect(offline?.msg).toMatchObject({ nodeId: BOB, status: 'offline' })
+      expect((offline?.msg as { members: string[] }).members).toEqual(['identity-bob'])
+      expect(onPresenceChange).toHaveBeenCalled()
+    })
+
+    it('keeps a node online when a heartbeat arrives before the suspect threshold', () => {
+      const { coordinator } = makeHost()
+      joinBob()
+
+      clock += SUSPECT_MS - 1
+      hub.deliver(BOB, HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: BOB, ts: clock })
+
+      // A sweep now sits within one suspect window of the refreshed lastSeen.
+      clock += 2
+      coordinator.sweepPresence()
+
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('online')
+    })
+
+    it('recovers suspect→online on a heartbeat (jitter absorbed, no offline)', () => {
+      const { coordinator } = makeHost()
+      const carol = recordingPeer(hub, CAROL)
+      joinBob()
+
+      clock += SUSPECT_MS + 1
+      coordinator.sweepPresence()
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('suspect')
+      carol.received.length = 0
+
+      clock += 1
+      hub.deliver(BOB, HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: BOB, ts: clock })
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('online')
+      const back = carol.received.find(
+        (r) => r.msg.kind === 'presence-update' && r.msg.status === 'online'
+      )
+      expect(back?.msg).toMatchObject({ nodeId: BOB, status: 'online' })
+
+      clock += SUSPECT_MS - 1
+      coordinator.sweepPresence()
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('online')
+    })
+
+    it('does NOT revive a confirmed-offline node on a bare heartbeat (requires rejoin, T7)', () => {
+      const { coordinator } = makeHost()
+      joinBob()
+
+      clock += CONFIRMED_MS + 1
+      coordinator.sweepPresence()
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('offline')
+
+      // A bare heartbeat after confirmed is dropped — no silent revival.
+      clock += 1000
+      hub.deliver(BOB, HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: BOB, ts: clock })
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('offline')
+
+      // A fresh join handshake re-admits the node as online (T5).
+      const bob = recordingPeer(hub, BOB)
+      bob.link.send(HOST, makeJoinRequest())
+      expect(federationStore.getNode(OFFICE, BOB)!.status).toBe('online')
+    })
+
+    it('ignores heartbeats from an unknown node', () => {
+      const { coordinator } = makeHost()
+      hub.deliver('ghost', HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: 'ghost', ts: clock })
+      expect(federationStore.getNode(OFFICE, 'ghost')).toBeNull()
+      coordinator.sweepPresence() // must not throw
+    })
+  })
+
+  // ── Snapshot ──
+
+  describe('getPresence', () => {
+    it('reflects current node statuses', () => {
+      const { coordinator } = makeHost()
+      const bob = recordingPeer(hub, BOB)
+      bob.link.send(HOST, makeJoinRequest())
+      const carol = recordingPeer(hub, CAROL)
+      carol.link.send(
+        HOST,
+        makeJoinRequest({ fromNode: CAROL, identityId: 'identity-carol', bringMembers: [] })
+      )
+
+      let snap = coordinator.getPresence()
+      expect(snap.officeId).toBe(OFFICE)
+      expect(snap.nodes.map((n) => n.nodeId).sort()).toEqual([CAROL, BOB].sort())
+      expect(snap.nodes.every((n) => n.status === 'online')).toBe(true)
+
+      clock += CONFIRMED_MS + 1
+      // Carol heartbeats; Bob goes stale past the confirmed threshold.
+      hub.deliver(CAROL, HOST, { kind: 'heartbeat', officeId: OFFICE, fromNode: CAROL, ts: clock })
+      coordinator.sweepPresence()
+
+      snap = coordinator.getPresence()
+      const byId = Object.fromEntries(snap.nodes.map((n) => [n.nodeId, n.status]))
+      expect(byId[BOB]).toBe('offline')
+      expect(byId[CAROL]).toBe('online')
+    })
+  })
+
+  describe('wake this node cannot run', () => {
+    it('answers undelivered instead of dropping it silently', () => {
+      // Consuming the wake retires the sender's give-up deadline, so a silent
+      // return left the sender believing it landed — forever, with no record of
+      // the failure on either machine. That is the 75-minute "online + idle"
+      // member: the message that should have started it no longer existed.
+      makeHost() // no onWake → this node owns nothing runnable
+      const bob = recordingPeer(hub, BOB)
+
+      bob.link.send(HOST, {
+        kind: 'wake' as const,
+        officeId: OFFICE,
+        correlationId: 'corr-orphan',
+        request: {
+          appId: 'app-nobody',
+          spaceId: 'space-b',
+          message: 'start the analysis',
+          conversationId: `team:app-nobody:${OFFICE}:epoch-1`,
+          teamContext: {
+            teamId: OFFICE, epochId: 'epoch-1', correlationId: 'corr-orphan',
+            fromAppId: null, wait: false, kind: 'message' as const,
+          },
+        },
+        fromNode: BOB,
+      })
+
+      const completion = bob.received.find((r) => r.msg.kind === 'turn-complete')
+      expect(completion).toBeDefined()
+      expect(completion!.msg).toMatchObject({
+        correlationId: 'corr-orphan',
+        outcome: { kind: 'undelivered' },
+      })
+    })
+  })
+})

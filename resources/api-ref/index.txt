@@ -77,7 +77,7 @@ GET    /api/apps/<appId>/available-skills                          [ai]       di
 GET    /api/skills/command-name                                    [ai]       store                   Preview the slash-command name a skill title would install under
 DELETE /api/apps/<appId>                                           [ai]       digital-human           Soft-delete (uninstall) a digital human; recoverable via reinstall
 POST   /api/apps/<appId>/reinstall                                 [ai]       digital-human           Reinstall a previously soft-deleted (uninstalled) digital human
-POST   /api/apps/<appId>/move-space                                [ai]       digital-human,workspace Move a digital human to a different space (or make it global)
+POST   /api/apps/<appId>/move-space                                [ai]       digital-human,workspace Set which space a digital human starts new work in
 POST   /api/apps/<appId>/clear-memory                              [ai]       digital-human           Delete all of a digital human's memory files
 DELETE /api/apps/<appId>/permanent                                 [wrapped]  digital-human           Permanently delete a digital human and all its data
 POST   /api/apps/<appId>/pause                                     [ai]       digital-human           Pause a digital human (stops scheduling)
@@ -89,8 +89,8 @@ POST   /api/apps/<appId>/runs/<runId>/continue                     [ai]       di
 POST   /api/apps/<appId>/runs/<runId>/inject                       [ai]       digital-human           Inject a text message into a currently active run
 GET    /api/apps/<appId>/runs/<runId>/session                      [ai]       digital-human           Read what a run actually did, step by step
 POST   /api/apps/<appId>/config                                    [ai]       digital-human           Replace a digital human's user configuration values
-PATCH  /api/apps/<appId>/overrides                                 [ai]       digital-human           Merge-patch per-installation overrides (frequency, notification level, model)
-POST   /api/apps/<appId>/frequency                                 [ai]       digital-human           Change how often a digital human runs, without editing its full definition (spec)
+PATCH  /api/apps/<appId>/overrides                                 [ai]       digital-human           Merge-patch per-installation overrides (notification level, model)
+POST   /api/apps/<appId>/frequency                                 [ai]       digital-human           Change how often a digital human runs, without editing the rest of its definition (spec)
 POST   /api/apps/<appId>/permissions/grant                         [ai]       digital-human           Grant a named permission to a digital human
 POST   /api/apps/<appId>/upgrade-strategy                          [ai]       digital-human,store     Set how a store-installed digital human handles version upgrades
 POST   /api/apps/<appId>/permissions/revoke                        [ai]       digital-human           Revoke a named permission from a digital human

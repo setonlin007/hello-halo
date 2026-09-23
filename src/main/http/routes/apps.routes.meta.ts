@@ -3,6 +3,22 @@ import type { RouteModuleMeta } from './_meta-types'
 export const MODULE: RouteModuleMeta = {
   file: 'apps',
   routes: {
+    'GET /api/apps/states': { expose: 'internal' },
+    'GET /api/apps/pending-inbox': { expose: 'internal' },
+    'GET /api/apps/:appId/activity/:entryId': { expose: 'internal' },
+    'GET /api/apps/studio-summary': { expose: 'internal' },
+    'GET /api/apps/people': { expose: 'internal' },
+    'GET /api/apps/capability-inventory': { expose: 'internal' },
+    'GET /api/apps/:appId/pending-entries': { expose: 'internal' },
+    'POST /api/apps/:appId/space-preview': { expose: 'internal' },
+    'POST /api/apps/:appId/escalation/:entryId/retry': { expose: 'internal' },
+    'POST /api/apps/:appId/escalation/:entryId/deadline': { expose: 'internal' },
+    // Declining a request is the user's call about their own decision, never
+    // the AI's — an agent able to dismiss it would be answering for them.
+    'POST /api/apps/:appId/escalation/:entryId/dismiss': { expose: 'internal' },
+    'POST /api/apps/:appId/runs/:runId/close': { expose: 'internal' },
+    'POST /api/apps/:appId/runs/:runId/stop': { expose: 'internal' },
+    'POST /api/apps/:appId/runs/start': { expose: 'internal' },
     // ── Listing / reading ─────────────────────────────────────────────
     // Full InstalledApp includes userConfig (raw config_schema values — no
     // 'password' input type exists, so credential fields are plain strings)
@@ -192,10 +208,10 @@ export const MODULE: RouteModuleMeta = {
     'POST /api/apps/:appId/move-space': {
       expose: 'ai',
       group: ['digital-human', 'workspace'],
-      summary: 'Move a digital human to a different space (or make it global)',
+      summary: 'Set which space a digital human starts new work in',
       body: '{"newSpaceId": "<spaceId — a uuid from GET /api/spaces>"}',
-      returns: '{success:true,data:{activationWarning?:string}}',
-      notes: 'Send {"newSpaceId": null} to make it global (available in every space). 404 if appId does not exist; 400 if newSpaceId is an empty string.',
+      returns: '{success:true,data:{}}',
+      notes: 'Changes the default only: work already running, existing chat sessions and team work keep the environment they started in. A digital human must belong to a space, so newSpaceId is required — null is rejected. Nothing is stopped or restarted. 404 if appId does not exist; 400 if newSpaceId is an empty string.',
       impact: 'reversible',
     },
 
@@ -212,19 +228,19 @@ export const MODULE: RouteModuleMeta = {
     'PATCH /api/apps/:appId/overrides': {
       expose: 'ai',
       group: 'digital-human',
-      summary: 'Merge-patch per-installation overrides (frequency, notification level, model)',
+      summary: 'Merge-patch per-installation overrides (notification level, model)',
       body: '{"notificationLevel": "important"}',
       returns: '{success:true}',
-      notes: 'Other fields you can set the same way: frequency (object keyed by subscriptionId), modelSourceId, modelId. JSON Merge Patch semantics: send null to clear a field (e.g. {"modelSourceId":null} to fall back to the global model).',
+      notes: 'Other fields you can set the same way: modelSourceId, modelId. JSON Merge Patch semantics: send null to clear a field (e.g. {"modelSourceId":null} to fall back to the global model). The run schedule is NOT set here — use POST /:appId/frequency.',
       impact: 'reversible',
     },
     'POST /api/apps/:appId/frequency': {
       expose: 'ai',
       group: 'digital-human',
-      summary: 'Change how often a digital human runs, without editing its full definition (spec)',
+      summary: 'Change how often a digital human runs, without editing the rest of its definition (spec)',
       body: '{"subscriptionId": "<subscriptionId — read app.spec.subscriptions via GET /api/apps/<appId>>", "frequency": "30m"}',
       returns: '{success:true}',
-      notes: 'frequency can also be a cron expression (e.g. "0 8 * * *"). subscriptionId must already exist — read app.spec.subscriptions via GET /:appId first. This sets a non-destructive override; it does not change the spec.',
+      notes: 'frequency can also be a cron expression (e.g. "0 8 * * *"); either one replaces the other. subscriptionId must name an existing schedule subscription — read app.spec.subscriptions via GET /:appId first. This rewrites that subscription\'s schedule in the spec, which is the only interval the scheduler reads and the one the settings panel shows; the rest of the spec is untouched.',
       impact: 'reversible',
     },
     'POST /api/apps/:appId/permissions/grant': {
@@ -304,7 +320,7 @@ export const MODULE: RouteModuleMeta = {
       summary: "Stop a digital human's in-progress chat reply",
       body: '{"conversationId": "<conversationId — a uuid from GET /api/spaces/$HALO_SPACE_ID/conversations>"}',
       returns: '{success:true}',
-      notes: 'conversationId is optional — omit it (or send {}) to stop every session of this app',
+      notes: 'Name the session to stop. Stopping every session at once is a much bigger act, so it must be asked for explicitly: send {"all": true}. Sending neither returns 400 rather than guessing.',
     },
     'GET /api/apps/:appId/chat/status': {
       expose: 'ai',
@@ -407,5 +423,10 @@ export const MODULE: RouteModuleMeta = {
       ].join('\n'),
       impact: 'irreversible',
     },
+    'GET /api/apps/overview': { expose: 'internal' },
+    'GET /api/spaces/:spaceId/available-skills': { expose: 'internal' },
+    'GET /api/spaces/:spaceId/effective-mcp-apps': { expose: 'internal' },
+    'GET /api/apps/:appId/runs': { expose: 'internal' },
+    'GET /api/apps/:appId/run-stats': { expose: 'internal' },
   },
 }

@@ -98,16 +98,13 @@ export interface ApiCredentials {
 // Image Attachments
 // ============================================
 
-export type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
+// The payload is the same object the renderer built and the transport carried,
+// so it is declared once in shared and re-exported here for agent-internal use.
+// Imported first because `export ... from` leaves no local binding for the
+// declarations below to reference.
+import type { ImageAttachment, ImageMediaType } from '../../../shared/types/image-attachment'
 
-export interface ImageAttachment {
-  id: string
-  type: 'image'
-  mediaType: ImageMediaType
-  data: string  // Base64 encoded
-  name?: string
-  size?: number
-}
+export type { ImageAttachment, ImageMediaType }
 
 // ============================================
 // Canvas Context
@@ -341,6 +338,8 @@ export interface McpServerStatusInfo {
   errorDetail?: string
   /** Epoch ms of the last probe/SDK report that produced this entry */
   lastCheckedAt?: number
+  /** Round-trip time of the last native probe, in milliseconds. */
+  latencyMs?: number
 }
 
 // ============================================

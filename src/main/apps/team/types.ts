@@ -1,0 +1,420 @@
+/**
+ * apps/team -- Type Definitions
+ *
+ * Internal types for the Digital Team data/persistence layer.
+ *
+ * The persistent domain entities (Team, TeamMember, TeamEdge, BlackboardTask,
+ * BlackboardFinding, TeamEpoch) and the creation/update input shapes are owned
+ * by the frozen contract in `src/shared/apps/team-types.ts`. This module
+ * re-exports those names so consumers of apps/team have a single import surface,
+ * and adds the SQLite row interfaces plus the TeamStore interface that are
+ * specific to the persistence layer.
+ */
+
+import type {
+  Team,
+  TeamMember,
+  TeamEdge,
+  BlackboardTask,
+  BlackboardFinding,
+  TeamEpoch,
+  TeamStatus,
+  TaskStatus,
+  EpochEndReason,
+  EpochOutcome,
+  TeamTrigger,
+  TeamTriggerInput,
+  TeamRunTriggerType,
+  JoinedOfficeSnapshot,
+  TeamMemberRuntimeStatus,
+  RosterBusyEntry,
+  TeamCheck,
+  TeamActivity,
+} from '../../../shared/apps/team-types'
+
+// Re-export the frozen domain contract for apps/team consumers.
+export type {
+  Team,
+  TeamMember,
+  TeamCheck,
+  TeamCheckSchedule,
+  TeamCheckView,
+  TeamActivity,
+  TeamActivityKind,
+  TeamActivityStatus,
+  TeamDelegatedPolicy,
+  UpdateTeamMemberInput,
+  TeamEdge,
+  BlackboardTask,
+  BlackboardFinding,
+  TeamEpoch,
+  TeamStatus,
+  TaskStatus,
+  EpochEndReason,
+  EpochOutcome,
+  EpochLifecycle,
+  MemberSourcing,
+  CollabMode,
+  EscalationRouting,
+  TeamTrigger,
+  TeamTriggerInput,
+  TeamTriggerSourceType,
+  TeamScheduleConfig,
+  TeamRunTrigger,
+  TeamRunTriggerType,
+  JoinedOfficeSnapshot,
+  JoinedOfficeMemberSnap,
+} from '../../../shared/apps/team-types'
+
+// ── SQLite Row Types (flat DB representation) ──
+
+/** Row shape from the `teams` table. */
+export interface TeamRow {
+  id: string
+  name: string
+  owning_space_id: string
+  goal: string
+  lead_app_id: string | null
+  member_sourcing: string
+  collab_mode: string
+  escalation_routing: string
+  status: string
+  current_epoch_id: string | null
+  created_at: number
+  updated_at: number
+  /** Office authority; added in migration v6 (null = hosted here). */
+  host_node_id: string | null
+}
+
+/** Row shape from the `team_members` table. */
+export interface TeamMemberRow {
+  team_id: string
+  app_id: string
+  member_name: string
+  role: string
+  is_lead: number
+  ai_provisioned: number
+  is_system_coordinator: number
+  added_at: number
+  /** Owning node; added in migration v5 (default 'SELF' for local members). */
+  owner_node_id: string
+  /** Member origin; added in migration v5 (default 'local'). */
+  origin: string
+  /** Portable owner identity; added in migration v5 (null for local-only). */
+  member_identity: string | null
+  /** Permission-overlay scope JSON; added in migration v7 (null = default-open). */
+  scope_json: string | null
+  /** Owner's display name for a remote member; added in migration v8 (null = local). */
+  owner_display_name: string | null
+  /** Per-team duty text; added in migration v10 (null = nothing written). */
+  duty: string | null
+  /** Delegated capability policy JSON; added in migration v10 (null = unrestricted). */
+  delegated_policy_json: string | null
+  /** Whether teammates may set a periodic check; added in migration v10. */
+  accepts_checks: number
+  /** Whether this member is waiting on its owner to decide; added in migration v13. */
+  awaiting_decision: number
+}
+
+/** Row shape from the `team_checks` table. */
+export interface TeamCheckRow {
+  id: string
+  team_id: string
+  epoch_id: string
+  target_app_id: string
+  created_by_app_id: string
+  instruction: string
+  schedule_json: string
+  run_count: number
+  created_at: number
+  updated_at: number
+  last_run_at: number | null
+}
+
+/** Row shape from the `team_edges` table. */
+export interface TeamEdgeRow {
+  team_id: string
+  from_app_id: string
+  to_app_id: string
+  sync: number
+}
+
+/** Row shape from the `blackboard_tasks` table. */
+export interface BlackboardTaskRow {
+  id: string
+  team_id: string
+  epoch_id: string
+  title: string
+  assignee_app_id: string | null
+  status: string
+  result_ref: string | null
+  note: string | null
+  parent_id: string | null
+  created_by_app_id: string
+  created_at: number
+  updated_at: number
+}
+
+/** Row shape from the `blackboard_findings` table. */
+export interface BlackboardFindingRow {
+  id: string
+  team_id: string
+  epoch_id: string
+  author_app_id: string
+  body: string | null
+  ref: string | null
+  created_at: number
+}
+
+/** Row shape from the `team_activity` table (migration v12). */
+export interface TeamActivityRow {
+  id: string
+  team_id: string
+  epoch_id: string
+  kind: string
+  actor_app_id: string
+  target_app_id: string | null
+  subject: string
+  body: string | null
+  ref_id: string | null
+  correlation_id: string | null
+  status: string | null
+  created_at: number
+}
+
+/** Row shape from the `team_epochs` table. */
+export interface TeamEpochRow {
+  id: string
+  team_id: string
+  started_at: number
+  ended_at: number | null
+  end_reason: string | null
+  summary: string | null
+  /** What initiated the run; added in migration v2 (default 'manual'). */
+  trigger_type?: string
+  /** Execution mode; added in migration v3 (default 'run'). */
+  lifecycle?: string
+  /** Chat scope for conversation epochs; added in migration v4 (null for runs). */
+  chat_key?: string | null
+  /** Conversation label; added in migration v9 (null → derived label). */
+  title?: string | null
+  /** Run outcome classification; added in migration v9 (null pre-classification). */
+  outcome?: string | null
+  /** Last turn into this epoch; added in migration v11 (null → started_at). */
+  last_activity_at?: number | null
+}
+
+/** Row shape from the `team_triggers` table. */
+export interface TeamTriggerRow {
+  id: string
+  team_id: string
+  source_type: string
+  config_json: string
+  enabled: number
+  created_at: number
+}
+
+// ── Store-level partial updates ──
+
+/**
+ * Mutable persisted team fields. `name` and `goal` are the only directly
+ * editable text fields; the strategy enums and lead/epoch pointers have
+ * dedicated setters because they carry lifecycle meaning.
+ */
+export interface TeamFieldUpdate {
+  name?: string
+  goal?: string
+  memberSourcing?: Team['memberSourcing']
+  collabMode?: Team['collabMode']
+  escalationRouting?: Team['escalationRouting']
+}
+
+/** Owner-authored member fields (see {@link TeamStore.updateMemberFields}). */
+export interface MemberFieldUpdate {
+  duty?: string | null
+  delegatedPolicyJson?: string | null
+  acceptsChecks?: boolean
+  awaitingDecision?: boolean
+}
+
+/** Fields a member or the lead may change on a single blackboard task. */
+export interface TaskPatch {
+  status?: TaskStatus
+  assigneeAppId?: string | null
+  resultRef?: string | null
+  note?: string | null
+}
+
+// ── TeamStore Interface ──
+
+/**
+ * Persistence contract for the Digital Team data layer.
+ *
+ * All methods are synchronous (better-sqlite3). The store performs no business
+ * validation beyond SQLite constraints — lifecycle rules (epoch transitions,
+ * topology enforcement, AI member caps) live in the future apps/team service.
+ *
+ * Concurrency: writes are scoped by primary key and findings are append-only,
+ * so no in-process locking is required (see DESIGN.md).
+ */
+export interface TeamStore {
+  // ── teams ─────────────────────────────────────
+  insertTeam(team: Team): void
+  getTeamById(teamId: string): Team | null
+  listTeams(): Team[]
+  listTeamsBySpace(spaceId: string): Team[]
+  updateTeamFields(teamId: string, fields: TeamFieldUpdate): void
+  updateTeamStatus(teamId: string, status: TeamStatus): void
+  updateTeamLeadAppId(teamId: string, leadAppId: string | null): void
+  updateTeamCurrentEpoch(teamId: string, epochId: string | null): void
+  deleteTeam(teamId: string): boolean
+
+  // ── team_members ──────────────────────────────
+  addMember(member: TeamMember): void
+  removeMember(teamId: string, appId: string): boolean
+  setMemberLead(teamId: string, appId: string, isLead: boolean): void
+  setMemberScope(teamId: string, appId: string, scopeJson: string | null): void
+  /**
+   * Patch the owner-authored fields of one member (duty / delegated policy /
+   * the derived accepts-checks bit). Omitted fields are preserved.
+   */
+  updateMemberFields(teamId: string, appId: string, fields: MemberFieldUpdate): void
+  listMembersByTeam(teamId: string): TeamMember[]
+  getMemberByName(teamId: string, memberName: string): TeamMember | null
+  getMember(teamId: string, appId: string): TeamMember | null
+  listMembersByAppId(appId: string): TeamMember[]
+  listDirectoryMemberships(): import('../../../shared/apps/people-directory').DirectoryMembership[]
+
+  // ── joined-office projection ──────────────────
+  /**
+   * Idempotently mirror a host-driven roster into the local store as a joined
+   * ("shadow") office (teams.host_node_id = the host's node id). Owner node ids
+   * arrive ABSOLUTE and are remapped SELF-relative for this node. A re-apply
+   * upserts in place — no duplicate members, no constraint error.
+   */
+  materializeJoinedOffice(input: {
+    hostNodeId: string
+    selfNodeId: string
+    snapshot: JoinedOfficeSnapshot
+  }): void
+  /**
+   * The transient per-member runtime status (appId → working/idle/...) captured
+   * from the last materialized roster snapshot of a joined office. Run-state is a
+   * live projection, not a persisted column, so the joiner's status board overlays
+   * it onto the rendered roster. Empty for a locally-hosted office or before any
+   * snapshot has arrived.
+   */
+  getJoinedMemberStatuses(teamId: string): Map<string, TeamMemberRuntimeStatus>
+  /** The in-progress task title a working member is on, from the last snapshot. */
+  getJoinedMemberTaskTitle(teamId: string, appId: string): string | undefined
+  /** Live busy assignments from the last snapshot of a joined office. */
+  getJoinedMemberBusy(teamId: string, appId: string): RosterBusyEntry[]
+
+  // ── team_edges ────────────────────────────────
+  replaceEdgesForTeam(teamId: string, edges: TeamEdge[]): void
+  listEdgesByTeam(teamId: string): TeamEdge[]
+  isEdgeAllowed(teamId: string, fromAppId: string, toAppId: string): boolean
+
+  // ── blackboard_tasks ──────────────────────────
+  insertTask(task: BlackboardTask): void
+  getTaskById(taskId: string): BlackboardTask | null
+  updateTask(taskId: string, patch: TaskPatch, updatedAt: number): void
+  /** Remove one task by id (no-op if absent). Used to roll back a rejected
+   *  optimistic write and to reconcile a replica against an authority snapshot. */
+  deleteTask(taskId: string): void
+  listTasksByEpoch(teamId: string, epochId: string): BlackboardTask[]
+  listTasksByTeam(teamId: string): BlackboardTask[]
+  /** Epoch id of the most recently written task/finding, or null when the board
+   *  is empty. Lets a JOINED office bind its feed to replicated data before the
+   *  run-epoch pointer materializes from a roster snapshot. */
+  getLatestBoardEpochId(teamId: string): string | null
+
+  // ── blackboard_findings ───────────────────────
+  insertFinding(finding: BlackboardFinding): void
+  /** Remove one finding by id (no-op if absent). Same reconcile/rollback use. */
+  deleteFinding(findingId: string): void
+  listFindingsByTeam(teamId: string): BlackboardFinding[]
+  listFindingsByEpoch(teamId: string, epochId: string): BlackboardFinding[]
+
+  // ── team_activity ─────────────────────────────
+  /**
+   * Append one act. Idempotent by id: a replicated row this node already applied
+   * optimistically, or a catch-up redelivery, is a no-op rather than a throw —
+   * activity rows are immutable, so an existing row with the same id IS the row.
+   */
+  insertActivity(activity: TeamActivity): void
+  /** Remove one act by id (no-op if absent). Rollback of a rejected shadow write. */
+  deleteActivity(activityId: string): void
+  listActivityByEpoch(teamId: string, epochId: string): TeamActivity[]
+  listRecentActivityByEpoch(teamId: string, epochId: string, limit: number): TeamActivity[]
+  /** Every act of a team, across epochs — the replication snapshot's source. */
+  getConversationStats(teamId: string, ownAppIds: string[]): {
+    involved: Set<string>
+    outputCounts: Map<string, number>
+    unansweredDecisionMembers: Map<string, string[]>
+  }
+  listActivityByTeam(teamId: string): TeamActivity[]
+  /**
+   * How many acts an epoch holds, without loading them. Lets a bounded reader
+   * state how much it is NOT showing, which is the difference between a reader
+   * that knows its own blind spot and one that mistakes a window for the whole.
+   */
+  countActivityByEpoch(teamId: string, epochId: string): number
+
+  // ── team_epochs ───────────────────────────────
+  updateWorkItem(epochId: string, patch: Partial<Pick<import('../../../shared/apps/team-types').TeamWorkItem, 'title' | 'status' | 'createdBy' | 'entryAppId'>>): void
+  insertEpoch(epoch: TeamEpoch, triggerType?: TeamRunTriggerType): void
+  getEpochById(epochId: string): TeamEpoch | null
+  endEpoch(
+    epochId: string,
+    endedAt: number,
+    endReason: EpochEndReason,
+    summary: string | null,
+    outcome?: EpochOutcome | null
+  ): void
+  /** Reopen a sealed epoch (clear ended_at/end_reason; keep summary) for reversible-seal wake. */
+  reopenEpoch(epochId: string): void
+  /** Stamp a turn entering this epoch (monotonic; never moves backwards). */
+  touchEpoch(epochId: string, at: number): void
+  /** Set a conversation epoch's user-facing title (rename). */
+  renameEpoch(epochId: string, title: string | null): void
+  /**
+   * Idempotent whole-row apply of a replicated epoch (insert-or-overwrite by id).
+   * The replication plane treats epochs as office-shared objects with the
+   * authority as single writer; later writes win field-by-field on re-apply.
+   */
+  upsertEpoch(epoch: TeamEpoch, triggerType?: TeamRunTriggerType): void
+  getEpochSummaryStats(teamId: string): Map<string, { taskCount: number; doneCount: number; lastActivityAt: number }>
+  getLatestEpochForTeam(teamId: string): TeamEpoch | null
+  listEpochsByTeam(teamId: string): TeamEpoch[]
+  getCurrentEpochForTeam(teamId: string): TeamEpoch | null
+  /** The open (not sealed) 'conversation' epoch for a (team, chat), or null. */
+  getOpenConversationEpoch(teamId: string, chatKey: string): TeamEpoch | null
+  getLatestConversationEpoch(teamId: string, chatKey: string): TeamEpoch | null
+  /** All open 'conversation' epochs of a team, newest first. */
+  listOpenConversationEpochs(teamId: string): TeamEpoch[]
+  /** All open epochs (run + conversation) of a team, newest first. */
+  listOpenEpochs(teamId: string): TeamEpoch[]
+
+  // ── team_checks ───────────────────────────────
+  /** Insert-or-overwrite by id (office-shared row, later write wins). */
+  upsertCheck(check: TeamCheck): void
+  getCheckById(checkId: string): TeamCheck | null
+  deleteCheck(checkId: string): boolean
+  listChecksByEpoch(teamId: string, epochId: string): TeamCheck[]
+  listChecksByTeam(teamId: string): TeamCheck[]
+  /** Used at boot to re-arm the alarms this machine owns. */
+  listAllChecks(): TeamCheck[]
+  /** Its run or conversation ended, so the checks set inside it end too. */
+  deleteChecksByEpoch(teamId: string, epochId: string): TeamCheck[]
+
+  // ── team_triggers ─────────────────────────────
+  insertTrigger(trigger: TeamTrigger): void
+  updateTrigger(id: string, patch: { config?: TeamTrigger['config']; enabled?: boolean }): void
+  deleteTrigger(id: string): boolean
+  deleteTriggersByTeam(teamId: string): void
+  getTriggerById(id: string): TeamTrigger | null
+  listTriggersByTeam(teamId: string): TeamTrigger[]
+  /** All enabled triggers across all teams — used for boot rehydration. */
+  listAllEnabledTriggers(): TeamTrigger[]
+}

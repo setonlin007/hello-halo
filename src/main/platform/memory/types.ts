@@ -33,6 +33,8 @@ export interface MemoryCallerScope {
   spacePath: string
   /** App identifier (required when type === 'app') */
   appId?: string
+  /** Trusted identity storage root supplied by the app manager, never by a tool caller. */
+  appDataPath?: string
 }
 
 // ============================================================================
@@ -95,6 +97,21 @@ export interface SessionSummaryParams {
 export const COMPACTION_THRESHOLD_BYTES = 100 * 1024
 
 // ============================================================================
+// Turn Modes
+// ============================================================================
+
+/**
+ * Where the turn sits. It decides only HOW memory reached the agent — the agent
+ * is the same one with the same memory wherever it works.
+ *
+ * - `run`     — an automation run: fresh context per trigger, so the snapshot is
+ *               injected and a `# History` heading pre-inserted every time
+ * - `session` — an ongoing session (chat, IM, team): the snapshot is injected when
+ *               the session starts and stays in context for the turns that follow
+ */
+export type MemoryTurnMode = 'run' | 'session'
+
+// ============================================================================
 // MemoryService Interface
 // ============================================================================
 
@@ -145,17 +162,25 @@ export interface MemoryService {
   flushBeforeCompaction(caller: MemoryCallerScope): Promise<void>
 
   /**
-   * Compact a memory.md file that has grown too large.
+   * Replace a memory.md that has grown too large with a compacted summary,
+   * keeping the full version at memory/YYYY-MM-DD-HHmm.md.
    *
-   * Moves the current memory.md to memory/YYYY-MM-DD-HHmm.md (archive)
-   * and creates a fresh memory.md. The caller (apps/runtime) is responsible
-   * for generating a compacted summary via LLM and writing it to the new file.
+   * The summary is produced by the caller (apps/runtime owns the LLM call) and
+   * handed over here, rather than this taking the file away first and waiting
+   * for one: memory.md stays readable and writable for the minutes generation
+   * takes, so a concurrent execution never meets an empty slot, and whatever it
+   * writes in the meantime is inside the version that gets archived.
    *
    * @param caller - Who is compacting
    * @param scope - Which scope to compact
-   * @returns Object with { archived: string (archive path), needsSummary: boolean }
+   * @param summary - What memory.md holds afterwards
+   * @returns Path to the archived file, or null if there was nothing to compact
    */
-  compact(caller: MemoryCallerScope, scope: MemoryScopeType): Promise<{ archived: string; needsSummary: boolean }>
+  compact(
+    caller: MemoryCallerScope,
+    scope: MemoryScopeType,
+    summary: string
+  ): Promise<string | null>
 
   /**
    * Save a session summary to the memory/ archive directory.
@@ -179,9 +204,11 @@ export interface MemoryService {
    * Returns a markdown fragment to be appended to the agent's system prompt.
    * Guides the AI to use native file tools (Read/Edit/Write) on memory.md.
    *
+   * @param mode - What the caller actually does for this turn, so the
+   *               instructions never promise an injection that did not happen
    * @returns Prompt fragment string
    */
-  getPromptInstructions(): string
+  getPromptInstructions(mode: MemoryTurnMode): string
 
   /**
    * Check if a memory file exceeds the compaction threshold.

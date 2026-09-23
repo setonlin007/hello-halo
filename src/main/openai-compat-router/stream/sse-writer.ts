@@ -13,7 +13,8 @@ import type {
   AnthropicContentBlockStopEvent,
   AnthropicMessageDeltaEvent,
   AnthropicMessageStopEvent,
-  AnthropicStopReason
+  AnthropicStopReason,
+  AnthropicWebSearchResult
 } from '../types'
 import type { NormalizedUsage } from '../converters/response/usage'
 
@@ -128,7 +129,7 @@ export class SSEWriter {
   writeWebSearchBlockStart(
     index: number,
     toolUseId: string,
-    results: Array<{ type: string; url?: string; title?: string }>
+    results: AnthropicWebSearchResult[]
   ): boolean {
     const event: AnthropicContentBlockStartEvent = {
       type: 'content_block_start',

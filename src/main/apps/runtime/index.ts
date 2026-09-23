@@ -32,7 +32,12 @@
  */
 
 import type { DatabaseManager } from '../../platform/store'
-import type { AppManagerService } from '../manager'
+import { getAppManager, type AppManagerService } from '../manager'
+import { previewAppSpaceChange, changeAppDefaultSpace, retainAppEnvironments } from './space-change'
+import { readSessionMessages } from './session-store'
+import { buildAppCapabilityInventory } from './capability-inventory'
+import { buildPeopleDirectory } from './people-directory'
+import { getTeamStore } from '../team'
 import type { SchedulerService } from '../../platform/scheduler'
 import type { MemoryService } from '../../platform/memory'
 import type { BackgroundService } from '../../platform/background'
@@ -55,7 +60,6 @@ import { clearAllImPermissionContexts } from './im-permission-registry'
 import { clearAllImStreamHandles } from './im-stream-registry'
 import { getConfig } from '../../foundation/config.service'
 import { getDataFolderName } from '../../foundation/product-config'
-import { getAppManager } from '../manager'
 import { onMcpAppsChange } from '../manager/service'
 import { createHaloAppsMcpServer } from '../conversation-mcp'
 import { registerAppBridge } from '../../services/app-bridge'
@@ -67,13 +71,21 @@ import type { AppRuntimeService } from './types'
 export type {
   AppRuntimeService,
   AppRunResult,
+  AppOverviewEntry,
   AppRunStartInfo,
   AutomationAppState,
   AutomationRun,
+  AutomationRunWithSummary,
+  ExecutionEnvironment,
+  ActivitySource,
+  EscalationContinuation,
   ActivityEntry,
   ActivityEntryContent,
   ActivityEntryType,
   ActivityQueryOptions,
+  PendingDecisionQuery,
+  RunQueryOptions,
+  RunStats,
   EscalationResponse,
   TriggerContext,
   TriggerType,
@@ -92,6 +104,7 @@ export {
 
 // Re-export concurrency for testing
 export { Semaphore } from './concurrency'
+export { createPersonContextTool } from './person-context-tool'
 
 // Re-export app chat functions
 export {
@@ -114,11 +127,15 @@ export {
   createNativeChatSession,
   forkNativeChatSession,
   deleteNativeChatSession,
+  renameChatSession,
 } from './app-chat'
 export type { AppChatRequest, NativeSessionResult } from './app-chat'
 
 // Re-export inbound dispatch
 export { dispatchInboundMessage } from './dispatch-inbound'
+
+// Re-export intentional-stop marker (called by IPC/HTTP stop handlers, read by app-chat.ts)
+export { markIntentionalStop } from './intentional-stop'
 
 // Re-export IM permission registry
 export {
@@ -156,6 +173,7 @@ let memoryServiceRef: MemoryService | null = null
 let eventRouterInstance: EventRouter | null = null
 let imChannelManagerInstance: ImChannelManager | null = null
 let imSessionRegistryInstance: ImSessionRegistry | null = null
+let activityStoreRef: ActivityStore | null = null
 
 // ============================================
 // Initialization
@@ -231,6 +249,7 @@ export async function initAppRuntime(
 
   // Create the activity store
   const store = new ActivityStore(appDb)
+  activityStoreRef = store
 
   // ── Create and wire EventRouter ──────────────────────────────────────
   const eventRouter = createEventRouter()
@@ -272,6 +291,16 @@ export async function initAppRuntime(
   const registry = new ImSessionRegistry(registryPath)
   setImSessionRegistry(registry)
   imSessionRegistryInstance = registry
+
+  for (const app of deps.appManager.listApps({ type: 'automation' })) {
+    if (app.status === 'uninstalled' || store.getSessionEnvironment(`environment-backfill:${app.id}`)) continue
+    try {
+      retainAppEnvironments(deps.appManager, store, app)
+    } catch (error) {
+      console.warn('[Runtime] Legacy environment backfill blocked; original storage must be restored', { appId: app.id, error })
+    }
+  }
+
 
   // ── Pending Relay Spool ─────────────────────────────────────────────
   // Records notify_bot pushes against their target sessions so the target's
@@ -371,11 +400,69 @@ export function getAppMemoryService(): MemoryService | null {
 }
 
 /**
+ * Get the ActivityStore instance captured during init.
+ * Used by app-chat.ts to provide report_to_user in team turns.
+ */
+export function getActivityStore(): ActivityStore | null {
+  return activityStoreRef
+}
+
+function spaceChangeDependencies() {
+  const manager = getAppManager()
+  if (!manager || !activityStoreRef || !runtimeService) throw new Error('App services are not initialized')
+  return { manager, store: activityStoreRef, runtime: runtimeService }
+}
+
+export function getStudioSummary(language?: string) {
+  const manager = getAppManager()
+  if (!manager) throw new Error('App manager is not initialized')
+  const coordinators = getTeamStore()?.listDirectoryMemberships().filter(member => member.isSystemCoordinator).map(member => member.appId) ?? []
+  return manager.getStudioSummary(language, coordinators)
+}
+
+export function listPeopleDirectory(query: import('../../../shared/apps/people-directory').PeopleDirectoryQuery = {}) {
+  const deps = spaceChangeDependencies()
+  return buildPeopleDirectory(deps.manager, deps.store, deps.runtime, getTeamStore()?.listDirectoryMemberships() ?? [], query)
+}
+
+export function getAppCapabilityInventory() {
+  const manager = getAppManager()
+  if (!manager || !activityStoreRef) throw new Error('App services are not initialized')
+  return buildAppCapabilityInventory(manager, activityStoreRef)
+}
+
+export function getAppSpaceChangePreview(appId: string, newSpaceId: string) {
+  return previewAppSpaceChange(spaceChangeDependencies(), appId, newSpaceId)
+}
+
+export async function moveAppDefaultSpace(appId: string, newSpaceId: string): Promise<void> {
+  await changeAppDefaultSpace(spaceChangeDependencies(), appId, newSpaceId)
+}
+
+export function readAppRunMessages(appId: string, runId: string) {
+  const run = activityStoreRef?.getRun(runId)
+  if (!run || run.appId !== appId) throw new Error('Execution is unavailable for this digital human')
+  const spacePath = run.environment?.spacePath
+  if (!spacePath) throw new Error('The original execution environment is unavailable')
+  return readSessionMessages(spacePath, appId, runId)
+}
+
+/**
  * Get the ImChannelManager instance for external use
  * (e.g., status queries, reconnect, config reload from IPC/HTTP).
  */
 export function getImChannelManager(): ImChannelManager | null {
   return imChannelManagerInstance
+}
+
+/**
+ * Get the EventRouter instance created during init.
+ * Used by the team trigger scheduler to route 'webhook' | 'file' | 'wecom'
+ * team triggers through the same multi-subscriber path the app runtime uses.
+ * Returns null if the App Runtime is not yet initialized.
+ */
+export function getEventRouter(): EventRouter | null {
+  return eventRouterInstance
 }
 
 /**
@@ -407,6 +494,7 @@ export async function shutdownAppRuntime(): Promise<void> {
   }
 
   imSessionRegistryInstance = null
+  activityStoreRef = null
   setImSessionRegistry(null as any)
 
   // Flush synchronously: a relay recorded seconds before exit must survive,

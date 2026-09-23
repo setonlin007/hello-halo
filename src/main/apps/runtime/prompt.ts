@@ -14,9 +14,12 @@
 
 import type { AutomationSpec } from '../spec'
 import type { MemorySnapshot } from '../../platform/memory/snapshot'
-import type { EscalationResponse } from './types'
+import type { EscalationResponse, EscalationQuestion } from './types'
+import { formatEscalationAnswer } from '../../../shared/apps/app-types'
 import type { ImSessionRecord } from '../../../shared/types/im-channel'
+import type { LiveInstance } from './live-instances'
 import { getImSessionDisplayName } from '../../../shared/types/im-channel'
+import { describeInstanceKind, formatInstanceTag } from './live-instances'
 import { buildSystemPrompt, buildSystemPromptWithAIBrowser } from '../../services/agent/system-prompt'
 import { AI_BROWSER_SYSTEM_PROMPT } from '../../services/ai-browser'
 import { AI_TERMINAL_SYSTEM_PROMPT } from '../../services/ai-terminal'
@@ -43,8 +46,8 @@ This is a headless background execution — there is no interactive user convers
   The user sees these reports in the Activity Thread, not your text output.
 - **User questions**: Use the escalation mechanism (type="escalation" in report_to_user)
   when you need user input. Do NOT use AskUserQuestion — it is unavailable in automation mode.
-- **Autonomy**: Execute the task to completion without asking for confirmation.
-  Only escalate when genuinely uncertain about a consequential decision.
+- **Autonomy**: Carry the task to completion on your own. Escalate only when the
+  rule in the Reporting section below applies.
 - **All other tools and capabilities remain identical** to the main Halo agent.
 
 ### Browser session
@@ -71,16 +74,23 @@ Use \`mcp__halo-report__report_to_user\` to communicate results to the user.
 2. **Important discoveries** (type="milestone") — when you find information
    of significant value to the user. Don't wait until the end to report it.
 
-3. **Uncertain decisions** (type="escalation") — when you encounter any
-   situation where you're unsure what the user would want. Do NOT make
-   assumptions. Ask first, then wait for the user's response.
+3. **Decisions that are not yours** (type="escalation") — escalate when the next
+   step is both hard to undo and open to more than one reading. Hard to undo
+   means it leaves your workspace: sent, submitted, published, paid, deleted.
+   Open to more than one reading means the instructions do not settle it, so you
+   would be choosing on the user's behalf.
+
+   Neither condition is enough alone. Hard to undo but unambiguous: do it, then
+   say what you did. Ambiguous but reversible: take the most likely reading, do
+   it, and name the reading you took. A plan the user must approve before you
+   execute it is an escalation.
 
 4. **Deliverable outputs** (type="output") — when you produce files,
    reports, or other artifacts. Tell the user where to find them.
 
 ### Reporting Format
 
-**summary** — write for humans: be clear, direct, and avoid technical jargon.
+**message** — write for humans: be clear, direct, and avoid technical jargon.
   ✅ "AirPods Pro lowest price today: ¥1199, no change from yesterday."
   ❌ "Successfully fetched 3 URLs, price delta: 0"
 
@@ -343,6 +353,8 @@ export function buildInitialMessage(options: {
   userConfig?: Record<string, unknown>
   appName: string
   memorySnapshot: MemorySnapshot
+  selfInstance: LiveInstance
+  liveInstances: LiveInstance[]
 }): string {
   const parts: string[] = []
 
@@ -351,6 +363,7 @@ export function buildInitialMessage(options: {
 
   // ── Memory ─────────────────────────────────────────────────────────────
   parts.push(buildMemorySection(options.memorySnapshot))
+  parts.push(buildLiveInstancesSection(options.selfInstance, options.liveInstances))
 
   // ── User Configuration ─────────────────────────────────────────────────
   if (options.userConfig && Object.keys(options.userConfig).length > 0) {
@@ -380,11 +393,23 @@ export function buildInitialMessage(options: {
  */
 export function buildEscalationResumeMessage(escalation: {
   originalQuestion: string
+  questions?: EscalationQuestion[]
   userResponse: EscalationResponse
 }): string {
-  const responseText = escalation.userResponse.text
-    || escalation.userResponse.choice
-    || '(no response)'
+  const questions = escalation.questions ?? []
+
+  // Several answers are listed against the questions they belong to: read on
+  // their own ("Yes; the second one") they are not answers at all.
+  if (questions.length > 1) {
+    return (
+      `User answered your escalation.\n\n` +
+      `${escalation.originalQuestion}\n\n` +
+      `${formatEscalationAnswer(questions, escalation.userResponse)}\n\n` +
+      `Continue your task based on these answers.`
+    )
+  }
+
+  const responseText = formatEscalationAnswer(questions, escalation.userResponse) || '(no response)'
   return (
     `User responded to your escalation.\n\n` +
     `Your question: "${escalation.originalQuestion}"\n` +
@@ -398,19 +423,89 @@ export function buildEscalationResumeMessage(escalation: {
 // ============================================
 
 /**
+ * Sits immediately above the injected memory. One digital human, many
+ * concurrent executions, one first-person file: without this, a line another
+ * instance wrote about itself reads as a description of the reader.
+ */
+const MEMORY_AUTHORSHIP_FRAMING = `
+This is the shared working state of the digital human (the AI agent you are
+running as), written over time by many
+instances — including ones that are running right now. It is written in the
+first person, but "I" is the digital human, not you. A line here that claims
+a role, an assignment, or work in progress was written by whoever was doing
+it, and may be from another instance, another conversation, or another day.
+
+Do not act on such a line as if it described you. If it matters for what you
+are about to do, verify it at its live source first — the team board, the
+files, the user in front of you — and if it turns out to be stale, correct
+the line.
+`.trim()
+
+/**
+ * Who this execution is, and who else is executing at the same moment. Rendered
+ * directly below the memory block so the reader meets the roster in the same
+ * breath as the file it explains.
+ *
+ * Never persisted: it is true only at the moment the message was built.
+ */
+export function buildLiveInstancesSection(self: LiveInstance, others: LiveInstance[]): string {
+  const asOf = formatClockTime(Date.now())
+  const lines: string[] = [
+    `You are \`${formatInstanceTag(self)}\` — this ${describeInstanceKind(self)}. ` +
+    `Anything in memory not written by you was written by another instance.`,
+    '',
+  ]
+
+  if (others.length === 0) {
+    lines.push(`No other instance of this digital human is running right now (as of ${asOf}).`)
+    return lines.join('\n')
+  }
+
+  lines.push(`### Running right now (as of ${asOf})`)
+  lines.push('')
+  for (const other of others) {
+    const started = other.startedAt ? `, started ${formatClockTime(other.startedAt)}` : ''
+    lines.push(`- ${formatInstanceTag(other)} — ${describeInstanceKind(other)}${started}`)
+  }
+  lines.push('')
+  lines.push(
+    'This was true when this message was built and may already be out of date;\n' +
+    'one of them may have finished by now. It tells you whose work you might be\n' +
+    'reading in memory. It is not a queue, a lock, or a way to reach them.'
+  )
+  return lines.join('\n')
+}
+
+function formatClockTime(epochMs: number): string {
+  const d = new Date(epochMs)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/**
  * Build the ## Memory section for the initial message.
  *
  * Three variants based on memory state:
  * - No file: guidance to create one
  * - Small file (≤30 lines): full content inline
  * - Large file (>30 lines): first section + structural outline
+ *
+ * Exported for app-chat, which injects the same section at the start of a team
+ * session — the digital human is the same one either way, so it must meet its
+ * memory in the same shape whether the turn came from a schedule or a teammate.
  */
-function buildMemorySection(snapshot: MemorySnapshot): string {
+export function buildMemorySection(snapshot: MemorySnapshot): string {
   const lines: string[] = []
   lines.push('## Memory')
   lines.push('')
-  lines.push('Your persistent memory from previous runs. Read it to maintain continuity and avoid repeating work.')
+  lines.push('Your persistent memory from previous work. Read it to maintain continuity and avoid repeating work.')
   lines.push('')
+
+  // Only where there is content to misread: a digital human with no memory yet
+  // has no first-person line to mistake for its own.
+  if (snapshot.exists) {
+    lines.push(MEMORY_AUTHORSHIP_FRAMING)
+    lines.push('')
+  }
 
   if (!snapshot.exists) {
     // ── No memory file ─────────────────────────────────────────────────

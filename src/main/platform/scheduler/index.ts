@@ -131,6 +131,7 @@ export async function initScheduler(deps: SchedulerDeps): Promise<SchedulerServi
         schedule: input.schedule,
         enabled: input.enabled,
         metadata: input.metadata,
+        kind: input.kind ?? 'app',
         anchorMs,
         nextRunAtMs,
         consecutiveErrors: 0,
@@ -274,8 +275,8 @@ export async function initScheduler(deps: SchedulerDeps): Promise<SchedulerServi
 
     // -- Execution --
 
-    onJobDue(handler: JobDueHandler): void {
-      timer.setHandler(handler)
+    onJobDue(kind: string, handler: JobDueHandler): void {
+      timer.setHandler(kind, handler)
     },
 
     start(): void {

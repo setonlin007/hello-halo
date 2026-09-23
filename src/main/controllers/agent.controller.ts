@@ -13,16 +13,8 @@ import {
   probeMcpApp as agentProbeMcpApp,
   resolveQuestion
 } from '../services/agent'
-
-// Image attachment type for multi-modal messages
-interface ImageAttachment {
-  id: string
-  type: 'image'
-  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
-  data: string  // Base64 encoded
-  name?: string
-  size?: number
-}
+import type { ImageAttachment } from '../../shared/types/image-attachment'
+import { markIntentionalStop } from '../apps/runtime'
 
 export interface SendMessageRequest {
   spaceId: string
@@ -60,6 +52,10 @@ export async function sendMessage(
  */
 export function stopGeneration(conversationId?: string): ControllerResponse {
   try {
+    // Marked BEFORE stopping — see intentional-stop.ts: a team member's stop
+    // kills its CC subprocess outright, surfacing the same way a crash does,
+    // and this is the only thing that tells turn-report.ts the difference.
+    if (conversationId) markIntentionalStop(conversationId)
     agentStopGeneration(conversationId)
     return { success: true }
   } catch (error: unknown) {

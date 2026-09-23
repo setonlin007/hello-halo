@@ -673,7 +673,7 @@ describe('SchedulerTimer', () => {
 
   it('should call handler when a job becomes due', async () => {
     const handler = vi.fn().mockResolvedValue('useful' as RunOutcome)
-    timer.setHandler(handler)
+    timer.setHandler('app', handler)
 
     // Insert a job due NOW
     const job = makeJob({ nextRunAtMs: currentTime })
@@ -691,7 +691,7 @@ describe('SchedulerTimer', () => {
 
   it('should NOT call handler for a future job', async () => {
     const handler = vi.fn().mockResolvedValue('useful' as RunOutcome)
-    timer.setHandler(handler)
+    timer.setHandler('app', handler)
 
     // Job is 30 minutes in the future
     const job = makeJob({ nextRunAtMs: currentTime + 1_800_000 })
@@ -705,7 +705,7 @@ describe('SchedulerTimer', () => {
 
   it('should not re-trigger a running job', async () => {
     const handler = vi.fn().mockResolvedValue('useful' as RunOutcome)
-    timer.setHandler(handler)
+    timer.setHandler('app', handler)
 
     // Insert an idle due job so armTimer() arms a timeout and the tick fires
     const idleJob = makeJob({ id: 'idle-due', nextRunAtMs: currentTime })
@@ -732,7 +732,7 @@ describe('SchedulerTimer', () => {
 
   it('should track consecutive errors in the store after handler error', async () => {
     const handler = vi.fn().mockRejectedValue(new Error('test failure'))
-    timer.setHandler(handler)
+    timer.setHandler('app', handler)
 
     const job = makeJob({ nextRunAtMs: currentTime })
     store.insertJob(job)
@@ -756,6 +756,40 @@ describe('SchedulerTimer', () => {
     expect(updated!.status).toBe('idle')
   })
 
+  it('should route a due job to the handler matching its kind', async () => {
+    const appHandler = vi.fn().mockResolvedValue('useful' as RunOutcome)
+    const teamHandler = vi.fn().mockResolvedValue('useful' as RunOutcome)
+    timer.setHandler('app', appHandler)
+    timer.setHandler('team', teamHandler)
+
+    store.insertJob(makeJob({ id: 'team-job', nextRunAtMs: currentTime, kind: 'team' }))
+
+    timer.start()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(teamHandler).toHaveBeenCalledOnce()
+    expect(teamHandler.mock.calls[0][0].id).toBe('team-job')
+    expect(appHandler).not.toHaveBeenCalled()
+  })
+
+  it('should record an error (not silently drop) when a kind has no handler', async () => {
+    const appHandler = vi.fn().mockResolvedValue('useful' as RunOutcome)
+    timer.setHandler('app', appHandler)
+
+    const job = makeJob({ id: 'orphan-kind', nextRunAtMs: currentTime, kind: 'team' })
+    store.insertJob(job)
+
+    timer.start()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(appHandler).not.toHaveBeenCalled()
+    const updated = store.getJob(job.id)
+    expect(updated!.consecutiveErrors).toBe(1)
+    const log = store.getRunLog(job.id, 1)
+    expect(log[0].outcome).toBe('error')
+    expect(log[0].error).toContain('team')
+  })
+
   // Issue #340: a hung handler must not starve other jobs or the tick loop.
   describe('hung-handler isolation (issue #340)', () => {
     it('runs another job while one handler hangs', async () => {
@@ -764,7 +798,7 @@ describe('SchedulerTimer', () => {
         release.push(() => resolve('useful'))
       }))
       const done = vi.fn().mockResolvedValue('useful' as RunOutcome)
-      timer.setHandler(async (job) => (job.id === 'hang-job' ? hang() : done(job)))
+      timer.setHandler('app', async (job) => (job.id === 'hang-job' ? hang() : done(job)))
 
       store.insertJob(makeJob({ id: 'hang-job', nextRunAtMs: currentTime }))
       store.insertJob(makeJob({ id: 'ok-job', nextRunAtMs: currentTime }))
@@ -791,7 +825,7 @@ describe('SchedulerTimer', () => {
         release.push(() => resolve('useful'))
       }))
       const done = vi.fn().mockResolvedValue('useful' as RunOutcome)
-      timer.setHandler(async (job) => (job.id === 'hang-job' ? hang() : done(job)))
+      timer.setHandler('app', async (job) => (job.id === 'hang-job' ? hang() : done(job)))
 
       store.insertJob(makeJob({ id: 'hang-job', nextRunAtMs: currentTime }))
       store.insertJob(makeJob({
@@ -825,7 +859,7 @@ describe('SchedulerTimer', () => {
         release.push(() => resolve('useful'))
       }))
       const done = vi.fn().mockResolvedValue('useful' as RunOutcome)
-      timer.setHandler(async (job) => (job.id === 'hang-job' ? hang() : done(job)))
+      timer.setHandler('app', async (job) => (job.id === 'hang-job' ? hang() : done(job)))
 
       store.insertJob(makeJob({ id: 'hang-job', nextRunAtMs: currentTime }))
       store.insertJob(makeJob({
@@ -875,7 +909,7 @@ describe('SchedulerTimer', () => {
           releases[job.id].push(() => resolve('useful'))
         })
       })
-      capped.setHandler(handler)
+      capped.setHandler('app', handler)
 
       for (let i = 0; i < 3; i++) {
         store.insertJob(makeJob({ id: `job-${i}`, nextRunAtMs: currentTime }))
@@ -916,7 +950,7 @@ describe('SchedulerTimer', () => {
       timers.push(capped)
 
       const handler = vi.fn().mockImplementation(() => new Promise<RunOutcome>(() => {}))
-      capped.setHandler(handler)
+      capped.setHandler('app', handler)
 
       // 3 due jobs, cap 2: job-2 stays stranded past-due.
       for (let i = 0; i < 3; i++) {
@@ -959,7 +993,7 @@ describe('SchedulerTimer', () => {
       if (injectedTimer && !timers.includes(injectedTimer)) timers.push(injectedTimer)
 
       const releases: Array<() => void> = []
-      service.onJobDue(() =>
+      service.onJobDue('app', () =>
         new Promise<RunOutcome>(resolve => {
           releases.push(() => resolve('useful'))
         })

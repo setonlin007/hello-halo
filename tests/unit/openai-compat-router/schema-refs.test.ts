@@ -54,7 +54,7 @@ function requestWithTools(): AnthropicRequest {
 describe('tool schema forwarding', () => {
   it('keeps $ref and $defs intact on the Chat Completions path', () => {
     const { request } = convertAnthropicToOpenAIChat(requestWithTools())
-    const params = request.tools![0].function.parameters as Record<string, unknown>
+    const params = request.tools![0].function.parameters as unknown as Record<string, unknown>
 
     expect(params).toEqual(SCHEMA_WITH_REFS)
   })
@@ -76,7 +76,7 @@ describe('tool schema forwarding', () => {
     } as never
 
     const { request } = convertAnthropicToOpenAIChat(anthropicRequest)
-    const params = request.tools![0].function.parameters as Record<string, unknown>
+    const params = request.tools![0].function.parameters as unknown as Record<string, unknown>
 
     expect(params.additionalProperties).toBe(false)
     expect(params.$schema).toBe('http://json-schema.org/draft-07/schema#')

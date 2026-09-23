@@ -15,15 +15,22 @@ import { useAppStore } from '../stores/app.store'
 import { useSpaceStore } from '../stores/space.store'
 import { useAppsStore } from '../stores/apps.store'
 import { useAppsPageStore, tabForAppType } from '../stores/apps-page.store'
+import { useTeamStore } from '../stores/team.store'
 import type { AppType } from '../../shared/apps/spec-types'
 import { Header } from '../components/layout/Header'
-import { AppList } from '../components/apps/AppList'
+import { visibleDigitalHumans } from '../utils/people-model'
+import { PeopleInbox } from '../components/apps/PeopleInbox'
+import { PeopleDirectory } from '../components/apps/PeopleDirectory'
+import { PersonTeams } from '../components/apps/PersonTeams'
+import { SkillCardWall } from '../components/apps/SkillCardWall'
+import { McpCardWall } from '../components/apps/McpCardWall'
+import { usePeopleViewStore } from '../stores/people-view.store'
 import { AutomationHeader } from '../components/apps/AutomationHeader'
+import { AppBotSessionsView } from '../components/apps/AppBotSessionsView'
+import { AppSessionsView } from '../components/apps/AppSessionsView'
 import { LoginNoticeBar } from '../components/apps/LoginNoticeBar'
 import { ActivityThread } from '../components/apps/ActivityThread'
 import { SessionDetailView } from '../components/apps/SessionDetailView'
-import { AppChatView } from '../components/apps/AppChatView'
-import { AppChatContainer } from '../components/apps/AppChatContainer'
 import { AppConfigPanel } from '../components/apps/AppConfigPanel'
 import { McpStatusCard } from '../components/apps/McpStatusCard'
 import { SkillInfoCard } from '../components/apps/SkillInfoCard'
@@ -32,16 +39,15 @@ import { AppInstallDialog } from '../components/apps/AppInstallDialog'
 import { ManualAddDialog } from '../components/apps/ManualAddDialog'
 import { SkillInstallDialog } from '../components/apps/SkillInstallDialog'
 import { UninstalledDetailView } from '../components/apps/UninstalledDetailView'
-import { StoreView } from '../components/store/StoreView'
+import { TeamTabContent } from '../components/team'
 import { useTranslation, getCurrentLanguage } from '../i18n'
 import { resolveSpecI18n } from '../utils/spec-i18n'
-import { useIsMobile } from '../hooks/useIsMobile'
 import { api } from '../api'
 import { ChevronLeft, ChevronRight, Settings } from 'lucide-react'
 
 export function AppsPage() {
   const { t } = useTranslation()
-  const { setView, previousView } = useAppStore()
+  const { navigate, navigateBack } = useAppStore()
   const currentSpace = useSpaceStore(state => state.currentSpace)
   const haloSpace = useSpaceStore(state => state.haloSpace)
   const spaces = useSpaceStore(state => state.spaces)
@@ -61,7 +67,6 @@ export function AppsPage() {
     openMarketplaceFilteredBy,
   } = useAppsPageStore()
 
-  const isMobile = useIsMobile()
 
   /** When set, ManualAddDialog opens pre-targeted to that type (skips chooser) */
   const [manualAddType, setManualAddType] = useState<'mcp' | 'skill' | null>(null)
@@ -75,11 +80,20 @@ export function AppsPage() {
     return null
   }, [currentTab])
 
+  const selectedTeamId = useTeamStore(s => s.currentTeamId)
+  const inTeamWorkbench = currentTab === 'team' && selectedTeamId !== null
+  const teams = useTeamStore(s => s.teams)
+
+
+  // How many teams have a decision waiting on the user — surfaced on the Teams
+  // tab itself so it's visible without having to switch away and back.
+  const waitingTeamsCount = useTeamStore(s => s.teams.filter(tm => tm.hasWaitingUser).length)
+
   /** Filter apps visible in the current tab (excludes store tab) */
   const appsForCurrentTab = useMemo(() => {
     if (!appTypeForCurrentTab) return []
-    return apps.filter(a => a.spec.type === appTypeForCurrentTab)
-  }, [apps, appTypeForCurrentTab])
+    return appTypeForCurrentTab === 'automation' ? visibleDigitalHumans(apps, teams) : apps.filter(app => app.spec.type === appTypeForCurrentTab)
+  }, [apps, appTypeForCurrentTab, teams])
 
   /**
    * Open the marketplace pre-filtered by the target type. Delegates to the
@@ -89,13 +103,25 @@ export function AppsPage() {
     void openMarketplaceFilteredBy(type)
   }, [openMarketplaceFilteredBy])
 
-  // Load all apps globally (across all spaces) on mount
+  useEffect(() => { void useTeamStore.getState().loadTeams() }, [])
   useEffect(() => {
-    loadApps()
-  }, [loadApps])
+    if (currentTab === 'team' || currentTab === 'my-skills' || currentTab === 'my-mcp' || detailView?.type === 'app-config') void loadApps()
+  }, [currentTab, detailView?.type, loadApps])
+  const [detailFailed, setDetailFailed] = useState(false)
+  const [detailRevision, setDetailRevision] = useState(0)
+  const targetAppId = initialAppId ?? selectedAppId
+  useEffect(() => {
+    if (!targetAppId || apps.some(app => app.id === targetAppId)) return
+    let active = true
+    setDetailFailed(false)
+    void useAppsStore.getState().refreshApp(targetAppId).then(() => {
+      if (active) { setDetailFailed(!useAppsStore.getState().apps.some(app => app.id === targetAppId)) }
+    })
+    return () => { active = false }
+  }, [targetAppId, detailRevision])
 
   // Fetch available updates on mount and stay subscribed to push events so
-  // the "Update" badge in AppListItem stays fresh without polling.
+  // the update badges on resource cards stay fresh without polling.
   const checkUpdatesAction = useAppsPageStore(s => s.checkUpdates)
   useEffect(() => {
     void checkUpdatesAction()
@@ -126,7 +152,7 @@ export function AppsPage() {
         // Switch to the correct tab for this app type (digital-humans / skills / mcp)
         const targetTab = tabForAppType(app.spec.type)
         if (currentTab !== targetTab) setCurrentTab(targetTab)
-        selectApp(app.id, app.status === 'uninstalled' ? 'uninstalled' : app.spec.type, app.spaceId ?? undefined)
+        selectApp(app.id, app.status === 'uninstalled' ? 'uninstalled' : app.spec.type)
         setInitialAppId(null)
       }
     }
@@ -137,31 +163,17 @@ export function AppsPage() {
   useEffect(() => {
     const prev = prevTabRef.current
     prevTabRef.current = currentTab
-    // Only clear when switching between the two list tabs (not to/from store)
-    if (prev !== currentTab && prev !== 'store' && currentTab !== 'store') {
+    if (prev !== currentTab) {
       // Preserve the selection when it already belongs to the new tab. This is
       // the case for programmatic cross-tab navigation (e.g. opening an MCP or
       // skill detail from a digital human's settings), which sets the tab and
       // the selection together — clearing here would wipe the just-opened
       // detail and auto-select the first app instead.
       const sel = apps.find(a => a.id === selectedAppId)
-      const belongsToNewTab = sel ? tabForAppType(sel.spec.type) === currentTab : false
+      const belongsToNewTab = sel ? tabForAppType(sel.spec.type) === currentTab : currentTab === 'my-digital-humans' && !!detailView
       if (!belongsToNewTab) clearSelection()
     }
   }, [currentTab, clearSelection, apps, selectedAppId])
-
-  // Auto-select first app for the current tab if nothing selected (desktop only —
-  // on mobile the user should see the full-width list first and tap to select)
-  useEffect(() => {
-    if (isMobile) return
-    if (currentTab === 'store') return
-    if (!selectedAppId && appsForCurrentTab.length > 0) {
-      const activeApps = appsForCurrentTab.filter(a => a.status !== 'uninstalled')
-      const waitingApp = activeApps.find(a => a.status === 'waiting_user')
-      const firstApp = waitingApp ?? activeApps[0] ?? appsForCurrentTab[0]
-      selectApp(firstApp.id, firstApp.status === 'uninstalled' ? 'uninstalled' : firstApp.spec.type, firstApp.spaceId ?? undefined)
-    }
-  }, [appsForCurrentTab, selectedAppId, selectApp, currentTab, isMobile])
 
   // Resolve the selected app (for breadcrumb and detail panel)
   const selectedApp = useMemo(
@@ -185,12 +197,13 @@ export function AppsPage() {
   }, [selectedApp, resolvedSpec])
 
   const isSessionDetail = detailView?.type === 'session-detail'
-  const isAppChat = detailView?.type === 'app-chat'
-  const isAppConfig = detailView?.type === 'app-config'
   const isUninstalledDetail = detailView?.type === 'uninstalled-detail'
+  // Bot sessions and run traces manage their own scrolling panes.
+  const isFullBleedDetail = isSessionDetail || detailView?.type === 'bot-sessions' || detailView?.type === 'app-sessions'
 
-  // Right-pane EmptyState is informational only; install/browse CTAs live
-  // exclusively in the AppList sidebar to avoid double action surfaces.
+  // Informational only: install/browse CTAs live on the surfaces that list
+  // resources (the walls, the directory), so a detail pane never competes with
+  // them. Reached when a selection has no detail view to render.
   const emptyStateVariant = currentTab === 'my-skills'
     ? 'skill' as const
     : currentTab === 'my-mcp'
@@ -217,13 +230,23 @@ export function AppsPage() {
             runId={detailView.runId}
           />
         )
-      case 'app-chat':
+      case 'app-sessions':
         return (
-          <AppChatContainer
+          <AppSessionsView
             appId={detailView.appId}
-            spaceId={detailView.spaceId}
+            spaceId={selectedApp?.spaceId ?? null}
           />
         )
+      case 'bot-sessions':
+        return (
+          <AppBotSessionsView
+            appId={detailView.appId}
+            spaceId={selectedApp?.spaceId ?? ''}
+            instanceId={detailView.instanceId}
+          />
+        )
+      case 'app-teams':
+        return <PersonTeams appId={detailView.appId} />
       case 'app-config':
         return <AppConfigPanel appId={detailView.appId} spaceName={selectedApp?.spaceId ? spaceMap[selectedApp.spaceId] : t('Global')} />
       case 'mcp-status':
@@ -248,18 +271,19 @@ export function AppsPage() {
       <Header
         left={
           <button
-            onClick={() => setView(currentSpace ? 'space' : (previousView || 'home'))}
+            onClick={() => inTeamWorkbench ? useTeamStore.getState().selectTeam(null) : currentSpace ? navigate('space') : navigateBack('space')}
             className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
           >
             <ChevronLeft className="w-4 h-4" />
-            {currentSpace?.name ?? t('Back')}
+            {inTeamWorkbench ? t('Teams') : currentSpace?.name ?? t('Back')}
           </button>
         }
         right={
           <button
-            onClick={() => setView('settings')}
-            className="p-1.5 hover:bg-secondary rounded-lg transition-colors"
+            onClick={() => navigate('settings')}
+            className="min-h-9 min-w-9 flex items-center justify-center p-1.5 hover:bg-secondary rounded-lg transition-colors"
             title={t('Settings')}
+            aria-label={t('Settings')}
           >
             <Settings className="w-5 h-5" />
           </button>
@@ -267,173 +291,81 @@ export function AppsPage() {
       />
 
       {/* Tab bar — kept provider-agnostic via TabButton sub-component */}
-      <div className="flex items-center gap-1 px-3 sm:px-4 py-2 border-b border-border flex-shrink-0 overflow-x-auto">
+      {!inTeamWorkbench && <div className="flex items-center gap-1 px-3 sm:px-4 py-2 border-b border-border flex-shrink-0 overflow-x-auto">
+        {/* The request inbox has no tab of its own: it is reached from the
+            directory's "Needs you" group, so it highlights this tab. */}
         <TabButton
-          active={currentTab === 'my-digital-humans'}
+          active={currentTab === 'my-digital-humans' || currentTab === 'inbox'}
           label={t('My Digital Humans')}
           onClick={() => setCurrentTab('my-digital-humans')}
         />
         <TabButton
-          active={currentTab === 'my-skills'}
-          label={t('My Skills')}
+          active={currentTab === 'team'}
+          label={t('Teams')}
+          badge={waitingTeamsCount}
+          onClick={() => setCurrentTab('team')}
+        />
+        <TabButton
+          active={currentTab === 'my-skills' || currentTab === 'my-mcp'}
+          label={t('Capability library')}
           onClick={() => setCurrentTab('my-skills')}
         />
-        <TabButton
-          active={currentTab === 'my-mcp'}
-          label={t('My MCP')}
-          onClick={() => setCurrentTab('my-mcp')}
-        />
-        <TabButton
-          active={currentTab === 'store'}
-          label={t('Marketplace')}
-          onClick={() => setCurrentTab('store')}
-        />
-      </div>
+      </div>}
 
       {/* Content area */}
-      {currentTab === 'store' ? (
-        <StoreView />
-      ) : !isMobile ? (
-        /* ── Desktop: split layout — left sidebar + right detail (unchanged) ── */
-        <div className="flex-1 flex overflow-hidden">
-          {/* Left: App list (fixed 240px width) */}
-          <div className="w-60 flex-shrink-0 border-r border-border flex flex-col overflow-hidden">
-            {currentTab === 'my-skills' ? (
-              <AppList
-                mode="skill"
-                onInstall={() => handleBrowseMarketplace('skill')}
-                onManualAdd={() => setShowSkillInstallDialog(true)}
-                spaceMap={spaceMap}
-              />
-            ) : currentTab === 'my-mcp' ? (
-              <AppList
-                mode="mcp"
-                onInstall={() => handleBrowseMarketplace('mcp')}
-                onManualAdd={() => setManualAddType('mcp')}
-                spaceMap={spaceMap}
-              />
-            ) : (
-              <AppList
-                mode="automation"
-                onInstall={() => setShowInstallDialog(true)}
-                spaceMap={spaceMap}
-              />
-            )}
+      {currentTab === 'team' ? (
+        <TeamTabContent />
+      ) : currentTab === 'inbox' ? (
+        <PeopleInbox />
+      ) : currentTab === 'my-digital-humans' ? (
+        selectedAppId && !selectedApp ? <div className="flex-1 p-6"><button onClick={clearSelection} className="mb-5 min-h-9 text-sm text-primary">{t('All digital humans')}</button>{detailFailed ? <p role="alert" className="text-sm text-destructive">{t('Could not load this digital human.')} <button onClick={() => setDetailRevision(value => value + 1)} className="underline">{t('Retry')}</button></p> : <p role="status" className="text-sm text-muted-foreground">{t('Loading…')}</p>}</div> : selectedAppId && selectedApp ? <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2 text-xs">
+            <button onClick={clearSelection} className="flex min-h-8 items-center gap-1 text-muted-foreground hover:text-primary"><ChevronLeft size={15} />{t('All digital humans')}</button>
+            <PersonReturnLink />
           </div>
-
-          {/* Right: Detail panel */}
-          <div className="flex-1 flex flex-col overflow-hidden">
-            {/* Session detail breadcrumb — replaces AutomationHeader when drilling into a specific run */}
-            {isSessionDetail && selectedApp && (
-              <SessionBreadcrumb
-                appName={selectedAppName ?? ''}
-                runId={(detailView as { runId: string }).runId}
-                onBack={() => openActivityThread(selectedApp.id)}
-              />
-            )}
-
-            {/* Automation persona card + tab bar — shown for all automation views except session detail drill-down */}
-            {!isSessionDetail && !isUninstalledDetail && selectedAppId && selectedApp?.spec.type === 'automation' && (
-              <>
-                <AutomationHeader appId={selectedAppId} spaceName={selectedApp?.spaceId ? spaceMap[selectedApp.spaceId] : t('Global')} />
-                {showLoginNotice && resolvedSpec?.browser_login && detailView?.type === 'activity-thread' && (
-                  <LoginNoticeBar
-                    browserLogin={resolvedSpec.browser_login}
-                    onDismiss={() => {
-                      if (selectedAppId) {
-                        updateAppOverrides(selectedAppId, { loginNoticeDismissed: true })
-                      }
-                    }}
-                    onOpenBrowser={(url, label) => {
-                      api.openLoginWindow(url, label)
-                    }}
-                  />
-                )}
-              </>
-            )}
-
-            {/* Detail content — app-chat manages its own scroll + flex layout */}
-            <div className={`flex-1 ${isAppChat || isSessionDetail ? 'overflow-hidden' : 'overflow-y-auto'}`}>
-              {renderDetail()}
+          {isSessionDetail ? <SessionBreadcrumb appName={selectedAppName ?? ''} runId={(detailView as { runId: string }).runId} onBack={() => openActivityThread(selectedApp.id)} /> : !isUninstalledDetail && <AutomationHeader appId={selectedAppId} spaceName={selectedApp.spaceId ? spaceMap[selectedApp.spaceId] : t('Global')} />}
+          {showLoginNotice && resolvedSpec?.browser_login && detailView?.type === 'activity-thread' && <LoginNoticeBar browserLogin={resolvedSpec.browser_login} onDismiss={() => void updateAppOverrides(selectedAppId, { loginNoticeDismissed: true })} onOpenBrowser={(url, label) => api.openLoginWindow(url, label)} />}
+          <div className={`min-h-0 flex-1 ${isFullBleedDetail ? 'overflow-hidden' : 'overflow-y-auto'}`}>{renderDetail()}</div>
+        </div> : <PeopleDirectory spaceMap={spaceMap} onCreate={() => setShowInstallDialog(true)} />
+      ) : (currentTab === 'my-skills' || currentTab === 'my-mcp') ? (
+        /* ── Capability library: wall first, one full-width detail behind a card ── */
+        selectedAppId && selectedApp ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 sm:px-4">
+              <button
+                onClick={clearSelection}
+                className="flex min-h-8 items-center gap-1 text-xs text-muted-foreground hover:text-primary"
+              >
+                <ChevronLeft size={15} />
+                {t('Back to capability library')}
+              </button>
             </div>
+            <div className="min-h-0 flex-1 overflow-y-auto">{renderDetail()}</div>
           </div>
-        </div>
-      ) : (
-        /* ── Mobile: list OR detail (push navigation) ── */
-        <div className="flex-1 flex flex-col overflow-hidden">
-          {selectedAppId ? (
-            <>
-              {/* Back button */}
-              <div className="flex items-center gap-2 px-3 py-2 border-b border-border flex-shrink-0">
-                <button
-                  onClick={clearSelection}
-                  className="flex items-center gap-1 text-sm text-primary"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                  {t('Back')}
-                </button>
-              </div>
-
-              {/* Session detail breadcrumb */}
-              {isSessionDetail && selectedApp && (
-                <SessionBreadcrumb
-                  appName={selectedAppName ?? ''}
-                  runId={(detailView as { runId: string }).runId}
-                  onBack={() => openActivityThread(selectedApp.id)}
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex gap-2 border-b border-border p-3">
+              <TabButton active={currentTab === 'my-skills'} label={t('Skills')} onClick={() => setCurrentTab('my-skills')} />
+              <TabButton active={currentTab === 'my-mcp'} label={t('MCP connections')} onClick={() => setCurrentTab('my-mcp')} />
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col px-3 pb-3 sm:px-6">
+              {currentTab === 'my-skills' ? (
+                <SkillCardWall
+                  spaceMap={spaceMap}
+                  onBrowseStore={() => handleBrowseMarketplace('skill')}
+                  onManualAdd={() => setShowSkillInstallDialog(true)}
+                />
+              ) : (
+                <McpCardWall
+                  spaceMap={spaceMap}
+                  onBrowseStore={() => handleBrowseMarketplace('mcp')}
+                  onManualAdd={() => setManualAddType('mcp')}
                 />
               )}
-
-              {/* Automation header */}
-              {!isSessionDetail && !isUninstalledDetail && selectedApp?.spec.type === 'automation' && (
-                <>
-                  <AutomationHeader appId={selectedAppId} spaceName={selectedApp?.spaceId ? spaceMap[selectedApp.spaceId] : t('Global')} />
-                  {showLoginNotice && resolvedSpec?.browser_login && detailView?.type === 'activity-thread' && (
-                    <LoginNoticeBar
-                      browserLogin={resolvedSpec.browser_login}
-                      onDismiss={() => {
-                        if (selectedAppId) {
-                          updateAppOverrides(selectedAppId, { loginNoticeDismissed: true })
-                        }
-                      }}
-                      onOpenBrowser={(url, label) => {
-                        api.openLoginWindow(url, label)
-                      }}
-                    />
-                  )}
-                </>
-              )}
-
-              {/* Detail content */}
-              <div className={`flex-1 ${isAppChat || isSessionDetail ? 'overflow-hidden' : 'overflow-y-auto'}`}>
-                {renderDetail()}
-              </div>
-            </>
-          ) : (
-            /* No selection: full-width list */
-            currentTab === 'my-skills' ? (
-              <AppList
-                mode="skill"
-                onInstall={() => handleBrowseMarketplace('skill')}
-                onManualAdd={() => setShowSkillInstallDialog(true)}
-                spaceMap={spaceMap}
-              />
-            ) : currentTab === 'my-mcp' ? (
-              <AppList
-                mode="mcp"
-                onInstall={() => handleBrowseMarketplace('mcp')}
-                onManualAdd={() => setManualAddType('mcp')}
-                spaceMap={spaceMap}
-              />
-            ) : (
-              <AppList
-                mode="automation"
-                onInstall={() => setShowInstallDialog(true)}
-                spaceMap={spaceMap}
-              />
-            )
-          )}
-        </div>
-      )}
+            </div>
+          </div>
+        )
+      ) : null}
 
       {/* Install dialog */}
       {showInstallDialog && (
@@ -470,19 +402,27 @@ interface TabButtonProps {
   active: boolean
   label: string
   onClick: () => void
+  /** Count shown as a small pill next to the label; hidden when 0 or omitted. */
+  badge?: number
 }
 
-function TabButton({ active, label, onClick }: TabButtonProps) {
+function TabButton({ active, label, onClick, badge }: TabButtonProps) {
   return (
     <button
       onClick={onClick}
-      className={`px-3 py-1.5 text-sm rounded-md transition-colors whitespace-nowrap ${
+      aria-pressed={active}
+      className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md transition-colors whitespace-nowrap ${
         active
           ? 'bg-secondary text-foreground font-medium'
           : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
       }`}
     >
       {label}
+      {!!badge && (
+        <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-halo-warning px-1 text-[10px] font-medium text-background">
+          {badge}
+        </span>
+      )}
     </button>
   )
 }
@@ -523,4 +463,13 @@ function SessionBreadcrumb({ appName, runId, label, onBack }: SessionBreadcrumbP
       )}
     </div>
   )
+}
+
+function PersonReturnLink() {
+  const { t } = useTranslation()
+  const target = usePeopleViewStore(state => state.returnTeam)
+  const inbox = usePeopleViewStore(state => state.returnInbox)
+  if (inbox) return <button onClick={() => { usePeopleViewStore.setState({ returnInbox: false }); useAppsPageStore.getState().setCurrentTab('inbox') }} className="min-h-8 text-primary">{t('Return to requests')}</button>
+  if (!target) return null
+  return <button onClick={() => { usePeopleViewStore.setState({ teamTarget: target, returnTeam: null, returnPerson: null }); useTeamStore.getState().selectTeam(target.teamId); useAppsPageStore.getState().setCurrentTab('team') }} className="min-h-8 text-primary">{t('Return to team task')}</button>
 }

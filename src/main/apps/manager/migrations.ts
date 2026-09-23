@@ -159,5 +159,34 @@ export const migrations: Migration[] = [
         ADD COLUMN knowledge_seeded INTEGER NOT NULL DEFAULT 0
       `)
     }
+  },
+  {
+    version: 7,
+    description: 'Drop the legacy schedule-interval override, superseded by the spec',
+    up(db) {
+      // The override used to win over the spec while only the spec was
+      // reachable from the settings UI, so a value left here by an older build
+      // kept running an interval the user could neither see nor change.
+      // Dropping the key makes the stored schedule agree with the displayed one.
+      db.exec(`
+        UPDATE installed_apps
+        SET user_overrides_json = json_remove(user_overrides_json, '$.frequency')
+        WHERE json_extract(user_overrides_json, '$.frequency') IS NOT NULL
+      `)
+    }
+  },
+  {
+    version: 8,
+    description: 'Preserve digital human data location across default space changes',
+    up(db) {
+      db.exec('ALTER TABLE installed_apps ADD COLUMN data_path TEXT')
+    }
+  },
+  {
+    version: 9,
+    description: 'Index stable digital human directory ordering',
+    up(db) {
+      db.exec("CREATE INDEX idx_apps_directory ON installed_apps(json_extract(spec_json, '$.type'), installed_at DESC, id ASC)")
+    }
   }
 ]

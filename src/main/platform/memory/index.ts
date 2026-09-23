@@ -26,6 +26,7 @@ import type {
   MemoryWriteParams,
   MemoryListParams,
   MemoryScopeType,
+  MemoryTurnMode,
   SessionSummaryParams
 } from './types'
 import { COMPACTION_THRESHOLD_BYTES } from './types'
@@ -47,7 +48,7 @@ import {
   appendToMemoryFile,
   replaceMemoryFile,
   listMemoryFiles,
-  archiveMemoryFile,
+  archiveAndReplaceMemoryFile,
   getFileSize
 } from './file-ops'
 import { generatePromptInstructions } from './prompt'
@@ -56,7 +57,7 @@ import { existsSync } from 'fs'
 import { mkdir } from 'fs/promises'
 
 // Re-export types for consumers
-export type { MemoryService, MemoryCallerScope, MemoryScopeType }
+export type { MemoryService, MemoryCallerScope, MemoryScopeType, MemoryTurnMode }
 export { COMPACTION_THRESHOLD_BYTES }
 
 // ============================================================================
@@ -142,31 +143,27 @@ function createMemoryService(): MemoryService {
     // ── compact ────────────────────────────────────────────────────────────
     async compact(
       caller: MemoryCallerScope,
-      scope: MemoryScopeType
-    ): Promise<{ archived: string; needsSummary: boolean }> {
+      scope: MemoryScopeType,
+      summary: string
+    ): Promise<string | null> {
       assertWritePermission(caller, scope, 'replace')
 
       const filePath = getMemoryFilePath(caller, scope)
       const archiveDir = getMemoryArchiveDir(caller, scope)
 
-      // Check if file exists and needs compaction
       const size = await getFileSize(filePath)
       if (size === 0) {
-        return { archived: '', needsSummary: false }
+        return null
       }
 
-      // Archive the current memory file
-      const archivedPath = await archiveMemoryFile(filePath, archiveDir)
+      const archivedPath = await archiveAndReplaceMemoryFile(filePath, archiveDir, summary)
 
       console.log(
         `[Memory] Compacted ${scope} memory: ` +
         `${(size / 1024).toFixed(1)}KB archived to ${archivedPath}`
       )
 
-      return {
-        archived: archivedPath,
-        needsSummary: true
-      }
+      return archivedPath
     },
 
     // ── saveSessionSummary ─────────────────────────────────────────────────
@@ -208,8 +205,8 @@ function createMemoryService(): MemoryService {
     },
 
     // ── getPromptInstructions ──────────────────────────────────────────────
-    getPromptInstructions(): string {
-      return generatePromptInstructions()
+    getPromptInstructions(mode: MemoryTurnMode): string {
+      return generatePromptInstructions(mode)
     },
 
     // ── needsCompaction ────────────────────────────────────────────────────

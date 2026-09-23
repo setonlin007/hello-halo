@@ -21,7 +21,7 @@ describe('resolveHttpConversationId', () => {
     for (const channel of ['wecom', 'weixin', 'feishu', 'dingtalk']) {
       const res = resolveHttpConversationId(APP, `app-chat:${APP}:${channel}:direct:someone`)
       expect(res.ok).toBe(false)
-      if (!res.ok) expect(res.error).toMatch(/only address the "http" or "local" channel/)
+      if (!res.ok) expect(res.error).toMatch(/only address the "http", "local" or "team" channel/)
     }
   })
 

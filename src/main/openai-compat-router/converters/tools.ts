@@ -48,7 +48,7 @@ export function anthropicToolToOpenAIChatTool(tool: AnthropicTool): OpenAIChatTo
     function: {
       name: tool.name,
       description: tool.description || '',
-      parameters: toOpenAIParameters(tool.input_schema),
+      parameters: toOpenAIParameters(tool.input_schema) as unknown as OpenAIChatTool['function']['parameters'],
       strict: tool.strict
     }
   }
@@ -63,7 +63,7 @@ export function anthropicToolToResponsesTool(tool: AnthropicTool): OpenAIRespons
     type: 'function',
     name: tool.name,
     description: tool.description || '',
-    parameters: toOpenAIParameters(tool.input_schema),
+    parameters: toOpenAIParameters(tool.input_schema) as unknown as OpenAIResponsesFunctionTool['parameters'],
     strict: tool.strict
   }
 }

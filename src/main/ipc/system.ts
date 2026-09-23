@@ -7,6 +7,7 @@ import { dirname } from 'path'
 import log from 'electron-log/main.js'
 import { setAutoLaunch, getAutoLaunch } from '../foundation/config.service'
 import { getMainWindow, onMainWindowChange } from '../foundation/window.service'
+import { logFatal } from '../foundation/logging'
 import { relaunchApp } from '../services/lifecycle'
 import { systemRpc } from '../../shared/rpc/contracts/system.contract'
 import { registerRawRpcHandlers } from './rpc'
@@ -65,7 +66,8 @@ export function registerSystemHandlers(): void {
           mainWindow.setTitleBarOverlay({
             color: options.color,
             symbolColor: options.symbolColor,
-            height: 40
+            // One pixel short of Header's 48px — see main/index.ts.
+            height: 47
           })
         }
         return { success: true }
@@ -154,7 +156,7 @@ export function registerSystemHandlers(): void {
           try {
             relaunchApp('settings-restart')
           } catch (error) {
-            console.error('[Settings] system:relaunch - Relaunch failed:', (error as Error).message)
+            logFatal('[Settings] system:relaunch - Relaunch failed:', (error as Error).message)
             app.exit(1)
           }
         })

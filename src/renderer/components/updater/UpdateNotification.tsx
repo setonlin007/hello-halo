@@ -24,6 +24,7 @@ import { useEffect, useRef } from 'react'
 import { api } from '../../api'
 import { useTranslation } from '../../i18n'
 import { useNotificationStore } from '../../stores/notification.store'
+import type { UpdaterReleaseNotes } from '../../../shared/types/updater'
 
 // Stable toast ID so lifecycle events replace rather than duplicate
 const UPDATE_TOAST_ID = 'updater-lifecycle'
@@ -60,13 +61,13 @@ function snooze(version: string): void {
  * release body, which can carry markup the restricted renderer would drop
  * mid-sentence.
  */
-function formatReleaseNotes(notes: string | { version: string; note: string }[] | undefined): string {
+function formatReleaseNotes(notes: UpdaterReleaseNotes | undefined): string {
   if (!notes) return ''
 
   const lines = typeof notes === 'string'
     ? notes.split('\n')
     : Array.isArray(notes)
-      ? notes.map(item => item.note)
+      ? notes.map(item => item.note ?? '')
       : []
 
   return lines

@@ -11,8 +11,13 @@
  */
 
 import { describe, it, expect } from 'vitest'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import {
   convertEventsToMessages,
+  openSessionWriter,
+  readSessionMessages,
   type StoredEvent,
 } from '../../../../src/main/apps/runtime/session-store'
 
@@ -108,6 +113,31 @@ function userTrigger(text: string, ts = '2026-01-01T00:00:00.000Z'): StoredEvent
     message: {
       role: 'user',
       content: [{ type: 'text', text }],
+    },
+  }
+}
+
+/** Create a user message carrying image blocks; `isTrigger` marks it as user-sent */
+function userTriggerWithImages(
+  text: string,
+  images: Array<{ name?: string; data: string }>,
+  ts = '2026-01-01T00:00:00.000Z',
+  isTrigger = true
+): StoredEvent {
+  return {
+    _ts: ts,
+    type: 'user',
+    ...(isTrigger ? { _isTrigger: true } : {}),
+    message: {
+      role: 'user',
+      content: [
+        { type: 'text', text },
+        ...images.map(img => ({
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: img.data },
+          ...(img.name ? { _name: img.name } : {}),
+        })),
+      ],
     },
   }
 }
@@ -774,6 +804,101 @@ describe('convertEventsToMessages', () => {
     })
   })
 
+  // ── Image attachments ──
+
+  describe('image attachments', () => {
+    it('reconstructs attached images on the user message', () => {
+      const events: StoredEvent[] = [
+        userTriggerWithImages('What is in this screenshot?', [
+          { name: 'shot.png', data: 'AAAA' },
+        ]),
+        assistantText('A table of contacts.'),
+      ]
+
+      const messages = convertEventsToMessages(events)
+
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'What is in this screenshot?' })
+      expect(messages[0].images).toEqual([
+        { id: 'session-img-1-0', type: 'image', mediaType: 'image/png', data: 'AAAA', name: 'shot.png' },
+      ])
+      // Images belong to the user turn only.
+      expect(messages[1].images).toBeUndefined()
+    })
+
+    it('keeps an image-only message (no text) visible', () => {
+      const messages = convertEventsToMessages([
+        userTriggerWithImages('', [{ data: 'AAAA' }]),
+      ])
+
+      expect(messages).toHaveLength(1)
+      expect(messages[0].content).toBe('')
+      expect(messages[0].images).toHaveLength(1)
+    })
+
+    it('assigns distinct ids to the images of one message', () => {
+      const messages = convertEventsToMessages([
+        userTriggerWithImages('two', [{ data: 'AAAA' }, { data: 'BBBB' }]),
+      ])
+
+      const ids = messages[0].images!.map(i => i.id)
+      expect(new Set(ids).size).toBe(2)
+    })
+
+    it('ignores image blocks on a user event that is not a trigger', () => {
+      // SDK round-trip user events can carry image blocks that are tool
+      // plumbing rather than something the user attached.
+      const messages = convertEventsToMessages([
+        userTriggerWithImages('tool echo', [{ data: 'AAAA' }], undefined, false),
+      ])
+
+      expect(messages[0].images).toBeUndefined()
+    })
+
+    it('omits the images field for a text-only message', () => {
+      const messages = convertEventsToMessages([userTrigger('plain text')])
+      expect(messages[0].images).toBeUndefined()
+    })
+
+    it('round-trips images through the JSONL writer and reader', () => {
+      const spacePath = mkdtempSync(join(tmpdir(), 'halo-session-store-'))
+      try {
+        const writer = openSessionWriter(spacePath, 'app-1', 'run-1')
+        writer.writeTrigger('Look at this', [
+          { id: 'img-1', type: 'image', mediaType: 'image/png', data: 'AAAA', name: 'shot.png' },
+        ])
+        writer.writeEvent({
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'Got it.' }] },
+        })
+
+        const messages = readSessionMessages(spacePath, 'app-1', 'run-1')
+
+        expect(messages.map(m => [m.role, m.content])).toEqual([
+          ['user', 'Look at this'],
+          ['assistant', 'Got it.'],
+        ])
+        expect(messages[0].images).toEqual([
+          { id: 'session-img-1-0', type: 'image', mediaType: 'image/png', data: 'AAAA', name: 'shot.png' },
+        ])
+      } finally {
+        rmSync(spacePath, { recursive: true, force: true })
+      }
+    })
+
+    it('writes no image blocks when a trigger has no attachments', () => {
+      const spacePath = mkdtempSync(join(tmpdir(), 'halo-session-store-'))
+      try {
+        openSessionWriter(spacePath, 'app-1', 'run-1').writeTrigger('text only')
+        const messages = readSessionMessages(spacePath, 'app-1', 'run-1')
+
+        expect(messages).toHaveLength(1)
+        expect(messages[0].images).toBeUndefined()
+      } finally {
+        rmSync(spacePath, { recursive: true, force: true })
+      }
+    })
+  })
+
   // ── Message ID uniqueness ──
 
   describe('message and thought IDs', () => {
@@ -800,5 +925,18 @@ describe('convertEventsToMessages', () => {
         .map(t => t.id)
       expect(new Set(thoughtIds).size).toBe(thoughtIds.length)
     })
+  })
+})
+
+describe('team transcript origin', () => {
+  it('retains dispatch identity on input and response, then resets it for a human turn', () => {
+    const messages = convertEventsToMessages([
+      { type: 'user', _ts: '2026-09-14T00:00:00Z', _isTrigger: true, _teamOrigin: { kind: 'message', correlationId: 'dispatch-1' }, message: { content: 'Delegated work' } },
+      { type: 'assistant', _ts: '2026-09-14T00:00:01Z', message: { content: [{ type: 'text', text: 'Internal result' }] } },
+      { type: 'user', _ts: '2026-09-14T00:00:02Z', _isTrigger: true, _teamOrigin: { kind: 'human_message', correlationId: 'human-1' }, message: { content: 'My question' } },
+      { type: 'assistant', _ts: '2026-09-14T00:00:03Z', message: { content: [{ type: 'text', text: 'Your answer' }] } },
+    ])
+    expect(messages.map(message => message.metadata?.teamTriggerKind)).toEqual(['message', 'message', 'human_message', 'human_message'])
+    expect(messages[0].metadata?.correlationId).toBe('dispatch-1')
   })
 })

@@ -15,13 +15,14 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import {
   Mail, MessageSquare, Bell, Webhook, Loader2,
-  CheckCircle, XCircle, ChevronDown, RefreshCw, Bot,
+  CheckCircle, XCircle, ChevronDown, RefreshCw,
   Plus, Trash2, MoreVertical, Smartphone, Info,
   QrCode, ExternalLink, UserCheck, Eye, EyeOff,
 } from 'lucide-react'
 import { useTranslation, getCurrentLanguage } from '../../i18n'
 import { api } from '../../api'
 import { useAppsStore } from '../../stores/apps.store'
+import { useTeamStore } from '../../stores/team.store'
 import type { HaloConfig } from '../../types'
 import { resolveLocalizedText } from '../../../shared/types'
 import { NOTIFICATION_CHANNEL_META } from '../../../shared/types/notification-channels'
@@ -34,11 +35,18 @@ import type {
 import type {
   ImChannelInstanceConfig,
   ImChannelInstanceStatus,
-  GuestPolicy,
 } from '../../../shared/types/im-channel'
+import { ChannelBackendSelect, ChannelBackendName } from './ChannelBackendSelect'
+import type {
+  ChannelBackendApp,
+  ChannelBackendTeam,
+  ChannelBackendValue,
+} from './ChannelBackendSelect'
 import { WeixinIlinkInstanceCard } from './WeixinIlinkInstanceCard'
 import { WecomScanAuthDialog } from './WecomScanAuthDialog'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/Popover'
+import { CapabilityPolicyFields } from '../capability/CapabilityPolicyFields'
+import { Switch } from '../ui/Switch'
 
 /** Product-level permission defaults (from IPC). Mirrors auth-loader.ImChannelsPermissionDefaults. */
 interface PermissionDefaults {
@@ -394,10 +402,14 @@ function NameResolutionField({ value, onChange, status }: NameResolutionFieldPro
 interface InstanceCardProps {
   instance: ImChannelInstanceConfig
   status: ImChannelInstanceStatus | undefined
-  automationApps: { id: string; spec: { name: string } }[]
+  automationApps: ChannelBackendApp[]
+  /** Teams whose members can back this channel (see ChannelBackendSelect). */
+  teams: ChannelBackendTeam[]
   isExpanded: boolean
   onToggle: () => void
   onChange: (instance: ImChannelInstanceConfig) => void
+  /** Rebinding goes through main so its validation applies to both binding surfaces. */
+  onRebind: (appId: string) => void
   onDelete: () => void
   onReconnect: () => void
   /** Warning message when this instance's Bot ID conflicts with another instance */
@@ -410,9 +422,11 @@ function InstanceCard({
   instance,
   status,
   automationApps,
+  teams,
   isExpanded,
   onToggle,
   onChange,
+  onRebind,
   onDelete,
   onReconnect,
   duplicateWarning,
@@ -427,10 +441,6 @@ function InstanceCard({
   const isEnabled = instance.enabled
   const cfg = instance.config as Record<string, unknown>
   const botId = (cfg.botId as string) || ''
-
-  // Resolve bound app name
-  const boundApp = automationApps.find(a => a.id === instance.appId)
-  const displayName = boundApp?.spec.name || t('Not bound')
 
   // Status indicator. Standby (superseded by another device) is informational
   // rather than an error, so it gets its own colour.
@@ -502,10 +512,14 @@ function InstanceCard({
     onChange({ ...instance, enabled: !isEnabled })
   }
 
-  const handleAppChange = (appId: string) => {
+  const handleTargetChange = (target: ChannelBackendValue) => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
     setDraft(null)
-    onChange({ ...instance, appId })
+    // A digital-human target goes through main's rebind, which rejects a target
+    // that would silently swallow inbound messages. A team target has no such
+    // validator yet, so it takes the plain config write.
+    if (target.teamId) onChange({ ...instance, ...target })
+    else onRebind(target.appId)
   }
 
   const handleStreamingChange = () => {
@@ -551,7 +565,9 @@ function InstanceCard({
         <div className="flex items-center gap-2.5 min-w-0">
           <div className={`w-2 h-2 rounded-full flex-shrink-0 ${statusDot}`} />
           <div className="text-left min-w-0">
-            <p className="text-sm font-medium truncate">{displayName}</p>
+            <p className="text-sm font-medium truncate">
+              <ChannelBackendName value={instance} automationApps={automationApps} teams={teams} />
+            </p>
             <p className="text-[11px] text-muted-foreground truncate">
               Bot ID: {truncateId(botId) || t('Not set')}
               {!isEnabled ? '' : isConnected ? '' : ` · ${statusText}`}
@@ -695,30 +711,12 @@ function InstanceCard({
             status={status?.identityResolution}
           />
 
-          {/* Digital Human selector */}
-          <div className="space-y-1">
-            <label className="text-sm text-muted-foreground">
-              {t('Digital Human')} <span className="text-red-400">*</span>
-            </label>
-            <div className="relative">
-              <Bot className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-              <select
-                value={instance.appId || ''}
-                onChange={(e) => handleAppChange(e.target.value)}
-                className="w-full bg-muted border border-border rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary appearance-none cursor-pointer"
-              >
-                <option value="">{t('Select digital human')}</option>
-                {automationApps.map(app => (
-                  <option key={app.id} value={app.id}>
-                    {app.spec.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {t('All messages from this Bot will be handled by this digital human')}
-            </p>
-          </div>
+          <ChannelBackendSelect
+            value={instance}
+            automationApps={automationApps}
+            teams={teams}
+            onChange={handleTargetChange}
+          />
 
           {/* Reply scope */}
           <div className="space-y-1">
@@ -844,45 +842,6 @@ function InstanceCard({
 // Permission Section (permissionEnabled + owners + guestPolicy)
 // ============================================
 
-/**
- * Built-in tools that can be granted to guests.
- * All tools are off by default — owners choose which to enable.
- */
-const GUEST_SAFE_BUILTIN_TOOLS = [
-  { name: 'Read', group: 'file' },
-  { name: 'Glob', group: 'file' },
-  { name: 'Grep', group: 'file' },
-  { name: 'WebFetch', group: 'network' },
-  { name: 'WebSearch', group: 'network' },
-  { name: 'Agent', group: 'other' },
-  { name: 'TodoWrite', group: 'other' },
-  { name: 'Bash', group: 'advanced' },
-  { name: 'Write', group: 'advanced' },
-  { name: 'Edit', group: 'advanced' },
-  { name: 'NotebookEdit', group: 'advanced' },
-] as const
-
-/** Group labels for tool tags */
-const TOOL_GROUP_LABELS: Record<string, string> = {
-  file: 'File Read',
-  network: 'Network',
-  other: 'Other',
-  advanced: 'Advanced',
-}
-
-/**
- * Halo MCP toggle definitions for the guest policy UI.
- * Replaces the old free-text mcp__ input.
- */
-const HALO_MCP_TOGGLES: { key: keyof GuestPolicy; labelKey: string }[] = [
-  { key: 'allowAiBrowser', labelKey: 'AI Browser' },
-  { key: 'allowEmail',     labelKey: 'Email' },
-  { key: 'allowNotify',    labelKey: 'Notifications' },
-  { key: 'allowApps',      labelKey: 'Digital Humans' },
-  { key: 'allowFileSend',  labelKey: 'File Send' },
-  { key: 'allowOcr',       labelKey: 'Text Extraction (OCR)' },
-]
-
 interface PermissionSectionProps {
   instance: ImChannelInstanceConfig
   /** Immediate save (for toggles) */
@@ -901,17 +860,8 @@ function PermissionSection({ instance, onChange, onDebouncedChange, permissionDe
   const guestPolicy = instance.guestPolicy
   const guestAccessEnabled = hasOwners && guestPolicy !== undefined
 
-  // Load installed MCP apps for the user MCP whitelist
-  const { apps } = useAppsStore()
-  const mcpApps = apps.filter(a => a.spec.type === 'mcp')
-
   // Local draft state for text fields (avoids cursor jumping during debounce)
   const [ownersDraft, setOwnersDraft] = useState<string | null>(null)
-
-  // Derive display values
-  const currentAllowedTools = guestPolicy?.allowedTools ?? []
-  const builtinNames = new Set(GUEST_SAFE_BUILTIN_TOOLS.map(t => t.name))
-  const selectedBuiltinTools = new Set(currentAllowedTools.filter(t => builtinNames.has(t)))
 
   const ownersDisplay = ownersDraft ?? owners.join(', ')
 
@@ -945,31 +895,6 @@ function PermissionSection({ instance, onChange, onDebouncedChange, permissionDe
     }
   }
 
-  const handleBuiltinToolToggle = (toolName: string) => {
-    const newSet = new Set(selectedBuiltinTools)
-    if (newSet.has(toolName)) {
-      newSet.delete(toolName)
-    } else {
-      newSet.add(toolName)
-    }
-    onChange({ ...instance, guestPolicy: { ...guestPolicy, allowedTools: Array.from(newSet) } })
-  }
-
-  const handleMcpToggle = (key: keyof GuestPolicy) => {
-    const current = guestPolicy?.[key] as boolean | undefined
-    onChange({ ...instance, guestPolicy: { ...guestPolicy, [key]: !current } })
-  }
-
-  const handleUserMcpToggle = (specId: string) => {
-    const current = guestPolicy?.allowedUserMcp ?? []
-    const updated = current.includes(specId)
-      ? current.filter(s => s !== specId)
-      : [...current, specId]
-    onChange({
-      ...instance,
-      guestPolicy: { ...guestPolicy, allowedUserMcp: updated.length > 0 ? updated : undefined },
-    })
-  }
 
   // ── Render ──
 
@@ -985,21 +910,7 @@ function PermissionSection({ instance, onChange, onDebouncedChange, permissionDe
               : t('Everyone has full access')}
           </p>
         </div>
-        <label className="relative inline-flex items-center cursor-pointer">
-          <input
-            type="checkbox"
-            checked={permissionEnabled}
-            onChange={handlePermissionToggle}
-            className="sr-only peer"
-          />
-          <div className="w-11 h-6 bg-secondary rounded-full peer peer-checked:bg-primary transition-colors">
-            <div
-              className={`w-5 h-5 bg-white rounded-full shadow-md transform transition-transform ${
-                permissionEnabled ? 'translate-x-5' : 'translate-x-0.5'
-              } mt-0.5`}
-            />
-          </div>
-        </label>
+        <Switch checked={permissionEnabled} onCheckedChange={handlePermissionToggle} />
       </div>
 
       {/* Permission details (only when enabled) */}
@@ -1057,125 +968,25 @@ function PermissionSection({ instance, onChange, onDebouncedChange, permissionDe
                       : t('Guests have no tool access — chat only')}
                   </p>
                 </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={guestAccessEnabled}
-                    onChange={handleGuestAccessToggle}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-secondary rounded-full peer peer-checked:bg-primary transition-colors">
-                    <div
-                      className={`w-5 h-5 bg-white rounded-full shadow-md transform transition-transform ${
-                        guestAccessEnabled ? 'translate-x-5' : 'translate-x-0.5'
-                      } mt-0.5`}
-                    />
-                  </div>
-                </label>
+                <Switch checked={guestAccessEnabled} onCheckedChange={handleGuestAccessToggle} />
               </div>
 
-              {/* Tool selection (only when guest access is enabled) */}
               {guestAccessEnabled && (
                 <div className="space-y-2">
                   <label className="text-sm text-muted-foreground">
                     {t('Guest Allowed Tools')}
                   </label>
-
-                  {/* Built-in tool tags grouped — unchanged from original */}
-                  {Object.entries(TOOL_GROUP_LABELS).map(([group, label]) => {
-                    const tools = GUEST_SAFE_BUILTIN_TOOLS.filter(t => t.group === group)
-                    if (tools.length === 0) return null
-                    return (
-                      <div key={group} className="flex flex-wrap items-center gap-1.5">
-                        <span className="text-xs text-muted-foreground/70 w-14 sm:w-16 shrink-0">
-                          {t(label)}
-                        </span>
-                        {tools.map(tool => {
-                          const isSelected = selectedBuiltinTools.has(tool.name)
-                          return (
-                            <button
-                              key={tool.name}
-                              type="button"
-                              onClick={() => handleBuiltinToolToggle(tool.name)}
-                              className={`px-2 py-0.5 text-xs rounded-md border transition-colors ${
-                                isSelected
-                                  ? 'bg-primary/15 text-primary border-primary/30'
-                                  : 'bg-muted text-muted-foreground border-border hover:border-primary/20'
-                              }`}
-                            >
-                              {tool.name}
-                            </button>
-                          )
-                        })}
-                      </div>
-                    )
-                  })}
-
-                  {/* MCP capabilities — replaces old free-text mcp__ input */}
-                  <div className="mt-2 pt-2 border-t border-border/40 space-y-3">
-                    {/* Halo built-in MCP toggles */}
-                    <div className="space-y-1.5">
-                      <label className="text-xs text-muted-foreground/70">
-                        {t('Halo Capabilities')}
-                      </label>
-                      {HALO_MCP_TOGGLES.map(({ key, labelKey }) => {
-                        const isOn = Boolean(guestPolicy?.[key])
-                        return (
-                          <div key={key} className="flex items-center justify-between">
-                            <p className="text-sm text-muted-foreground">{t(labelKey)}</p>
-                            <label className="relative inline-flex items-center cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={isOn}
-                                onChange={() => handleMcpToggle(key)}
-                                className="sr-only peer"
-                              />
-                              <div className="w-9 h-5 bg-secondary rounded-full peer peer-checked:bg-primary transition-colors">
-                                <div
-                                  className={`w-4 h-4 bg-white rounded-full shadow-md transform transition-transform ${
-                                    isOn ? 'translate-x-4' : 'translate-x-0.5'
-                                  } mt-0.5`}
-                                />
-                              </div>
-                            </label>
-                          </div>
-                        )
-                      })}
-                    </div>
-
-                    {/* User-installed MCP servers (only shown when any are installed) */}
-                    {mcpApps.length > 0 && (
-                    <div className="space-y-1.5">
-                      <label className="text-xs text-muted-foreground/70">
-                        {t('Installed MCP Servers')}
-                      </label>
-                      {mcpApps.map(app => {
-                      const specId = app.specId
-                      const isAllowed = guestPolicy?.allowedUserMcp?.includes(specId) ?? false
-                      return (
-                        <div key={specId} className="flex items-center justify-between">
-                          <p className="text-sm text-muted-foreground">{app.spec.name}</p>
-                          <label className="relative inline-flex items-center cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={isAllowed}
-                              onChange={() => handleUserMcpToggle(specId)}
-                              className="sr-only peer"
-                            />
-                            <div className="w-9 h-5 bg-secondary rounded-full peer peer-checked:bg-primary transition-colors">
-                              <div
-                                className={`w-4 h-4 bg-white rounded-full shadow-md transform transition-transform ${
-                                  isAllowed ? 'translate-x-4' : 'translate-x-0.5'
-                                } mt-0.5`}
-                              />
-                            </div>
-                          </label>
-                        </div>
-                      )
-                    })}
-                  </div>
-                    )}
-                  </div>
+                  <CapabilityPolicyFields
+                    policy={guestPolicy}
+                    mode="strict"
+                    groupLabels={{
+                      file: t('File Read'),
+                      network: t('Network'),
+                      other: t('Other'),
+                      advanced: t('Advanced'),
+                    }}
+                    onChange={(next) => onChange({ ...instance, guestPolicy: next })}
+                  />
                 </div>
               )}
             </>
@@ -1385,11 +1196,20 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
 
   useEffect(() => { loadApps() }, [loadApps])
 
+  // Teams for the backend selector — a channel binds one member of a team, so
+  // the selector needs a LIVE roster. team.store is that: App.tsx loads it at
+  // startup and keeps it current from team:updated, and every roster edit goes
+  // through the store's own actions. A local fetch here would be a second copy
+  // that nothing refreshes, so a member added after this panel mounted could
+  // never be picked.
+  const teams = useTeamStore(s => s.teams)
+
   // Load product-level permission defaults (once)
   useEffect(() => {
     api.imChannelsPermissionDefaults()
-      .then((res: { success?: boolean; data?: PermissionDefaults | null }) => {
-        if (res.success && res.data) setPermissionDefaults(res.data)
+      .then((res) => {
+        // Untyped IPC payload — PermissionDefaults is the renderer's mirror of it.
+        if (res.success && res.data) setPermissionDefaults(res.data as PermissionDefaults)
       })
       .catch(() => { /* defaults stay null — no restrictions */ })
   }, [])
@@ -1447,7 +1267,7 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
   }, [setConfig])
 
   // ── IM Channel instances from config ────────────────────────────
-  const instances = config?.imChannels?.instances ?? []
+  const instances: ImChannelInstanceConfig[] = config?.imChannels?.instances ?? []
 
   const saveInstances = useCallback(async (newInstances: ImChannelInstanceConfig[]) => {
     if (!config) return
@@ -1485,6 +1305,19 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
     const newInstances = instances.map(i => i.id === updated.id ? updated : i)
     saveInstances(newInstances)
   }, [instances, saveInstances])
+
+  // Rebinding is owned by main (see im-channels/binding.ts): it validates the
+  // target and re-applies the connection, which a plain config write cannot do.
+  const handleRebindInstance = useCallback(async (instanceId: string, appId: string) => {
+    if (!config) return
+    const res = await api.imChannelsSetInstanceApp(instanceId, appId)
+    if (!res.success) {
+      console.error('[MessageChannels] rebind failed:', res.error)
+      return
+    }
+    const patched = instances.map(i => i.id === instanceId ? { ...i, appId } : i)
+    setConfig({ ...config, imChannels: { ...config.imChannels, instances: patched } } as HaloConfig)
+  }, [config, instances, setConfig])
 
   const handleAddInstance = useCallback(() => {
     // Apply product-level permission defaults for new instances
@@ -1721,9 +1554,11 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
                   instance={inst}
                   status={imStatuses.find(s => s.id === inst.id)}
                   automationApps={automationApps}
+                  teams={teams}
                   isExpanded={expandedInstances.has(inst.id)}
                   onToggle={() => toggleInstanceExpanded(inst.id)}
                   onChange={handleInstanceChange}
+                  onRebind={(appId) => handleRebindInstance(inst.id, appId)}
                   onDelete={() => handleDeleteInstance(inst.id)}
                 />
               ))}
@@ -1785,9 +1620,11 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
                   instance={inst}
                   status={imStatuses.find(s => s.id === inst.id)}
                   automationApps={automationApps}
+                  teams={teams}
                   isExpanded={expandedInstances.has(inst.id)}
                   onToggle={() => toggleInstanceExpanded(inst.id)}
                   onChange={handleInstanceChange}
+                  onRebind={(appId) => handleRebindInstance(inst.id, appId)}
                   onDelete={() => handleDeleteInstance(inst.id)}
                   onReconnect={() => handleReconnectInstance(inst.id)}
                   duplicateWarning={getDuplicateWarning(inst, instances)}

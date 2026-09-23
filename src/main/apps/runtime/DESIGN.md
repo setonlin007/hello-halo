@@ -58,20 +58,58 @@ the run completes. No session reuse across runs.
 - Automation runs are independent executions. Each should start clean.
 - Keeping sessions alive for 24h (escalation wait) wastes resources and is fragile.
 - The memory system provides continuity: AI reads memory at start, writes at end.
-- Escalation responses trigger a NEW run with the escalation context injected into
-  the initial message, not a session resume. This is simpler and more robust.
+- Escalation responses durably queue a continuation of the original run and SDK
+  session. Missing original context is a recoverable failure, never a silent fresh run.
 
 ### 2.3 Escalation as Run Boundary
 
 **Decision**: When AI calls `report_to_user(type="escalation")`, the current run
-records the escalation and ends. User response triggers a new run.
+records the escalation and releases execution resources. A user response resumes
+the original work after its answer and continuation have been committed together.
 
 **Rationale**:
 - Holding a Claude Code subprocess alive for hours is resource-wasteful and fragile.
 - The AI can write important context to memory before escalating.
-- The new run receives: escalation question + user response + memory context.
-- This is simpler than session hibernation and more resilient to process crashes.
-- V2 could introduce session persistence if needed, but V1 prioritizes robustness.
+- The resumed session receives the questions beside their corresponding answers.
+- A persistent continuation survives a process exit without retaining a live subprocess.
+- An unavailable original session is shown as a continuation failure with the answer retained.
+
+**The ending is enforced by the runtime, not requested of the model.** The tool result used
+to ask the model to stop; it frequently kept working, acting on the very decision it had
+just said it could not make alone. `escalation-cut.ts` now ends the turn for it, and both
+consumers apply the same rule — `execute.ts` reading the SDK stream, `app-chat-sink.ts`
+observing it for chat and team turns. The cut waits for every tool call the turn issued to
+have its result: a call left without one is a transcript some engines refuse to resume,
+which would strand the conversation the answer is meant to return to. What the model
+produced after asking is discarded.
+
+The two cases differ only in what follows, and the tool result says so: a solo run is
+genuinely suspended on the answer, while a team member keeps being woken by teammates and
+periodic checks, so it is told the answer will arrive as its own wake quoting the question.
+
+**One escalation may ask for several decisions.** `content.questions` carries them, and
+`summary` then frames why they are being asked; a single-decision escalation leaves
+`questions` empty and carries its question in `summary` as before. Because the run ends at
+the escalation, splitting decisions across calls would interrupt the user once per
+question and cost a round trip each — the array is what makes "ask for everything you need
+first" possible. Read the shape through `getEscalationQuestions` and render answers
+through `formatEscalationAnswer` (both in `shared/apps/app-types`, shared with the
+renderer); no caller should branch on which shape was written, and the legacy
+`content.question` field only exists for entries written before it moved into `summary`.
+
+**An app may hold several unanswered questions.** Because the escalating run ends, the app
+is idle from the executor's point of view, and a further trigger can produce a second
+question before the first is answered. Each is an independent `activity_entries` row keyed
+by its own run, and each is answerable in any order; answering one resumes only its own run.
+Two consequences follow:
+- **Automatic triggers stand down while any question is open** (`admitAutomaticRun`). The app
+  asking is the app declaring it cannot proceed alone, so starting the next scheduled or
+  event-driven run would route around the person it just asked. Manual triggers are
+  unaffected — that is the user acting, not the app acting around the user.
+- **Pending questions are resolved by query, never from the app record.** `waiting_user` and
+  `pendingEscalationId` are caches of the same fact and can be stale or absent; the store is
+  the authority (`hasPendingSoloEscalation`). Open questions are
+  closed only by their own deadline or explicit task closure, never by a person-level status change.
 
 ### 2.4 report_to_user as SDK MCP Server
 
@@ -97,7 +135,8 @@ SQLite database, with FOREIGN KEY to `installed_apps` with CASCADE DELETE.
 ### 2.6 Concurrency: Simple Counting Semaphore
 
 **Decision**: Module-level counting semaphore with configurable `maxConcurrent`.
-Default: 2 concurrent runs.
+Default: 10 concurrent runs. Each digital human has one serial standalone execution
+lane; accepted answer continuations take the next free opportunity before new triggers.
 
 **Rationale**:
 - Each run spawns a Claude Code subprocess (significant resource usage).
@@ -111,12 +150,22 @@ Default: 2 concurrent runs.
 creates scheduler jobs (for schedule-type) and event-bus subscriptions (for other
 types), and registers a keep-alive reason.
 
-`deactivate(appId)` removes all scheduler jobs and event-bus subscriptions for
-the App and unregisters the keep-alive reason.
+`deactivate(appId)` removes scheduler jobs and event-bus subscriptions and unregisters
+the keep-alive reason. It does not stop running work. Pause also removes queued
+automatic work immediately; shutdown and explicit task closure abort their own work.
 
 **State tracking**: An internal `Map<appId, ActivationState>` tracks the
 scheduler job IDs, event-bus unsubscribe functions, and keep-alive disposer for
 each activated App.
+
+**Startup settles runs a previous process abandoned.** A run leaves `'running'`
+only from inside the process executing it, so a crash or a forced quit strands
+the row claiming to be live — invisible to pruning, and read by the UI as
+neither live nor finished, which leaves the user with no way back into it.
+`activateAll` therefore fails every `'running'` row not backed by a live
+execution and writes it a `run_error` entry, which both restores it to the
+timeline and makes it resumable through `continueFailedRun`. The live-execution
+filter is what keeps the sweep safe if it is ever reached outside startup.
 
 ### 2.8 Trigger Context in Initial Message
 
@@ -337,11 +386,59 @@ Consequences that matter:
 - A round that can never be answered is settled, not left hanging:
   `onConsumerStopped` rejects outstanding rounds when the session dies, and an
   empty interrupted/errored turn rejects rather than leaving an IM stream open.
+- Those cover a session that *reports* its death. A session that simply never
+  produces a turn — a resume against a transcript a crashed process left broken,
+  an engine that failed to launch — reports nothing, and the caller would await a
+  reply that can no longer arrive. `TURN_START_TIMEOUT_MS` bounds that wait, and
+  what it measures is the one thing that distinguishes the two cases: **whether
+  the engine is producing anything at all**. The clock runs only while no turn is
+  running and something is queued; it is cleared for the whole duration of any
+  turn, including one the digital human started itself, which claims no round but
+  is proof of liveness all the same. Keying it on "a round is claimed" instead
+  was a real defect — a message sent during background work was failed while the
+  engine was plainly alive.
+- On expiry the sink stops waiting; it does **not** declare the message
+  undelivered. Acceptance is not observable from here, and a wrongly-confident
+  "not delivered, send it again" invites duplicated work — the worse failure of
+  the two. Supplements injected into a running turn never create a round, so
+  this deadline does not apply to them at all.
+- **Giving up the wait must not give up the queue slot.** The round is settled
+  but stays in the queue, because the turn it was dispatched for may still
+  arrive and ownership here is decided purely by order — removing it shifts
+  every later pairing by one, which is precisely the one-turn-behind defect this
+  module was built to eliminate. The abandoned slot is a marker nobody awaits:
+  when its turn lands it claims that slot and is delivered as an unsolicited
+  reply (so a late answer still reaches the user), and `hasActiveRound` excludes
+  settled slots so the conversation does not read as permanently busy. Contrast
+  `cancel()`, which *does* remove the round — it means the send itself threw, so
+  nothing reached the engine and no turn is owed.
 
 **Generating state moved off `activeSessions`**. App chat no longer registers
 there; `isAppChatConversationGenerating` is the single predicate (queued round OR
 consumer mid-turn) and every caller — stop, clear, restart, supplement buffering
-— goes through it. Session invalidation for app chat now takes the consumer path
+— goes through it.
+
+**Reading `activeSessions` for an app chat is always wrong, and it fails
+silently.** `registerActiveSession` has no callers at all, so the map is empty
+and every `activeSessions.has(...)` answers a confident, permanent `false` —
+worse than an obvious break, because each caller reads a plausible answer and
+none can tell it is a constant. Two probes were left on it and both are now
+moved (`bootstrap/extended.ts`): the authority reconciler's owner-busy check,
+where a streaming member read idle and had its in-progress task reassigned out
+from under it on authority handover, and the session-feed's, where a turn's
+provisional trailing message was published to other nodes as final. Anything
+that reaches for that map again is to be read the same way until proven
+otherwise.
+
+**Which replacement depends on the question**, and the two are not
+interchangeable. `bus.isSessionOccupied` answers "can this session take work" —
+a streaming turn OR a slot reserved for one that has not started — and belongs
+to scheduling decisions. `isAppChatConversationGenerating` answers "is text
+being produced right now" and belongs to anything withholding provisional
+output; a slot reserved for a turn that has not begun has nothing provisional
+to withhold.
+
+Session invalidation for app chat now takes the consumer path
 (`pendingConsumerRebuilds`) instead of the legacy `pendingInvalidations` path,
 which is also what makes stop/team-agent handling in `control.ts` apply to
 digital humans for free.
@@ -384,8 +481,7 @@ on it.
 
 **Layer split in the renderer**: local sessions render in the interactive
 `AppChatView` (keyed by conversationId for a clean remount on switch); IM/HTTP
-sessions stay read-only in `ImChatView`. `AppChatContainer` branches on
-`session.source === 'local'`.
+sessions stay read-only in `ImChatView`, reached through `ImSessionDetailView`.
 
 ### 2.14 Cross-Session Relay (Pending Relay Spool)
 
@@ -513,6 +609,26 @@ global slot free), `onStarted` (the run row exists, fired from `executeRun`'s
 guarantees the caller is never left waiting on an admission that already
 happened, e.g. when the run fails before inserting its row.
 
+### 2.17 A Stop Is Work for the Owner, Not a Status
+
+**Decision**: when the runtime stops a person — consecutive failures hitting the
+threshold, an expired sign-in — that is reported as an item waiting on the
+owner, not only as a status. `app-state.ts` derives `AutomationAppState.blocked`
+from the persisted status; `getPendingInbox` returns the same people beside the
+unanswered questions and counts them in its total.
+
+**Rationale**: a stop and an unanswered question are the same thing to the
+owner — work that will not move until they act — and they end the same way, with
+`resume()`. Carrying the stop only as a status produced a person marked as
+needing the owner whose request list, which holds questions and nothing else,
+was legitimately empty. A surface that claims someone needs the owner has to
+carry the way out of it.
+
+**`error` is a state, not a default**. It used to be the fall-through of the
+status ladder in both derivations, so an unmapped status was indistinguishable
+from a person the runtime had stopped — an uninstalled person read as one that
+had failed. Every status is now mapped explicitly and the ladder exists once.
+
 ---
 
 ## 3. SQLite Schema
@@ -562,8 +678,11 @@ src/main/apps/runtime/
   errors.ts                  -- Runtime-specific error types
   migrations.ts              -- Schema for automation_runs + activity_entries
   store.ts                   -- ActivityStore (CRUD for runs and entries)
+  app-state.ts               -- persisted AppStatus + live execution facts -> AutomationAppState (status, blocked, automaticEnabled). Shared by getAppState and the directory page; two copies of this ladder is how they came to disagree
+  people-directory.ts        -- bounded directory page projection
   prompt.ts                  -- buildAppSystemPrompt() for automation (headless) sessions
   report-tool.ts             -- report_to_user SDK MCP tool
+  escalation-cut.ts          -- when a turn that asked the user may be ended (§2.3); applied by execute.ts and app-chat-sink.ts
   notify-tool.ts             -- halo-notify SDK MCP tool (notify_channel + notify_bot)
   notify-availability.ts     -- resolveNotifyAvailability() — single source of truth for whether notify tools are actually loaded (mirrors notify-tool injection rules; consumed by chat + automation prompts)
   concurrency.ts              -- Counting semaphore
@@ -574,6 +693,7 @@ src/main/apps/runtime/
   -- Interactive chat with an App (separate from automation runs):
   app-chat.ts                -- sendAppChatMessage() and chat session lifecycle
   app-chat-sink.ts           -- TurnSink for chat: run JSONL + round/autonomous delivery (§2.12a)
+  app-chat-live-turn.ts      -- The turn a chat is running RIGHT NOW: whether there is one (`isAppChatConversationGenerating` — the only truthful busy probe; app chat never writes the engine's legacy `activeSessions` map) and how to add a message to it. Its own leaf module because the team layer asks both synchronously, and app-chat.ts imports the team runtime accessor — a static edge back would close that cycle
   config-defaults.ts         -- Merge App config_schema defaults into userConfig
   dispatch-inbound.ts        -- Route IM inbound messages into app-chat
   im-permission-registry.ts  -- Per-conversation owner/guest context for SDK gating
@@ -596,6 +716,10 @@ src/main/apps/runtime/
     manager.ts               -- Generic channel lifecycle (provider-agnostic)
     im-prompt.ts             -- IM entry/constraint builders + ImSessionContext
     file-send-mcp.ts         -- send_file_to_chat MCP tool (pre-bound to session)
+    file-send-resolve.ts     -- binds that capability to one chat, behind the export
+                                gate. Shared: every dispatch path into a chat must
+                                resolve it identically or the session is rebuilt
+                                mid-turn (see runtime/team/DESIGN.md)
     identity-resolve.ts      -- Channel-agnostic opaque-chatId -> real-name resolution
                                 (opt-in via ImChannelInstance.identityCapability)
     wecom-identity-resolve.ts -- WeCom-specific identityCapability implementation
@@ -671,7 +795,7 @@ interface AppRuntimeService {
   triggerManually(appId: string): Promise<AppRunResult>      // resolves at run end
   startManually(appId: string): Promise<AppRunStartInfo>      // resolves at run start (§2.16)
   getAppState(appId: string): AutomationAppState
-  respondToEscalation(appId: string, entryId: string, response: EscalationResponse): Promise<void>
+  respondToEscalation(appId: string, entryId: string, response: EscalationResponse): Promise<ActivityEntry>
   getActivityEntries(appId: string, options?: ActivityQueryOptions): ActivityEntry[]
   getEntriesForRun(runId: string): ActivityEntry[]
   getRun(runId: string): AutomationRun | null
@@ -680,3 +804,135 @@ interface AppRuntimeService {
   deactivateAll(): Promise<void>
 }
 ```
+
+
+### Durable decisions, provenance and environment references
+
+Migration 7 retains the pre-migration activity content and responses in
+`runtime_decision_migration_backup`, then creates the continuation outbox,
+legacy deadline policy and session-environment tables. Migrations run inside the
+platform store transaction: a failure leaves the previous schema/data intact.
+The backup is an audit/recovery source, not another live activity store. A rollback
+requires restoring a pre-upgrade database copy before launching an older binary;
+never lower the migration version on a live upgraded database.
+
+An answer and its outbox row commit in one synchronous transaction. Repeating the
+same answer returns the stored answer; a conflicting answer fails. Deadlines and
+closure are checked against authoritative data in that transaction. Answer time is
+server assigned. Multi-question forms must supply every answer in one submission.
+The original answer remains visible if execution fails. Retry only requeues the
+continuation; it does not write another answer.
+
+Standalone continuations share the standalone execution lane and reuse the original
+run/session. Team continuations retain their team, epoch and member. Busy team
+sessions leave answers in the persistent outbox rather than the bounded in-memory
+mailbox. The team runtime signals actual start and settlement; stable decision
+correlation IDs suppress duplicate in-process delivery. Startup recovers interrupted
+continuations. This is at-least-once recovery with deduplication, not an exactly-once
+promise for external side effects such as email or file changes.
+
+New installations have no implicit decision deadline. Explicit template deadlines
+remain supported. Existing installations retain their prior configured/default
+24-hour policy. Already-overdue unanswered historical requests retain their original
+deadline plus `deadlineReviewRequired`; they require an explicit new deadline or
+no-deadline choice before an answer. Other deadlines keep expiring normally.
+Expiration writes a system resolution, never user-response text, and affects only
+the corresponding request. Exact legacy system-shaped responses are reclassified with `attribution: unverified`
+and retained verbatim in the resolution audit plus the migration backup. The old
+schema has no actor evidence; matching reserved text does not prove who wrote it. No historical
+closed work is restarted.
+
+`ActivityStore.insertEntry` supplies trusted provenance for every producer. Team
+reports of all kinds carry team/epoch/member attribution and an idempotent shared
+activity with the same entry reference. Historical provenance is backfilled only
+from a team context or an actual run record; otherwise it remains unknown.
+Question summaries included in a model's report-tool result are scoped to the
+current team task or standalone run, never another team's private question.
+
+Run environments are immutable snapshots captured before new work begins. Chat
+session environments are pinned when native sessions are created or other sessions first run. Forks retain their source environment. A one-time startup backfill pins provable legacy transcripts and registry sessions; a durable marker avoids rescanning their history on each launch. Changing future defaults pins any
+provable legacy environments before moving; existing records keep their old
+working/data/memory paths. Missing original storage blocks continuation rather than recreating empty memory or switching spaces. Connection bindings retain installed instance IDs: chat captures workspace inheritance minus explicit denials, while independent runs capture declared connections. Current revocations still apply, and replacing an original connection with a same-name account blocks continuation. Public runtime activity/state types re-export the shared
+renderer-safe contract rather than maintaining another structural copy.
+
+`getAppState` is a projection: automatic enablement, active execution, pending
+questions and accepted continuations coexist. Manual execution and answering do
+not enable automatic schedules. The legacy status field no longer closes questions
+or overwrites the user's pause intent when an execution asks for a decision.
+
+
+### Read-only identity and team awareness
+
+`person-context` resolves current identity, membership and role from trusted runtime
+context. Owners can query their digital human's visible teams; a borrowed team turn
+is limited to its current team/task; guests do not receive the tool. A single narrow
+schema exposes this read on demand without waking a team or injecting histories.
+The space assistant's `halo-apps` read tool may query an authorized named digital
+human but does not claim that person's identity. Links use stable team/task/member
+identifiers and the renderer's guarded navigation path.
+
+Changing the default space uses the runtime facade, pins provable legacy run/session
+environments and rebinds future subscriptions without deactivating current work.
+The manager's persisted data path keeps identity memory stable across the move.
+
+
+### Activity write contract and recovery
+
+All activity producers pass through `ActivityStore.insertEntry`. `report-tool.ts`
+creates standalone and team reports/requests with explicit source snapshots;
+ordinary native/IM chat does not mount this reporting tool. `execute.ts` creates
+fallback completion/error entries linked to the persisted run. `service.ts`
+records admission skips, interrupted startup runs and continuation state changes.
+The store resolves standalone source only through an existing run, team source
+through trusted team context, and otherwise uses `unknown`. Team reports retain
+team/task names as display snapshots and stable IDs for navigation; the board
+references the same activity ID rather than inventing another decision.
+
+Canonical entries returned after answer acceptance and emitted activity upserts
+include the durable continuation status. A stopped attempt may expose
+`resumeAvailable` only when the original session exists and no unresolved or
+expired authorization blocks it. Task closure remains terminal and distinct from
+stopping an attempt. IM trigger history also reads the pinned session environment.
+
+After an unexpected shutdown, startup settles interrupted attempts and requeues
+persisted running continuations. Queued decisions remain durable if dependencies
+are unavailable; failed continuations retain the accepted answer for explicit
+retry. Operators should preserve the complete database plus transcript/storage
+paths before upgrade or rollback. The migration backup preserves changed decision
+records but is not a full database backup. Restoring only its rows into an active
+newer database can disconnect outbox and task state and is not a supported rollback.
+
+Capability inventory is a runtime facade over the manager's pure scope projection.
+It adds retained session and unfinished-run instance bindings in one on-demand store
+query, skips closed/completed work and metadata anchors, and applies current MCP
+revocations before reporting consumers. The manager never reads runtime state.
+Retained consumers are labelled as potential use, distinct from current default
+workspace inheritance; no history content or connection secret enters this result.
+
+Queued executions reload the installed person after obtaining their resource slot,
+so permissions revoked during the wait apply before SDK creation. Continuations
+without their original run/thread/engine-session identity fail explicitly; the
+executor never substitutes a fresh conversation. Disk-reopen and competing-WAL
+connection tests cover answer/outbox durability and close-versus-answer ordering,
+and migration fault injection verifies schema, audit and row rollback together.
+
+The people-directory facade combines the manager's bounded SQL projection with a
+single membership query, grouped decision/continuation counts, one indexed recent
+run query capped at five records per page item, and an in-memory runtime snapshot.
+It does not call getAppState once per card or retrieve prompts/configuration. Page
+size is capped at 100; stable installed-time/id ordering supports offset seeking.
+The complete InstalledApp contract remains reserved for existing full-data flows
+and on-demand detail hydration.
+
+Legacy environment retention runs for paused and error-state people as well as
+active ones, before continuation dispatch. An existing run without a retained
+environment is blocked rather than resolved against its current default. Reopening
+a run occurs only after resource admission; failures before SDK setup settle the
+original run and preserve its accepted answer. The repeated-error circuit breaker
+only disables enabled automatic work and never overwrites an explicit pause.
+
+The desktop and remote Run once action uses `startManually` through `app:start-run`
+and `POST /api/apps/:appId/runs/start`. It acknowledges admission without waiting
+for model completion, so the automatic-task switch remains usable while work is
+running. The existing public `/trigger` endpoint retains its completion response
+for external integrations. Both paths share admission and concurrency checks.

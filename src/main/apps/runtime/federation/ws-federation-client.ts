@@ -1,0 +1,399 @@
+/**
+ * apps/runtime/federation -- Joiner-side outbound WS client
+ *
+ * The joiner role's only network leg: an outbound WebSocket to the host office's
+ * server. It authenticates with the office credential, then exchanges
+ * 'federation' frames. This is a thin transport — it carries no join/presence
+ * semantics; the coordinator drives those through a FederationLink backed by
+ * this client.
+ *
+ * Uses the `ws` npm library directly. That is a library dependency, not the
+ * http/* transport tier, so the federation module's downward-only dependency
+ * direction holds: the joiner never imports websocket.ts.
+ *
+ * Reconnect uses exponential backoff (1s→…→30s cap), mirroring the renderer
+ * transport. Timers are unref'd so a pending reconnect never keeps the process
+ * (or a test runner) alive.
+ */
+
+import WebSocket from 'ws'
+
+import { framePlane, type FederationMessage, type FramePlane, type NodeId } from './types'
+
+const LOG_TAG = '[FedClient]'
+
+const BACKOFF_BASE_MS = 1000
+const BACKOFF_MAX_MS = 30_000
+
+/**
+ * Per-plane bounded outbound queues. When the link is congested the planes
+ * drain in strict priority (control → stream → artifact), and each plane's cap is
+ * enforced independently so a flood of large artifact frames can neither
+ * head-of-line-block nor evict coordination traffic. Control is sized so it never
+ * realistically overflows; if it ever did it sheds its OWN oldest, never trading
+ * a control guarantee for a lower plane. Artifact is the smallest because its
+ * frames are the largest and the most droppable (a viewer simply re-fetches).
+ */
+const PLANE_QUEUE_CAP: Record<FramePlane, number> = {
+  control: 1024,
+  stream: 256,
+  artifact: 32,
+}
+/** Drain order: highest priority first. */
+const PLANE_DRAIN_ORDER: readonly FramePlane[] = ['control', 'stream', 'artifact']
+
+export type WsFederationClientState = 'connecting' | 'open' | 'closed'
+
+/**
+ * A signed identity proof answering the host's auth challenge. Shape mirrors the
+ * host-side device-key resolver contract (http/identity); this module treats it
+ * as opaque data — building/signing it is injected so the federation layer never
+ * imports the identity/key modules (dependency direction).
+ */
+export type FederationAuthProof = Record<string, unknown>
+
+export interface WsFederationClientDeps {
+  /** Host server base URL, e.g. ws://host:3017 or http://host:3017 (upgraded). */
+  serverUrl: string
+  /** Office-member credential token presented on the WS auth handshake. */
+  credentialToken: string
+  /**
+   * Build the signed proof for a host-issued auth challenge (base64 nonce →
+   * device-key proof). A federation session REQUIRES a proven node identity:
+   * when this is absent or returns null the client cannot complete the node
+   * handshake and closes (the host would reject its frames anyway).
+   */
+  makeAuthProof?: (nonce: string) => FederationAuthProof | null
+  /**
+   * The office this connection speaks for, carried in the auth payload. Enables
+   * ROSTER RE-ENTRY on the receiving side: when the invite token cannot be
+   * verified there (it was signed by a lost creator's key — e.g. dialing a
+   * newly-elected authority), a proven identity that is already an admitted
+   * node of this office is re-admitted without a fresh invite.
+   */
+  officeId?: string
+  /** Delivered every inbound 'federation' frame after auth succeeds. */
+  onFrame: (frame: FederationMessage) => void
+  /** Connection lifecycle, surfaced for the manager's logging/diagnostics. */
+  onStateChange?: (state: WsFederationClientState) => void
+  /**
+   * GATEWAY sessions only: the relay reported the room's host is gone
+   * (gw:host-lost). Receiving it also proves this joined office rides a
+   * gateway — the manager marks the office relay-backed so a later election
+   * win claims the room (gw:host-attach with the new term) instead of trying
+   * to dial WAN peers directly. LAN sessions never see this envelope.
+   */
+  onGatewayHostLost?: () => void
+  /**
+   * Fired when the link re-authenticates AFTER a prior drop — i.e. a reconnect,
+   * never the initial auth. The socket reconnect + re-auth restores transport,
+   * but federation membership stays whatever the host last decided (e.g.
+   * confirmed-offline once it stopped hearing from this node). The consumer uses
+   * this to re-drive a fresh join-request so the node re-enters the roster and
+   * gets a catch-up, instead of relying on bare heartbeats the host now drops.
+   */
+  onReauth?: () => void
+  /**
+   * Fired once when this link has failed to establish for `attempts` consecutive
+   * tries — the address is not merely flaky, it is wrong or unroutable from here.
+   * Advice, not a stop: retrying continues, and the consumer decides whether to
+   * route elsewhere. A leg that can never connect is not harmless — every frame
+   * addressed to it queues, overflows, and is shed where no layer above can see.
+   */
+  onUnreachable?: (attempts: number) => void
+}
+
+/** Consecutive failed connects after which a link is reported as unreachable. */
+const UNREACHABLE_AFTER_ATTEMPTS = 5
+
+/** Minimum gap between shed-frame warnings per plane, so a dead link cannot flood the log. */
+const DROP_LOG_INTERVAL_MS = 30_000
+
+/** What a link can report about itself, for the office-level health line. */
+export interface WsLinkHealth {
+  url: string
+  connected: boolean
+  /** Consecutive failed connect attempts; 0 once connected. */
+  failedAttempts: number
+  /** Frames shed by queue overflow since this client was created, by plane. */
+  dropped: Record<FramePlane, number>
+}
+
+/**
+ * Outbound WS client to a host office. Constructed open: it connects eagerly and
+ * reconnects on drop until close() is called. Frames sent before auth complete
+ * are queued and flushed on auth:success.
+ */
+export class WsFederationClient {
+  private readonly wsUrl: string
+  private socket: WebSocket | null = null
+  private authed = false
+  // True once any auth:success has happened in this client's lifetime. A later
+  // auth:success while this is already set means the link came back from a drop,
+  // which is what distinguishes a reconnect-reauth (fire onReauth) from the
+  // initial auth (do not).
+  private hasAuthedEver = false
+  private stopped = false
+  private reconnectAttempt = 0
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  // Outbound frames held until the link is authed, segmented by plane so they
+  // drain in priority and overflow is shed per-plane.
+  private readonly outbound: Record<FramePlane, Array<{ frame: FederationMessage; to: NodeId | null }>> = {
+    control: [],
+    stream: [],
+    artifact: [],
+  }
+  // Frames shed by overflow, and when each plane last reported it. Counted rather
+  // than logged per frame: a link that cannot connect sheds one every couple of
+  // seconds, and a per-frame line buries the fact that thousands are gone.
+  private readonly dropped: Record<FramePlane, number> = { control: 0, stream: 0, artifact: 0 }
+  private readonly lastDropLogAt: Record<FramePlane, number> = { control: 0, stream: 0, artifact: 0 }
+  private unreachableReported = false
+
+  constructor(private readonly deps: WsFederationClientDeps) {
+    // Accept http(s) or ws(s); normalize to a ws(s) /ws endpoint.
+    const base = deps.serverUrl.replace(/\/+$/, '').replace(/^http/, 'ws')
+    this.wsUrl = base.endsWith('/ws') ? base : `${base}/ws`
+    this.connect()
+  }
+
+  /**
+   * Send a federation frame, queueing (bounded, per-plane) until the link is
+   * authed. `to` is the intended target node, stamped on the envelope: a LAN
+   * host and a hosted gateway room ignore it (member frames route to the
+   * host), but a HOSTLESS gateway room uses it to deliver addressed election
+   * traffic (votes, catch-up replies) to exactly one member instead of
+   * fanning it out roomwide.
+   */
+  send(frame: FederationMessage, to?: NodeId | null): void {
+    if (this.authed && this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ type: 'federation', ...(to ? { to } : {}), payload: frame }))
+      return
+    }
+    const plane = framePlane(frame)
+    const queue = this.outbound[plane]
+    if (queue.length >= PLANE_QUEUE_CAP[plane]) {
+      // Overflow sheds within the SAME plane only — a full artifact queue never
+      // evicts a queued control frame. Drop oldest of this plane.
+      queue.shift()
+      this.dropped[plane] += 1
+      this.reportDropped(plane)
+    }
+    queue.push({ frame, to: to ?? null })
+  }
+
+  /**
+   * Say that frames are being lost, at a bounded rate, and say WHY: a shed frame
+   * on a link that never connected is a dead address, not congestion, and the two
+   * call for opposite responses. The count is cumulative because the magnitude is
+   * the signal — a handful is a hiccup, thousands is a channel eating traffic.
+   */
+  private reportDropped(plane: FramePlane): void {
+    const now = Date.now()
+    if (now - this.lastDropLogAt[plane] < DROP_LOG_INTERVAL_MS) return
+    this.lastDropLogAt[plane] = now
+    const why = this.authed
+      ? 'link is authed but the queue is not draining'
+      : `link has never carried a frame since its last connect (failed attempts=${this.reconnectAttempt})`
+    console.warn(
+      `${LOG_TAG} ${plane} queue full; shedding frames url=${this.wsUrl} ` +
+        `droppedTotal=${this.dropped[plane]} — ${why}`
+    )
+  }
+
+  /** Connection state and cumulative losses, for the office-level health line. */
+  getHealth(): WsLinkHealth {
+    return {
+      url: this.wsUrl,
+      connected: this.authed && this.socket?.readyState === WebSocket.OPEN,
+      failedAttempts: this.authed ? 0 : this.reconnectAttempt,
+      dropped: { ...this.dropped },
+    }
+  }
+
+  /** Stop reconnecting and close the socket. Idempotent. */
+  close(): void {
+    this.stopped = true
+    this.authed = false
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.socket) {
+      // Closing a socket that is still handshaking makes `ws` emit 'error'
+      // asynchronously. removeAllListeners drops the 'error' handler, and an
+      // EventEmitter 'error' with no listener is promoted to an uncaught
+      // exception the synchronous catch below can never see — keep a sink.
+      this.socket.removeAllListeners()
+      this.socket.on('error', () => {})
+      try {
+        this.socket.close()
+      } catch {
+        /* already closing */
+      }
+      this.socket = null
+    }
+    this.setState('closed')
+    console.log(`${LOG_TAG} closed url=${this.wsUrl}`)
+  }
+
+  // ── Internals ──
+
+  private setState(state: WsFederationClientState): void {
+    this.deps.onStateChange?.(state)
+  }
+
+  private connect(): void {
+    if (this.stopped) return
+    this.authed = false
+    this.setState('connecting')
+    console.log(`${LOG_TAG} connecting url=${this.wsUrl} attempt=${this.reconnectAttempt}`)
+
+    const socket = new WebSocket(this.wsUrl)
+    this.socket = socket
+
+    socket.on('open', () => {
+      console.log(`${LOG_TAG} socket open url=${this.wsUrl}`)
+      // Leg 1 of the node handshake: request a federation session. The host
+      // answers with auth:challenge; the signed proof rides the second auth.
+      socket.send(
+        JSON.stringify({
+          type: 'auth',
+          payload: {
+            token: this.deps.credentialToken,
+            federation: true,
+            ...(this.deps.officeId ? { officeId: this.deps.officeId } : {}),
+          },
+        })
+      )
+    })
+
+    socket.on('message', (data: WebSocket.RawData) => {
+      this.handleMessage(data)
+    })
+
+    socket.on('close', (code: number, reason: Buffer) => {
+      this.authed = false
+      this.setState('closed')
+      const why = reason?.length ? reason.toString() : ''
+      console.log(`${LOG_TAG} socket closed url=${this.wsUrl} code=${code}${why ? ` reason=${why}` : ''}`)
+      if (this.stopped) return
+      this.scheduleReconnect()
+    })
+
+    socket.on('error', (err: Error) => {
+      console.warn(`${LOG_TAG} socket error url=${this.wsUrl} msg=${err.message}`)
+      // 'close' follows and drives the reconnect; nothing else to do here.
+    })
+  }
+
+  private handleMessage(data: WebSocket.RawData): void {
+    let message: { type?: string; payload?: unknown; error?: string }
+    try {
+      message = JSON.parse(data.toString())
+    } catch {
+      console.warn(`${LOG_TAG} dropped non-JSON message url=${this.wsUrl}`)
+      return
+    }
+
+    switch (message.type) {
+      case 'auth:challenge': {
+        // Leg 2: sign the host's one-shot nonce with the local identity key and
+        // re-auth with the proof attached. Without a proof factory (or when it
+        // cannot sign) the node handshake is impossible — close instead of
+        // hammering the host with an unprovable session.
+        const nonce = (message.payload as { nonce?: unknown } | undefined)?.nonce
+        const proof =
+          typeof nonce === 'string' ? this.deps.makeAuthProof?.(nonce) ?? null : null
+        if (!proof) {
+          console.warn(`${LOG_TAG} auth challenge received but no identity proof available url=${this.wsUrl}`)
+          this.close()
+          break
+        }
+        this.socket?.send(
+          JSON.stringify({
+            type: 'auth',
+            payload: {
+              token: this.deps.credentialToken,
+              federation: true,
+              proof,
+              ...(this.deps.officeId ? { officeId: this.deps.officeId } : {}),
+            },
+          })
+        )
+        break
+      }
+      case 'auth:success': {
+        const isReauth = this.hasAuthedEver
+        this.authed = true
+        this.hasAuthedEver = true
+        this.reconnectAttempt = 0
+        // The address works again; a later outage must be able to announce itself.
+        this.unreachableReported = false
+        this.setState('open')
+        console.log(`${LOG_TAG} authenticated url=${this.wsUrl}${isReauth ? ' (reconnect)' : ''}`)
+        this.flushOutbound()
+        // Re-drive the join AFTER flushing so the request rides the live socket,
+        // not a stale queued frame.
+        if (isReauth) {
+          console.log(`${LOG_TAG} re-driving join after reconnect url=${this.wsUrl}`)
+          this.deps.onReauth?.()
+        }
+        break
+      }
+      case 'auth:failed':
+        // Auth failures are not transient; stop retrying so we don't hammer the
+        // host with a credential it has already rejected.
+        console.warn(`${LOG_TAG} auth failed url=${this.wsUrl} error=${message.error ?? 'unknown'}`)
+        this.close()
+        break
+      case 'federation':
+        this.deps.onFrame(message.payload as FederationMessage)
+        break
+      case 'gw:host-lost':
+        console.warn(`${LOG_TAG} gateway reports host lost url=${this.wsUrl}`)
+        this.deps.onGatewayHostLost?.()
+        break
+      // 'event'/'pong'/others are not consumed by the federation joiner leg.
+    }
+  }
+
+  private flushOutbound(): void {
+    if (!this.authed || this.socket?.readyState !== WebSocket.OPEN) return
+    // Drain in strict plane priority so coordination goes out ahead of any
+    // backlog of stream/artifact frames buffered during the reconnect.
+    for (const plane of PLANE_DRAIN_ORDER) {
+      const queue = this.outbound[plane]
+      const pending = queue.splice(0, queue.length)
+      for (const { frame, to } of pending) {
+        this.socket.send(JSON.stringify({ type: 'federation', ...(to ? { to } : {}), payload: frame }))
+      }
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnectTimer) return
+    this.reconnectAttempt += 1
+    const delay = Math.min(
+      BACKOFF_BASE_MS * 2 ** (this.reconnectAttempt - 1),
+      BACKOFF_MAX_MS
+    )
+    console.log(`${LOG_TAG} reconnecting in ${delay}ms url=${this.wsUrl} attempt=${this.reconnectAttempt}`)
+    // Announced once, and only after enough tries to rule out a transient drop.
+    // Retrying continues regardless: the address may come back, and the consumer
+    // may have nowhere better to send. What must not continue is the SILENCE.
+    if (!this.unreachableReported && this.reconnectAttempt >= UNREACHABLE_AFTER_ATTEMPTS) {
+      this.unreachableReported = true
+      console.warn(
+        `${LOG_TAG} unreachable after ${this.reconnectAttempt} attempts url=${this.wsUrl}; ` +
+          `anything addressed here is queueing and will be shed`
+      )
+      this.deps.onUnreachable?.(this.reconnectAttempt)
+    }
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, delay)
+    if (typeof this.reconnectTimer.unref === 'function') this.reconnectTimer.unref()
+  }
+}

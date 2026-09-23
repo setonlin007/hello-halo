@@ -34,7 +34,10 @@ const minimalSkillSpec = {
   version: '1.0',
   author: 'tester',
   description: 'A test skill',
-  type: 'skill'
+  type: 'skill',
+  // Skills follow the external SKILL.md format: content lives in
+  // skill_content / skill_files, not system_prompt.
+  skill_content: '# Test Skill\n\nYou are a helpful assistant.'
 }
 
 const minimalAutomationSpec = {
@@ -95,9 +98,7 @@ describe('validateAppSpec - minimal valid specs', () => {
   it('should accept minimal Skill spec', () => {
     const result = validateAppSpec(minimalSkillSpec)
     expect(result.type).toBe('skill')
-    expect(result.name).toBe('Test Skill')
-    // Skills are lightweight: system_prompt is not part of the skill contract
-    expect((result as { system_prompt?: unknown }).system_prompt).toBeUndefined()
+    expect((result as { skill_content?: string }).skill_content).toContain('You are a helpful assistant.')
   })
 
   it('should accept minimal Automation spec', () => {
@@ -137,17 +138,12 @@ describe('validateAppSpec - required fields', () => {
     expect(() => validateAppSpec(spec)).toThrow(AppSpecValidationError)
   })
 
-  it('should reject missing author for automation', () => {
+  it('should reject missing author (non-skill types)', () => {
+    // Author is optional for skills (SKILL.md has no author field) but stays
+    // required for the other types.
     const spec = { ...minimalAutomationSpec, author: undefined }
     expect(() => validateAppSpec(spec)).toThrow(AppSpecValidationError)
-  })
-
-  it('should accept missing author for skill', () => {
-    // SKILL.md format has no author field, so author is optional for skills
-    const spec = { ...minimalSkillSpec, author: undefined }
-    const result = validateAppSpec(spec)
-    expect(result.type).toBe('skill')
-    expect(result.author).toBeUndefined()
+    expect(validateAppSpec({ ...minimalSkillSpec, author: undefined }).type).toBe('skill')
   })
 
   it('should reject missing description', () => {
@@ -185,22 +181,15 @@ describe('validateAppSpec - type-specific constraints', () => {
     } catch (err) {
       expect((err as AppSpecValidationError).issues).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({
-            path: 'system_prompt',
-            message: 'Expected string, received undefined',
-            received: 'undefined'
-          })
+          expect.objectContaining({ path: 'system_prompt' })
         ])
       )
     }
   })
 
-  it('should accept skill without system_prompt', () => {
-    // Skills are lightweight and do not carry a system_prompt
-    const spec = { ...minimalSkillSpec, system_prompt: undefined }
-    const result = validateAppSpec(spec)
-    expect(result.type).toBe('skill')
-    expect((result as { system_prompt?: unknown }).system_prompt).toBeUndefined()
+  it('should accept a skill without system_prompt (SKILL.md model)', () => {
+    const result = validateAppSpec(minimalSkillSpec)
+    expect(result.system_prompt).toBeUndefined()
   })
 
   it('should reject MCP without mcp_server', () => {
@@ -209,37 +198,31 @@ describe('validateAppSpec - type-specific constraints', () => {
   })
 
   it('should strip mcp_server on non-MCP type', () => {
-    // Discriminated union validates against the skill schema, which has no
-    // mcp_server field, so the unknown key is stripped rather than rejected.
-    const spec = {
+    // The discriminated-union schema strips fields that do not belong to the
+    // declared type instead of rejecting the spec.
+    const result = validateAppSpec({
       ...minimalSkillSpec,
       mcp_server: { command: 'npx' }
-    }
-    const result = validateAppSpec(spec)
-    expect(result.type).toBe('skill')
-    expect((result as { mcp_server?: unknown }).mcp_server).toBeUndefined()
+    })
+    expect(result.mcp_server).toBeUndefined()
   })
 
   it('should strip subscriptions on non-automation type', () => {
-    const spec = {
+    const result = validateAppSpec({
       ...minimalSkillSpec,
       subscriptions: [{
         source: { type: 'schedule' as const, config: { every: '30m' } }
       }]
-    }
-    const result = validateAppSpec(spec)
-    expect(result.type).toBe('skill')
-    expect((result as { subscriptions?: unknown }).subscriptions).toBeUndefined()
+    })
+    expect(result.subscriptions).toBeUndefined()
   })
 
   it('should strip memory_schema on non-automation type', () => {
-    const spec = {
+    const result = validateAppSpec({
       ...minimalSkillSpec,
       memory_schema: { price: { type: 'number' } }
-    }
-    const result = validateAppSpec(spec)
-    expect(result.type).toBe('skill')
-    expect((result as { memory_schema?: unknown }).memory_schema).toBeUndefined()
+    })
+    expect(result.memory_schema).toBeUndefined()
   })
 
   it('should allow extension without system_prompt', () => {

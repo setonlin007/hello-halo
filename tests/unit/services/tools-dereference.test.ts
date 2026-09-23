@@ -255,7 +255,7 @@ describe('Moonshot request path', () => {
         $defs: {
           Row: { type: 'object', properties: { id: { type: 'string' } } },
         },
-      }) as AnthropicTool['input_schema'],
+      }) as unknown as AnthropicTool['input_schema'],
     }
 
     const body = { tools: [anthropicToolToOpenAIChatTool(tool)] }

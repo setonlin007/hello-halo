@@ -22,9 +22,11 @@ import { updaterApi } from './updater.api'
 import { perfApi } from './perf.api'
 import { healthApi } from './health.api'
 import { appsApi } from './apps.api'
+import { teamApi } from './team.api'
 import { storeApi } from './store.api'
 import { tlonApi } from './tlon.api'
 import { eventsApi } from './events.api'
+import { taskApi } from './task.api'
 
 /**
  * Unified api object — drop-in replacement for window.halo, transport-agnostic.
@@ -46,9 +48,11 @@ export const api = {
   ...perfApi,
   ...healthApi,
   ...appsApi,
+  ...teamApi,
   ...storeApi,
   ...tlonApi,
   ...eventsApi,
+  ...taskApi,
 }
 
 // Export type for the API

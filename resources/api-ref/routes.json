@@ -86,6 +86,10 @@
     "group": "workspace"
   },
   {
+    "method": "GET",
+    "path": "/api/spaces/summaries"
+  },
+  {
     "method": "POST",
     "path": "/api/spaces",
     "group": "workspace"
@@ -109,6 +113,10 @@
     "method": "DELETE",
     "path": "/api/spaces/:spaceId",
     "group": "workspace"
+  },
+  {
+    "method": "POST",
+    "path": "/api/spaces/:spaceId/forget"
   },
   {
     "method": "POST",
@@ -387,6 +395,18 @@
     "group": "channels"
   },
   {
+    "method": "POST",
+    "path": "/api/im-channels/set-instance-app"
+  },
+  {
+    "method": "POST",
+    "path": "/api/im-channels/create-instance"
+  },
+  {
+    "method": "POST",
+    "path": "/api/im-channels/unbind-instance"
+  },
+  {
     "method": "GET",
     "path": "/api/im-channels/permission-defaults",
     "group": "channels"
@@ -445,6 +465,62 @@
   },
   {
     "method": "GET",
+    "path": "/api/apps/states"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/studio-summary"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/people"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/pending-inbox"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/capability-inventory"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/pending-entries"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/activity/:entryId"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/space-preview"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/escalation/:entryId/retry"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/escalation/:entryId/deadline"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/escalation/:entryId/dismiss"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/runs/:runId/close"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/runs/start"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/runs/:runId/stop"
+  },
+  {
+    "method": "GET",
     "path": "/api/apps",
     "group": "digital-human"
   },
@@ -455,6 +531,10 @@
   },
   {
     "method": "GET",
+    "path": "/api/apps/overview"
+  },
+  {
+    "method": "GET",
     "path": "/api/apps/:appId",
     "group": "digital-human"
   },
@@ -462,6 +542,14 @@
     "method": "GET",
     "path": "/api/apps/:appId/available-skills",
     "group": "digital-human"
+  },
+  {
+    "method": "GET",
+    "path": "/api/spaces/:spaceId/available-skills"
+  },
+  {
+    "method": "GET",
+    "path": "/api/spaces/:spaceId/effective-mcp-apps"
   },
   {
     "method": "GET",
@@ -512,6 +600,14 @@
     "method": "GET",
     "path": "/api/apps/:appId/activity",
     "group": "digital-human"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/runs"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/run-stats"
   },
   {
     "method": "POST",
@@ -645,6 +741,134 @@
     "method": "POST",
     "path": "/api/apps/:appId/sessions/delete",
     "group": "digital-human"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/propose-members"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/detail"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/chat-messages"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/members/:appId/send"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/artifacts"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/conversations"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/conversations"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/teams/:teamId/conversations/:epochId"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/teams/:teamId/conversations/:epochId"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/epochs"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/epochs/:epochId/board"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/epochs/:epochId/artifacts"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/teams/:teamId"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/teams/:teamId"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/members"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/teams/:teamId/members/:appId"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/teams/:teamId/checks/:checkId"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/teams/:teamId/members/:appId"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/teams/:teamId/edges"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/run"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/pause"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/triggers"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/triggers"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/invite"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/teams/:teamId/invite/:jti"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/join"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/leave"
+  },
+  {
+    "method": "GET",
+    "path": "/api/teams/:teamId/federation/presence"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/teams/:teamId/triggers/:triggerId"
   },
   {
     "method": "POST",
@@ -879,5 +1103,25 @@
     "method": "GET",
     "path": "/api/tlon/:kbId/ingest-status",
     "group": "knowledge-base"
+  },
+  {
+    "method": "GET",
+    "path": "/api/task-state"
+  },
+  {
+    "method": "POST",
+    "path": "/api/task-state/mark-unseen"
+  },
+  {
+    "method": "POST",
+    "path": "/api/task-state/mark-read"
+  },
+  {
+    "method": "POST",
+    "path": "/api/task-state/set-kept"
+  },
+  {
+    "method": "POST",
+    "path": "/api/task-state/remove"
   }
 ]

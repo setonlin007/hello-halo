@@ -446,15 +446,17 @@ describe('WecomStreamSession.maybePushProgress', () => {
       await session.update({ type: 'tool_call', tool: 'Read', summary: 'first' })
       await session.update({ type: 'tool_call', tool: 'Edit', summary: 'second' })
       await session.update({ type: 'tool_call', tool: 'Write', summary: 'third' })
-
-      vi.setSystemTime(t0 + 2 * 60_000 + 1000)
       await session.update({ type: 'tool_call', tool: 'Bash', summary: 'fourth' })
+
+      // Advance beyond the throttle window so the next update flushes.
+      vi.setSystemTime(t0 + 3 * 60 * 1000)
+      await session.update({ type: 'tool_call', tool: 'Bash', summary: 'fifth' })
 
       const progressPushes = transport.calls.filter(p =>
         p.method === 'queuePush' && (p.args[1] as string).includes('任务进行中')
       )
 
-      expect(progressPushes.length).toBeGreaterThanOrEqual(1)
+      expect(progressPushes.length).toBeGreaterThanOrEqual(2)
 
       const pushText = progressPushes[progressPushes.length - 1].args[1] as string
 
@@ -752,16 +754,14 @@ describe('WecomStreamSession.maybePushProgress', () => {
       session.markStreamBroken('test')
 
       await session.update({ type: 'tool_call', tool: 'Read', summary: 'reading' })
-      await session.update({ type: 'tool_result', tool: 'Read', summary: 'done', success: true })
-
-      vi.setSystemTime(t0 + 2 * 60_000 + 1000)
+      vi.setSystemTime(t0 + 3 * 60 * 1000)
       await session.update({ type: 'tool_result', tool: 'Read', summary: 'done', success: true })
 
       const progressPushes = transport.calls.filter(p =>
         p.method === 'queuePush' && (p.args[1] as string).includes('任务进行中')
       )
 
-      expect(progressPushes.length).toBeGreaterThanOrEqual(1)
+      expect(progressPushes.length).toBeGreaterThanOrEqual(2)
 
       const pushText = progressPushes[progressPushes.length - 1].args[1] as string
       // Tool activity never reaches the user-facing push payload.

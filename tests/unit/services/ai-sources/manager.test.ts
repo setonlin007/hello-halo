@@ -321,15 +321,15 @@ describe('refreshSourceConfig — token freshness and degraded catalogs', () => 
     stub: Partial<CatalogProviderStub>
   ): CatalogProviderStub {
     const provider: CatalogProviderStub = {
-      checkTokenWithConfig: vi.fn(() => ({ valid: true, needsRefresh: false })),
-      refreshTokenWithConfig: vi.fn(async () => ({
+      checkTokenWithConfig: vi.fn().mockReturnValue({ valid: true, needsRefresh: false }),
+      refreshTokenWithConfig: vi.fn().mockResolvedValue({
         success: true,
         data: { accessToken: 'fresh-tok', refreshToken: 'fresh-ref', expiresAt: 999 }
-      })),
-      refreshConfig: vi.fn(async () => ({
+      }),
+      refreshConfig: vi.fn().mockResolvedValue({
         success: true,
         data: { 'catalog-prov': { availableModels: ['m1'], modelNames: { m1: 'M1' } } }
-      })),
+      }),
       ...stub
     }
     ;(mgr as unknown as { providers: Map<string, unknown> }).providers.set('catalog-prov', provider)
@@ -354,7 +354,7 @@ describe('refreshSourceConfig — token freshness and degraded catalogs', () => 
     seedCatalogSource()
     const mgr = new AISourceManager()
     const provider = registerProvider(mgr, {
-      checkTokenWithConfig: vi.fn(() => ({ valid: false, expiresIn: 0, needsRefresh: true }))
+      checkTokenWithConfig: vi.fn().mockReturnValue({ valid: false, expiresIn: 0, needsRefresh: true })
     })
 
     await mgr.refreshSourceConfig('o1')
@@ -370,8 +370,8 @@ describe('refreshSourceConfig — token freshness and degraded catalogs', () => 
     seedCatalogSource()
     const mgr = new AISourceManager()
     const provider = registerProvider(mgr, {
-      checkTokenWithConfig: vi.fn(() => ({ valid: false, expiresIn: 0, needsRefresh: true })),
-      refreshTokenWithConfig: vi.fn(async () => ({ success: false, error: 'refresh token revoked' }))
+      checkTokenWithConfig: vi.fn().mockReturnValue({ valid: false, expiresIn: 0, needsRefresh: true }),
+      refreshTokenWithConfig: vi.fn().mockResolvedValue({ success: false, error: 'refresh token revoked' })
     })
 
     const result = await mgr.refreshSourceConfig('o1')
@@ -384,7 +384,7 @@ describe('refreshSourceConfig — token freshness and degraded catalogs', () => 
     seedCatalogSource()
     const mgr = new AISourceManager()
     registerProvider(mgr, {
-      refreshConfig: vi.fn(async () => ({
+      refreshConfig: vi.fn().mockResolvedValue({
         success: true,
         data: {
           'catalog-prov': {
@@ -394,7 +394,7 @@ describe('refreshSourceConfig — token freshness and degraded catalogs', () => 
             degraded: true
           }
         }
-      }))
+      })
     })
 
     const result = await mgr.refreshSourceConfig('o1')
@@ -409,7 +409,7 @@ describe('refreshSourceConfig — token freshness and degraded catalogs', () => 
     seedCatalogSource()
     const mgr = new AISourceManager()
     registerProvider(mgr, {
-      refreshConfig: vi.fn(async () => ({
+      refreshConfig: vi.fn().mockResolvedValue({
         success: true,
         data: {
           'catalog-prov': {
@@ -418,7 +418,7 @@ describe('refreshSourceConfig — token freshness and degraded catalogs', () => 
             modelOverrides: { fetched: { contextWindow: 128000 } }
           }
         }
-      }))
+      })
     })
 
     await mgr.refreshSourceConfig('o1')

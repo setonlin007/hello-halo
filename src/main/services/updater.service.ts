@@ -30,6 +30,7 @@ import { is } from '@electron-toolkit/utils'
 // Local imports
 import { getMainWindow } from '../foundation/window.service'
 import { loadProductConfig, UpdateConfig } from '../foundation/product-config'
+import type { UpdaterStatusPayload, UpdaterStatusPhase } from '../../shared/types/updater'
 
 // Type imports
 const { autoUpdater } = electronUpdater
@@ -292,12 +293,13 @@ export function initAutoUpdater(): void {
  * Send update status to renderer
  */
 function sendUpdateStatus(
-  status: 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'manual-download' | 'error',
-  data?: Record<string, unknown>
+  status: UpdaterStatusPhase,
+  data?: Omit<UpdaterStatusPayload, 'status'>
 ): void {
   const mainWindow = getMainWindow()
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('updater:status', { status, ...data })
+    const payload: UpdaterStatusPayload = { status, ...data }
+    mainWindow.webContents.send('updater:status', payload)
   }
 }
 

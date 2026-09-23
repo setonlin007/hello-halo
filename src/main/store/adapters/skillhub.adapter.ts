@@ -336,6 +336,7 @@ export class SkillHubAdapter implements RegistryAdapter {
       skill_files,
       store: {
         slug: entry.slug,
+        tags: entry.tags ?? [],
         registry_id: _source.id,
       },
     }

@@ -18,6 +18,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 
 // The raw compaction path dynamic-imports @anthropic-ai/sdk; mock it so the
 // API-key-path test can observe which client was (not) constructed.
@@ -86,6 +89,21 @@ vi.mock('../../../../src/main/foundation/config.service', () => ({
   resolveClaudeConfigDir: vi.fn().mockReturnValue('/tmp/cc-config'),
 }))
 
+vi.mock('../../../../src/main/apps/manager', () => ({
+  getAppManager: vi.fn(() => ({ getAppWorkDir: () => '/tmp/app-1' })),
+}))
+vi.mock('../../../../src/main/apps/runtime/execution-environment', () => ({
+  resolveExecutionEnvironment: vi.fn(() => ({
+    spaceId: 'space-1', spacePath: '/tmp/space-1', workDir: '/tmp/space-1', memoryDir: '/tmp/app-1',
+  })),
+  validateExecutionEnvironment: vi.fn(),
+  validateEnvironmentConnections: vi.fn(),
+}))
+vi.mock('../../../../src/main/apps/runtime/person-context-tool', () => ({
+  createPersonContextMcpServer: vi.fn(() => ({ name: 'halo-person-context' })),
+  personContextPrompt: vi.fn(() => ''),
+}))
+
 vi.mock('../../../../src/main/services/space.service', () => ({
   getSpace: vi.fn().mockReturnValue({ id: 'space-1', path: '/tmp/space-1' }),
   getSpaceDir: vi.fn().mockReturnValue('/tmp/space-1'),
@@ -144,8 +162,14 @@ vi.mock('../../../../src/main/platform/memory/snapshot', () => ({
   createMemoryStatusMcpServer: vi.fn().mockReturnValue({ name: 'halo-memory', _isMcpServer: true }),
 }))
 
+// Captures the escalation callback so a test can raise one mid-stream, the way
+// the real tool handler does from inside the turn.
+let raiseEscalation: ((entryId: string) => void) | undefined
 vi.mock('../../../../src/main/apps/runtime/report-tool', () => ({
-  createReportToolServer: vi.fn().mockReturnValue({ name: 'halo-report', _isMcpServer: true }),
+  createReportToolServer: vi.fn((_store: unknown, _ctx: unknown, onEscalation?: (id: string) => void) => {
+    raiseEscalation = onEscalation
+    return { name: 'halo-report', _isMcpServer: true }
+  }),
 }))
 
 vi.mock('../../../../src/main/apps/runtime/notify-tool', () => ({
@@ -186,6 +210,13 @@ vi.mock('../../../../src/main/apps/runtime/session-store', () => ({
 vi.mock('../../../../src/main/apps/runtime/active-runs', () => ({
   registerActiveRun: vi.fn(),
   unregisterActiveRun: vi.fn(),
+  listActiveRuns: vi.fn(() => []),
+}))
+
+vi.mock('../../../../src/main/apps/runtime/live-instances', () => ({
+  describeSelfInstance: vi.fn(() => ({ id: 'aaaabbbb', kind: 'run', origin: 'schedule', startedAt: 0 })),
+  listLiveInstances: vi.fn(() => []),
+  formatInstanceTag: vi.fn(() => 'schedule#aaaa'),
 }))
 
 // Keep prompt building cheap and side-effect-free.
@@ -195,14 +226,15 @@ vi.mock('../../../../src/main/apps/runtime/prompt', () => ({
   buildEscalationResumeMessage: vi.fn().mockReturnValue('ESCALATION RESUME'),
 }))
 
-import {
-  executeRun,
-  providerRequiresFirstPartyClient
-} from '../../../../src/main/apps/runtime/execute'
+import { executeRun } from '../../../../src/main/apps/runtime/execute'
+import { providerRequiresFirstPartyClient } from '../../../../src/main/apps/runtime/turn/memory-lifecycle'
 import { RunExecutionError } from '../../../../src/main/apps/runtime/errors'
 import { query as agentSdkQuery, createSession } from '../../../../src/main/services/agent/resolved-sdk'
 import { getApiCredentials, getMcpServersForRequires } from '../../../../src/main/services/agent/helpers'
 import { resolveCredentialsForSdk } from '../../../../src/main/services/agent/sdk-config'
+import { getOrCreateV2Session } from '../../../../src/main/services/agent/session-manager'
+import { resolveExecutionEnvironment } from '../../../../src/main/apps/runtime/execution-environment'
+import { openSessionWriter } from '../../../../src/main/apps/runtime/session-store'
 
 // ============================================
 // Fakes
@@ -216,21 +248,36 @@ class FakeSession {
   close = vi.fn()
   private readonly script: SdkMessage[]
   private readonly throwOnStream: Error | null
+  private readonly onYield: ((message: SdkMessage) => void) | null
   /** How many times stream() has been consumed (each auto-continue re-streams). */
   streamCalls = 0
+  /** Messages actually handed to the consumer — a cut turn leaves some unread. */
+  yielded: SdkMessage[] = []
 
-  constructor(opts: { script?: SdkMessage[]; throwOnStream?: Error | null } = {}) {
+  constructor(opts: {
+    script?: SdkMessage[]
+    throwOnStream?: Error | null
+    /** Runs after each message is yielded, for side effects a tool would have. */
+    onYield?: (message: SdkMessage) => void
+  } = {}) {
     this.script = opts.script ?? []
     this.throwOnStream = opts.throwOnStream ?? null
+    this.onYield = opts.onYield ?? null
   }
 
   stream(): AsyncGenerator<SdkMessage> {
     this.streamCalls++
     const script = this.streamCalls === 1 ? this.script : []
     const throwOnStream = this.throwOnStream
+    const onYield = this.onYield
+    const yielded = this.yielded
     return (async function* () {
       if (throwOnStream) throw throwOnStream
-      for (const m of script) yield m
+      for (const m of script) {
+        yielded.push(m)
+        yield m
+        onYield?.(m)
+      }
     })()
   }
 }
@@ -255,6 +302,8 @@ function makeApp(overrides: Record<string, unknown> = {}) {
 
 function makeStore() {
   return {
+    getRun: vi.fn(),
+    pinRunEnvironment: vi.fn(),
     insertRun: vi.fn(),
     completeRun: vi.fn(),
     updateRunSessionId: vi.fn(),
@@ -304,11 +353,7 @@ function makeCompactionMemory() {
     read: vi.fn().mockResolvedValue(
       '# now\n\n## State | large memory\n\n# History\n\n## 2026-08-29-0900 | older entry\n',
     ),
-    compact: vi.fn().mockResolvedValue({
-      archived: 'memory/run/2026-08-30-1000-run.jsonl',
-      needsSummary: true,
-    }),
-    write: vi.fn().mockResolvedValue(undefined),
+    compact: vi.fn().mockResolvedValue('memory/2026-08-30-1000.md'),
   } as any
 }
 
@@ -395,6 +440,57 @@ describe('executeRun — completion branches', () => {
     expect(nextSession.streamCalls).toBe(11)
     // A run_error activity entry is surfaced for the no-report case.
     expect(emitEntry).toHaveBeenCalled()
+  })
+})
+
+describe('executeRun — a run that asks the user', () => {
+  /**
+   * The run used to be asked, in the tool result, to stop after escalating —
+   * and routinely kept working, acting on the very decision it had just said it
+   * could not make alone. The stop is now the runtime's, and it lands only once
+   * the question's tool call has its result: cutting earlier would leave a call
+   * unanswered in the transcript the user's reply has to resume against.
+   */
+  it('ends the run at the escalation instead of letting the model carry on', async () => {
+    const askUser: SdkMessage = {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'call-1', name: 'mcp__halo-report__report_to_user' }] },
+    }
+    const askResult: SdkMessage = {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'call-1' }] },
+    }
+    const afterwards: SdkMessage = {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'carrying on anyway' }] },
+    }
+
+    raiseEscalation = undefined
+    nextSession = new FakeSession({
+      script: [systemInit(), askUser, askResult, afterwards],
+      // The real tool handler fires this from inside the turn, between the
+      // call and its result reaching the consumer.
+      onYield: message => { if (message === askUser) raiseEscalation?.('entry-1') },
+    })
+
+    const store = makeStore()
+    const result = await executeRun({
+      app: makeApp(),
+      trigger: baseTrigger,
+      store,
+      memory: makeMemory(),
+    })
+
+    expect(store.completeRun).toHaveBeenCalledWith(
+      result.runId,
+      expect.objectContaining({ status: 'waiting_user' }),
+    )
+    expect(result.outcome).toBe('useful')
+    // Whatever the model said after asking is discarded, not reported.
+    expect(nextSession.yielded).not.toContain(afterwards)
+    expect(result.finalText ?? '').not.toContain('carrying on anyway')
+    // The question counts as having reported, so nothing nags the run onward.
+    expect(nextSession.streamCalls).toBe(1)
   })
 })
 
@@ -532,14 +628,12 @@ describe('executeRun — compaction provider routing (#121)', () => {
     expect(arg.prompt).toContain('compacting the memory file')
 
     // LLM summary written as the new memory.md, not the system fallback.
-    expect(memory.write).toHaveBeenCalledWith(
+    expect(memory.compact).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({
-        mode: 'replace',
-        content: expect.not.stringContaining('Compacted by system'),
-      }),
+      'app',
+      expect.not.stringContaining('Compacted by system'),
     )
-    expect(memory.write.mock.calls[0][1].content).toContain('## State | compacted via one-shot query')
+    expect(memory.compact.mock.calls[0][2]).toContain('## State | compacted via one-shot query')
   })
 
   it('routes delegated sources through the agent SDK query with the routing header', async () => {
@@ -585,7 +679,7 @@ describe('executeRun — compaction provider routing (#121)', () => {
     // key near the subprocess.
     expect(arg.options.env.ANTHROPIC_CUSTOM_HEADERS).toBe('x-halo-backend: encoded-config')
     expect(arg.options.env.ANTHROPIC_API_KEY).toBeUndefined()
-    expect(memory.write.mock.calls[0][1].content).toContain('## State | compacted via one-shot query')
+    expect(memory.compact.mock.calls[0][2]).toContain('## State | compacted via one-shot query')
   })
 
   it('keeps API-key providers on the raw @anthropic-ai/sdk path', async () => {
@@ -604,7 +698,7 @@ describe('executeRun — compaction provider routing (#121)', () => {
 
     expect(agentSdkQuery).not.toHaveBeenCalled()
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1)
-    expect(memory.write.mock.calls[0][1].content).toContain('## State | compacted via one-shot query')
+    expect(memory.compact.mock.calls[0][2]).toContain('## State | compacted via one-shot query')
   })
 
   it('falls back to the system summary when the agent SDK query yields nothing', async () => {
@@ -627,7 +721,7 @@ describe('executeRun — compaction provider routing (#121)', () => {
     })
 
     expect(agentSdkQuery).toHaveBeenCalledTimes(1)
-    expect(memory.write.mock.calls[0][1].content).toContain('Compacted by system')
+    expect(memory.compact.mock.calls[0][2]).toContain('Compacted by system')
   })
 
   it.each([
@@ -662,7 +756,7 @@ describe('executeRun — compaction provider routing (#121)', () => {
 
       expect(agentSdkQuery).not.toHaveBeenCalled()
       expect(anthropicCreateMock).toHaveBeenCalledTimes(1)
-      expect(memory.write.mock.calls[0][1].content).toContain('## State | compacted via one-shot query')
+      expect(memory.compact.mock.calls[0][2]).toContain('## State | compacted via one-shot query')
     },
   )
 })
@@ -726,5 +820,65 @@ describe('providerRequiresFirstPartyClient', () => {
     expect(providerRequiresFirstPartyClient('oauth', 'github-copilot')).toBe(false)
     expect(providerRequiresFirstPartyClient('anthropic')).toBe(false)
     expect(providerRequiresFirstPartyClient('openai')).toBe(false)
+  })
+})
+
+
+describe('executeRun — original continuation context', () => {
+  it('refuses to infer an unpinned old execution environment from the current default', async () => {
+    vi.mocked(resolveExecutionEnvironment).mockClear()
+    vi.mocked(createSession).mockClear()
+    await expect(executeRun({
+      app: makeApp({ spaceId: 'new-space' }), store: makeStore(), memory: makeMemory(),
+      existingRunId: 'old-run', existingSessionKey: 'old-thread',
+      trigger: { type: 'continue_followup', description: 'Continue', continue: { sessionId: 'old-engine' } },
+    })).rejects.toThrow('original execution environment is unavailable')
+    expect(resolveExecutionEnvironment).not.toHaveBeenCalled()
+    expect(createSession).not.toHaveBeenCalled()
+  })
+
+  it('fails a continuation without an original engine session instead of starting fresh', async () => {
+    vi.mocked(createSession).mockClear()
+    vi.mocked(getOrCreateV2Session).mockClear()
+    const store = makeStore()
+    store.getRun.mockReturnValue({ environment: { spaceId: 'space-1', spacePath: '/tmp/space-1', workDir: '/tmp/space-1', memoryDir: '/tmp/app-1' } })
+    const result = await executeRun({
+      app: makeApp(), store, memory: makeMemory(), existingRunId: 'old-run', existingSessionKey: 'old-thread',
+      trigger: { type: 'continue_followup', description: 'Continue interrupted work', continue: {} },
+    })
+    expect(result.outcome).toBe('error')
+    expect(result.errorMessage).toContain('original execution context is unavailable')
+    expect(createSession).not.toHaveBeenCalled()
+    expect(getOrCreateV2Session).not.toHaveBeenCalled()
+    expect(store.insertRun).not.toHaveBeenCalled()
+  })
+
+  it('restores the original engine session and storage despite a changed default space', async () => {
+    vi.mocked(createSession).mockClear()
+    vi.mocked(getOrCreateV2Session).mockClear()
+    vi.mocked(resolveExecutionEnvironment).mockClear()
+    vi.mocked(openSessionWriter).mockClear()
+    nextSession = new FakeSession({ script: [assistantReport()] })
+    vi.mocked(getOrCreateV2Session).mockResolvedValueOnce(nextSession as any)
+    const store = makeStore()
+    const directory = mkdtempSync(join(tmpdir(), 'halo-execute-context-'))
+    const environment = { spaceId: 'old-space', spacePath: join(directory, 'storage'), workDir: join(directory, 'work'), memoryDir: join(directory, 'memory') }
+    store.getRun.mockReturnValue({ runId: 'old-run', sessionKey: 'old-thread', sessionId: 'old-engine', environment })
+    const result = await executeRun({
+      app: makeApp({ spaceId: 'new-space' }), store, memory: makeMemory(),
+      existingRunId: 'old-run', existingSessionKey: 'old-thread',
+      trigger: { type: 'escalation_followup', description: 'Answer received', escalation: {
+        sessionId: 'old-engine', originalQuestion: 'Proceed?', userResponse: { ts: 1, text: 'Approved' },
+      } },
+    })
+    expect(result.outcome).toBe('useful')
+    expect(result.runId).toBe('old-run')
+    expect(result.sessionKey).toBe('old-thread')
+    expect(getOrCreateV2Session).toHaveBeenCalledWith('old-space', 'old-thread', expect.any(Object), 'old-engine', environment.workDir)
+    expect(createSession).not.toHaveBeenCalled()
+    expect(resolveExecutionEnvironment).not.toHaveBeenCalled()
+    expect(store.insertRun).not.toHaveBeenCalled()
+    expect(openSessionWriter).toHaveBeenCalledWith(environment.spacePath, 'app-1', 'old-run')
+    rmSync(directory, { recursive: true, force: true })
   })
 })

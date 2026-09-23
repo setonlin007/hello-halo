@@ -1,0 +1,100 @@
+/**
+ * Team view preferences — client-local, per-office view choices.
+ *
+ * These are pure presentation preferences (how the office renders on THIS
+ * screen), deliberately kept out of the team domain model and backend: an
+ * office's coordination data never carries a skin. Persisted to localStorage,
+ * keyed by team id, mirroring the per-space layout-preference pattern.
+ */
+
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+
+/** How the office topology renders: plain status cards, or cartoon workstations. */
+export type OfficeSkin = 'default' | 'cartoon'
+
+/** Cartoon is the default: the workstation metaphor reads more clearly than an
+ *  abstract node graph. One click switches any office back to plain cards. */
+export const DEFAULT_OFFICE_SKIN: OfficeSkin = 'cartoon'
+
+interface TeamViewPrefsState {
+  memberByTask: Record<string, Record<string, string>>
+  rememberTaskMember: (teamId: string, taskId: string, appId: string) => void
+  taskByTeam: Record<string, string | null>
+  setLastTask: (teamId: string, taskId: string | null) => void
+
+  groupsByTeam: Record<string, Record<string, boolean>>
+  setTaskGroup: (teamId: string, group: string, open: boolean) => void
+
+  /** teamId → chosen skin. Absent means "use the default". */
+  skinByTeam: Record<string, OfficeSkin>
+  setOfficeSkin: (teamId: string, skin: OfficeSkin) => void
+  /**
+   * teamId → the digital human of MINE this office's conversations open onto.
+   * Opening a team should land on your own digital human, and on the one you
+   * last spoke to when you brought several — but that is your habit on this
+   * screen, not a fact about the office, so it never leaves this machine.
+   */
+  defaultMemberByTeam: Record<string, string>
+  setDefaultMember: (teamId: string, appId: string) => void
+}
+
+export const useTeamViewPrefsStore = create<TeamViewPrefsState>()(
+  persist(
+    (set) => ({
+      memberByTask: {},
+      rememberTaskMember: (teamId, taskId, appId) => set(state => ({ memberByTask: { ...state.memberByTask, [teamId]: { ...state.memberByTask[teamId], [taskId]: appId } } })),
+      taskByTeam: {},
+      setLastTask: (teamId, taskId) => set(state => ({ taskByTeam: { ...state.taskByTeam, [teamId]: taskId } })),
+      groupsByTeam: {},
+      setTaskGroup: (teamId, group, open) => set(state => ({ groupsByTeam: {
+        ...state.groupsByTeam, [teamId]: { ...state.groupsByTeam[teamId], [group]: open },
+      } })),
+      skinByTeam: {},
+      setOfficeSkin: (teamId, skin) =>
+        set((state) => ({ skinByTeam: { ...state.skinByTeam, [teamId]: skin } })),
+      defaultMemberByTeam: {},
+      setDefaultMember: (teamId, appId) =>
+        set((state) =>
+          state.defaultMemberByTeam[teamId] === appId
+            ? state
+            : { defaultMemberByTeam: { ...state.defaultMemberByTeam, [teamId]: appId } }
+        ),
+    }),
+    {
+      name: 'halo-team-view-prefs',
+      partialize: (state) => ({
+        memberByTask: state.memberByTask,
+        taskByTeam: state.taskByTeam,
+        groupsByTeam: state.groupsByTeam,
+        skinByTeam: state.skinByTeam,
+        defaultMemberByTeam: state.defaultMemberByTeam,
+      }),
+    },
+  ),
+)
+
+/** The office skin for a team, falling back to the default when unset. */
+export function useOfficeSkin(teamId: string): OfficeSkin {
+  return useTeamViewPrefsStore((state) => state.skinByTeam[teamId] ?? DEFAULT_OFFICE_SKIN)
+}
+
+/**
+ * Which digital human of yours a team conversation talks to. Candidates must be
+ * ones that can actually answer, so a remembered choice that has since been
+ * uninstalled falls through instead of pointing the chat at nothing. Null when
+ * none of yours run on this machine — a teammate's answers to its own owner and
+ * is reached from its own thread, never adopted here as a stand-in.
+ */
+export function pickChatTarget(
+  remembered: string | undefined,
+  candidateAppIds: string[]
+): string | null {
+  if (remembered && candidateAppIds.includes(remembered)) return remembered
+  return candidateAppIds[0] ?? null
+}
+
+export function useDefaultChatTarget(teamId: string, candidateAppIds: string[]): string | null {
+  const remembered = useTeamViewPrefsStore((state) => state.defaultMemberByTeam[teamId])
+  return pickChatTarget(remembered, candidateAppIds)
+}

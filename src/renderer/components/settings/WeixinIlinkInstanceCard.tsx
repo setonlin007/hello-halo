@@ -12,7 +12,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import QRCode from 'qrcode'
 import {
   Loader2, ChevronDown, RefreshCw, Smartphone,
-  Trash2, MoreVertical, Bot,
+  Trash2, MoreVertical,
 } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 import { api } from '../../api'
@@ -20,15 +20,16 @@ import type {
   ImChannelInstanceConfig,
   ImChannelInstanceStatus,
 } from '../../../shared/types/im-channel'
+import { ChannelBackendSelect, ChannelBackendName } from './ChannelBackendSelect'
+import type {
+  ChannelBackendApp,
+  ChannelBackendTeam,
+  ChannelBackendValue,
+} from './ChannelBackendSelect'
 
 // ============================================
 // Types
 // ============================================
-
-export interface AutomationApp {
-  id: string
-  spec: { name: string }
-}
 
 /** Connection state for the WeChat iLink QR-code auth flow */
 type WeixinIlinkAuthState =
@@ -42,10 +43,14 @@ type WeixinIlinkAuthState =
 export interface WeixinIlinkInstanceCardProps {
   instance: ImChannelInstanceConfig
   status: ImChannelInstanceStatus | undefined
-  automationApps: AutomationApp[]
+  automationApps: ChannelBackendApp[]
+  /** Teams whose members can back this channel (see ChannelBackendSelect). */
+  teams: ChannelBackendTeam[]
   isExpanded: boolean
   onToggle: () => void
   onChange: (instance: ImChannelInstanceConfig) => void
+  /** Rebinding goes through main so its validation applies to both binding surfaces. */
+  onRebind: (appId: string) => void
   onDelete: () => void
 }
 
@@ -82,9 +87,11 @@ export function WeixinIlinkInstanceCard({
   instance,
   status,
   automationApps,
+  teams,
   isExpanded,
   onToggle,
   onChange,
+  onRebind,
   onDelete,
 }: WeixinIlinkInstanceCardProps) {
   const { t } = useTranslation()
@@ -201,13 +208,12 @@ export function WeixinIlinkInstanceCard({
     })
   }, [stopPolling, instance])
 
-  const handleAppChange = useCallback((appId: string) => {
-    onChange({ ...instance, appId })
-  }, [instance, onChange])
-
-  // Resolve bound app name
-  const boundApp = automationApps.find(a => a.id === instance.appId)
-  const displayName = boundApp?.spec.name || t('Not bound')
+  // Same split as MessageChannelsSection: a digital-human target is validated by
+  // main's rebind; a team target has no validator yet and takes a config write.
+  const handleTargetChange = useCallback((target: ChannelBackendValue) => {
+    if (target.teamId) onChange({ ...instance, ...target })
+    else onRebind(target.appId)
+  }, [instance, onChange, onRebind])
 
   const statusDot = !isEnabled
     ? 'bg-muted-foreground/30'
@@ -232,7 +238,9 @@ export function WeixinIlinkInstanceCard({
         <div className="flex items-center gap-2.5 min-w-0">
           <div className={`w-2 h-2 rounded-full flex-shrink-0 ${statusDot}`} />
           <div className="text-left min-w-0">
-            <p className="text-sm font-medium truncate">{displayName}</p>
+            <p className="text-sm font-medium truncate">
+              <ChannelBackendName value={instance} automationApps={automationApps} teams={teams} />
+            </p>
             <p className="text-[11px] text-muted-foreground truncate">
               {statusText}
             </p>
@@ -362,30 +370,12 @@ export function WeixinIlinkInstanceCard({
             )}
           </div>
 
-          {/* Digital Human selector */}
-          <div className="space-y-1">
-            <label className="text-sm text-muted-foreground">
-              {t('Digital Human')} <span className="text-red-400">*</span>
-            </label>
-            <div className="relative">
-              <Bot className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-              <select
-                value={instance.appId || ''}
-                onChange={(e) => handleAppChange(e.target.value)}
-                className="w-full bg-muted border border-border rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary appearance-none cursor-pointer"
-              >
-                <option value="">{t('Select digital human')}</option>
-                {automationApps.map(app => (
-                  <option key={app.id} value={app.id}>
-                    {app.spec.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {t('All messages from this Bot will be handled by this digital human')}
-            </p>
-          </div>
+          <ChannelBackendSelect
+            value={instance}
+            automationApps={automationApps}
+            teams={teams}
+            onChange={handleTargetChange}
+          />
         </div>
       )}
     </div>

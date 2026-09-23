@@ -7,7 +7,7 @@ import { dirname, join } from 'path'
 import { homedir } from 'os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'fs'
 import { v4 as uuidv4 } from 'uuid'
-import { getDataFolderName, getServiceDefaults } from './product-config'
+import { getDataFolderName, getProductFederationGatewayUrl, getServiceDefaults } from './product-config'
 
 // Import analytics config type
 import type { AnalyticsConfig } from '../services/analytics/types'
@@ -619,6 +619,9 @@ interface HaloConfig {
   system: {
     autoLaunch: boolean
   }
+  notifications?: {
+    taskComplete: boolean
+  }
   // Agent behavior configuration
   agent?: {
     maxTurns: number
@@ -630,10 +633,23 @@ interface HaloConfig {
     enableTeams?: boolean
     /** Enable Digital Humans MCP tools (automation app management) */
     enableDigitalHumans?: boolean
+    /** Master switch for Cross-Conversation Interop (conversation_read/conversation_send). Undefined/true = on. */
+    enableConversationInterop?: boolean
+    /** Sub-switch, only meaningful when enableConversationInterop is on: false = read-only (no conversation_send). */
+    enableConversationSend?: boolean
     /** Tools disabled by user (Extended Capabilities toggles) */
     disabledTools?: string[]
     /** Developer: enable verbose diagnostic logging (HTTP payloads, session lifecycle, stream events, scheduler) */
     developerMode?: boolean
+    /** Team member turn timeout in ms. Overrides the built-in default when set. */
+    teamTurnTimeoutMs?: number
+    /** Team circuit breaker overrides (per-epoch limits). Unset fields fall back to defaults. */
+    teamCircuitLimits?: {
+      maxMessages?: number
+      maxForwardDepth?: number
+    }
+    /** Cap on team member turns running at once on this machine. Overrides the built-in default when set. */
+    teamMaxConcurrentTurns?: number
   }
   remoteAccess: {
     enabled: boolean
@@ -692,7 +708,6 @@ interface HaloConfig {
   analytics?: AnalyticsConfig
   // Global layout preferences (panel sizes and visibility)
   layout?: {
-    sidebarOpen?: boolean
     sidebarWidth?: number
     artifactRailWidth?: number
   }
@@ -775,6 +790,15 @@ interface HaloConfig {
      * Issue #124.
      */
     userAgent?: string
+  }
+  // Office federation configuration
+  federation?: {
+    /**
+     * Federation gateway base URL used to relay office collaboration across
+     * networks. Empty/undefined falls back to the product.json default; no
+     * default anywhere = pure-LAN behaviour.
+     */
+    gatewayUrl?: string
   }
 }
 
@@ -1309,16 +1333,23 @@ export function getConfig(): HaloConfig {
   }
 }
 
+/**
+ * Patch accepted by `saveConfig`. `api` is deep-merged onto the stored value,
+ * so a caller may send only the credential fields it is changing.
+ */
+type HaloConfigPatch = Partial<Omit<HaloConfig, 'api'>> & { api?: Partial<HaloConfig['api']> }
+
 // Save configuration
-export function saveConfig(config: Partial<HaloConfig>): HaloConfig {
+export function saveConfig(config: HaloConfigPatch): HaloConfig {
   const currentConfig = getConfig()
-  const newConfig = { ...currentConfig, ...config }
+  const newConfig: HaloConfig = {
+    ...currentConfig,
+    ...config,
+    api: { ...currentConfig.api, ...config.api }
+  }
   const previousAiSourcesSignature = getAiSourcesSignature(currentConfig.aiSources)
 
   // Deep merge for nested objects
-  if (config.api) {
-    newConfig.api = { ...currentConfig.api, ...config.api }
-  }
   if (config.permissions) {
     newConfig.permissions = { ...currentConfig.permissions, ...config.permissions }
   }
@@ -1388,6 +1419,10 @@ export function saveConfig(config: Partial<HaloConfig>): HaloConfig {
         }
       })
     }
+  }
+  // federation: shallow merge (gatewayUrl, future fields)
+  if (config.federation !== undefined) {
+    newConfig.federation = { ...currentConfig.federation, ...config.federation }
   }
 
   const configPath = getConfigPath()
@@ -1542,4 +1577,15 @@ export function setAutoLaunch(enabled: boolean): void {
 export function getAutoLaunch(): boolean {
   const settings = app.getLoginItemSettings()
   return settings.openAtLogin
+}
+
+/**
+ * Effective federation gateway URL: user config first, then the product.json
+ * default. Null when neither is set (pure-LAN behaviour).
+ */
+export function getFederationGatewayUrl(): string | null {
+  const user = getConfig().federation?.gatewayUrl?.trim()
+  if (user) return user
+  const product = getProductFederationGatewayUrl()?.trim()
+  return product || null
 }

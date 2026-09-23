@@ -18,6 +18,9 @@ import { sendToRenderer } from '../../foundation/window.service'
 import { notifyAppEvent } from '../../services/notification.service'
 import { getOutputDir } from '../../services/space-scope'
 import { reclaimReportedFile } from './report-output'
+import { getActiveTeamRuntime } from './team'
+import { oneLineExcerpt } from './text-truncate'
+import type { TeamTriggerContext } from '../../../shared/apps/team-types'
 
 // ============================================
 // Types
@@ -35,6 +38,10 @@ export interface ReportToolContext {
   notificationLevel?: 'all' | 'important' | 'none'
   /** Space owning this run; bounds where reported files may live. */
   spaceId?: string
+  /** Absolute path to the plans directory for file-based data_path guidance */
+  plansDir?: string
+  /** Drives team-specific report routing when present. */
+  teamContext?: TeamTriggerContext
 }
 
 /** Callback invoked when an escalation entry is created */
@@ -49,6 +56,46 @@ function textResult(text: string, isError = false) {
     content: [{ type: 'text' as const, text }],
     ...(isError ? { isError: true } : {}),
   }
+}
+
+const OPEN_QUESTION_EXCERPT = 80
+
+/**
+ * Both endings are now enforced by the runtime, which cuts the turn as soon as
+ * this call is complete (see escalation-cut.ts) — neither wording asks the model
+ * to cooperate. What still differs is what follows: a solo run is genuinely
+ * suspended on the answer, while a team member keeps being woken by teammate
+ * messages and periodic checks, and one told otherwise reads the next unrelated
+ * wake as the answer it was promised.
+ */
+function resumeExpectation(inTeamTurn: boolean): string {
+  return inTeamTurn
+    ? 'This turn ends here. The question stays open until the user answers it; ' +
+      'you may still be woken for other work meanwhile, and the answer will ' +
+      'arrive as its own wake quoting the question it belongs to.'
+    : 'The user has been notified. This run ends here and resumes with ' +
+      'their answer.'
+}
+
+/**
+ * People answer in their own order, so a new question does not replace an
+ * earlier one. Naming what is still outstanding lets the model fold the new ask
+ * into an old one, or say plainly that it supersedes it.
+ */
+function describeOpenQuestions(store: ActivityStore, context: ReportToolContext, exceptEntryId: string): string {
+  const others = store
+    .getAllPendingEscalations()
+    .filter((e) => e.appId === context.appId && e.id !== exceptEntryId &&
+      (context.teamContext
+        ? e.content.teamContext?.teamId === context.teamContext.teamId && e.content.teamContext?.epochId === context.teamContext.epochId
+        : !e.content.teamContext && e.runId === context.runId))
+  if (others.length === 0) return ''
+
+  const quoted = others
+    .map((e) => `"${oneLineExcerpt(e.content.question || e.content.summary, OPEN_QUESTION_EXCERPT)}"`)
+    .join('; ')
+  return ` You also have ${others.length} earlier question(s) still unanswered: ${quoted}.` +
+    ' If this new one replaces or absorbs any of them, say so in it.'
 }
 
 // ============================================
@@ -74,18 +121,25 @@ export function createReportToolServer(
   const baseDescription =
     'Write an entry to the Activity Thread so the user knows what happened. ' +
     'ALWAYS call this at the end of every execution.\n\n' +
-    'Example call: { "type": "run_complete", "summary": "💧 Time to drink water! Stay hydrated." }\n\n' +
-    'type values:\n' +
-    '- "run_complete": Task finished (use this most of the time)\n' +
-    '- "run_skipped": Nothing to do this time\n' +
-    '- "milestone": Important finding mid-task\n' +
-    '- "escalation": Need user decision before continuing\n' +
-    '- "output": Produced a file or report\n\n' +
-    'For escalation: also provide "question" field. After escalation, stop execution.\n\n' +
-    'For detailed content (plans, proposals, long reports):\n' +
-    '1. Write content to a .md file first (use Write tool)\n' +
-    '2. Pass the absolute file path as data_path\n' +
-    'This keeps the tool call lightweight and lets you Edit the file for revisions.'
+    '`message` is what the user reads — plain markdown, written for a human.\n' +
+    'For an escalation, `message` IS the question: one concrete thing to decide.\n' +
+    'Add `choices` when the answers are obvious. End your turn after the call.\n' +
+    'Need several decisions? Ask for them in ONE call: put a one-line framing in ' +
+    '`message` and the decisions in `questions`. The user answers them together, ' +
+    'so splitting them across calls interrupts them once per question.\n\n' +
+    'type:\n' +
+    '- run_complete — the run finished and needs nothing from the user. ' +
+    'Errors count too: say what broke.\n' +
+    '- run_skipped — there was nothing to run this time.\n' +
+    '- milestone — notifies the user of an important event; the run continues.\n' +
+    '- escalation — a human decision or approval is required. ' +
+    'The run ends at this call and resumes when the user answers, so ask for ' +
+    'everything you need first.\n' +
+    '- output — a file or report was produced; say what it is and where.\n\n' +
+    'App instructions that say to alert or notify the user about something mean ' +
+    'a milestone or an escalation, not a line in the final report.\n\n' +
+    'Plans, proposals and long reports go in a .md file: pass its absolute path ' +
+    'as `data_path` and Edit that file to revise.'
 
   // Name the directory explicitly: the model has no way to infer which paths
   // the user's readers can reach.
@@ -106,9 +160,14 @@ export function createReportToolServer(
         'escalation',
         'output',
       ]).describe(
-        'Entry type. Use "run_complete" for normal task completion. REQUIRED — must be one of the listed values.'
+        'Entry type. Use "run_complete" for normal task completion, or pick by ' +
+        'what the entry needs from the user. The five values are described in ' +
+        'the tool description.'
       ),
-      summary: z.string().describe(
+      // Optional in the schema so a missing value reaches the handler, which can
+      // answer with an instruction the model acts on rather than a schema dump.
+      // The requirement itself is carried by the description.
+      message: z.string().optional().describe(
         'REQUIRED. Briefly tell the user what happened in clear markdown. ' +
         'Example: "💧 Drink water reminder: Stay hydrated! It\'s been 1 hour since your last reminder." ' +
         'Do not include raw JSON or code blocks — unless the user explicitly requires it.'
@@ -121,11 +180,21 @@ export function createReportToolServer(
         'Use this instead of "data" for detailed plans, proposals, or long reports. ' +
         'To revise content later, Edit the file and re-escalate with the same path.'
       ),
-      question: z.string().optional().describe(
-        'Only for escalation: the question to ask the user.'
-      ),
       choices: z.array(z.string()).optional().describe(
-        'Only for escalation: preset answer choices (user can also type freely).'
+        'Only for escalation: preset answer choices (user can also type freely). ' +
+        'Ignored when `questions` is used — each question carries its own.'
+      ),
+      questions: z.array(
+        z.object({
+          question: z.string().describe('One concrete thing to decide.'),
+          choices: z.array(z.string()).optional().describe(
+            'Preset answers for this question (user can also type freely).'
+          ),
+        })
+      ).optional().describe(
+        'Only for escalation, and only when you need MORE THAN ONE decision. ' +
+        '`message` then becomes a one-line framing of why you are asking, and ' +
+        'these are the decisions. The user answers all of them at once.'
       ),
     },
     async (input) => {
@@ -133,31 +202,48 @@ export function createReportToolServer(
       const now = Date.now()
       const runTag = runContext.runId.slice(0, 8)
 
-      // DEBUG: dump raw input to diagnose SDK tool input delivery
-      console.log(
-        `[Runtime][${runTag}] report_to_user RAW input: ${JSON.stringify(input)}`
-      )
+      // `message` is optional in the schema so that its absence lands here
+      // instead of being rejected upstream as a schema dump the model cannot
+      // act on. Nothing is written: the run has not been reported yet, and a
+      // placeholder entry would spend the user's attention on nothing.
+      if (!input.message) {
+        return textResult(
+          'No message was sent. `message` is what the user reads in the ' +
+          'Activity Thread — required on every call. Call again with it.',
+          true
+        )
+      }
 
-      // Defensive defaults: SDK tool() does not enforce Zod at runtime,
-      // non-Anthropic models may omit required fields.
+      // Non-Anthropic models occasionally send a type outside the enum.
       const VALID_TYPES = ['run_complete', 'run_skipped', 'milestone', 'escalation', 'output'] as const
       const safeType = (VALID_TYPES as readonly string[]).includes(input.type)
         ? input.type
         : 'run_complete'
-      const safeSummary = input.summary ?? 'Task completed.'
 
-      const summaryPreview = safeSummary.slice(0, 80)
+      // Only an escalation offers the user a way to answer, so questions on any
+      // other type are dropped. A blank one is dropped for the same reason: it
+      // would render a row the Send button then waits on forever.
+      const askedQuestions =
+        safeType === 'escalation'
+          ? (input.questions ?? [])
+              .filter((q) => typeof q?.question === 'string' && q.question.trim().length > 0)
+              .map((q) => ({
+                question: q.question.trim(),
+                ...(q.choices?.length ? { choices: q.choices } : {}),
+              }))
+          : []
+
       console.log(
         `[Runtime][${runTag}] report_to_user called: type=${safeType}${input.type !== safeType ? ` (original: ${input.type})` : ''}, ` +
-        `summary="${summaryPreview}"` +
+        `message="${input.message.slice(0, 80)}"` +
         (input.data_path ? `, data_path="${input.data_path}"` : '') +
-        (input.question ? `, question="${input.question.slice(0, 60)}"` : '') +
-        (input.choices ? `, choices=${input.choices.length}` : '')
+        (input.choices ? `, choices=${input.choices.length}` : '') +
+        (askedQuestions.length ? `, questions=${askedQuestions.length}` : '')
       )
 
       // Build content
       const content: ActivityEntryContent = {
-        summary: safeSummary,
+        summary: input.message,
       }
 
       // Map type to status
@@ -172,8 +258,47 @@ export function createReportToolServer(
       if (input.data_path) {
         content.dataPath = await reclaimReportedFile(input.data_path, runContext.spaceId)
       }
-      if (input.question) content.question = input.question
-      if (input.choices) content.choices = input.choices
+      // With several questions each carries its own choices and `message` is
+      // the framing, so a top-level `choices` has no question to belong to.
+      if (input.choices && askedQuestions.length === 0) content.choices = input.choices
+      if (askedQuestions.length > 0) content.questions = askedQuestions
+
+      // ── Team-channel routing ────────────────────────────────────────────────
+      // In a team turn, report_to_user keeps its ORIGINAL purpose: escalation
+      // (human decision) + optional audit entries. It does NOT carry the result —
+      // the result is the turn's FINAL MESSAGE, captured by the runtime (onReply).
+      //
+      // A member asking for a human decision always reaches the human. The team's
+      // escalation preference shapes the prompt (take it to the lead first), it
+      // does not intercept here: silently redirecting a member that asked for a
+      // person left the question answered in two places at once, while the member
+      // itself had already stopped waiting for either answer.
+      const team = runContext.teamContext
+      if (team) {
+        content.teamContext = { teamId: team.teamId, epochId: team.epochId, ...(team.taskId ? { taskId: team.taskId } : {}) }
+        const snapshot = getActiveTeamRuntime()?.describeTaskSource?.(team.teamId, team.epochId)
+        content.source = {
+          kind: 'team', appId: runContext.appId, teamId: team.teamId, epochId: team.epochId,
+          memberId: runContext.appId, taskId: team.taskId, sessionKey: runContext.sessionKey,
+          ...(snapshot ?? {}),
+        }
+      }
+      if (team && safeType === 'escalation') {
+        const reportText = input.data ? `${input.message}\n\n${input.data}` : input.message
+        // Tag the escalation entry so the team view aggregates it.
+        content.teamContext = {
+          teamId: team.teamId,
+          epochId: team.epochId,
+          ...(team.taskId ? { taskId: team.taskId } : {}),
+        }
+        getActiveTeamRuntime()?.captureReport(team.correlationId, {
+          kind: 'escalation',
+          content: reportText,
+        })
+      }
+      // Non-escalation reports in a team turn fall through to the normal path:
+      // they write an ordinary (audit) activity entry and do NOT affect the team
+      // result (which is the turn's final message).
 
       // Persist + broadcast the entry
       const entry: ActivityEntry = {
@@ -185,23 +310,68 @@ export function createReportToolServer(
         sessionKey: runContext.sessionKey,
         content,
       }
+      let persisted = true
       try {
-        emitEntry ? emitEntry(entry) : store.insertEntry(entry)
+        if (emitEntry) {
+          // Automation path: the entry is also how the user receives the report,
+          // so a failure here is a real delivery failure — surface it.
+          emitEntry(entry)
+        } else {
+          // Chat/team path: this is an audit copy only, delivered via the turn's
+          // final message / team capture / desktop notification below. Never
+          // abort the turn on a persistence error here (previously left a stuck
+          // member believing escalation was broken).
+          store.insertEntry(entry)
+        }
       } catch (err) {
+        persisted = false
         console.error('[Runtime] Failed to insert activity entry:', err)
-        return textResult(`Failed to save report: ${err instanceof Error ? err.message : String(err)}`, true)
+        if (emitEntry) {
+          return textResult(`Failed to save report: ${err instanceof Error ? err.message : String(err)}`, true)
+        }
+      }
+
+      if (persisted && team) {
+        try {
+          const runtime = getActiveTeamRuntime()
+          if (!runtime) throw new Error('Team runtime is unavailable')
+          const reportText = input.data ? `${input.message}\n\n${input.data}` : input.message
+          runtime.blackboard.postActivity({
+            id: safeType === 'escalation' ? `decision-request:${entryId}` : `report:${entryId}`,
+            teamId: team.teamId,
+            epochId: team.epochId,
+            kind: safeType === 'escalation' ? 'decision' : 'finding',
+            actorAppId: runContext.appId,
+            subject: oneLineExcerpt(input.message, 80),
+            body: reportText,
+            status: safeType === 'escalation' ? 'escalation' : 'ok',
+            refId: entryId,
+          })
+        } catch (error) {
+          console.error('[Runtime] Report could not be added to shared task history', {
+            appId: runContext.appId,
+            entryId,
+            teamId: team.teamId,
+            epochId: team.epochId,
+            error,
+          })
+        }
       }
 
       console.log(`[Runtime][${runTag}] Activity entry created: type=${safeType}, app=${runContext.appId}, entry=${entryId}`)
 
-      // Send system desktop notification based on notification level
+      // Send system desktop notification based on notification level.
       const level = runContext.notificationLevel ?? 'important'
       const shouldNotify =
         level === 'all' ||
         (level === 'important' && (safeType === 'escalation' || safeType === 'milestone' || safeType === 'output'))
       if (shouldNotify) {
-        notifyAppEvent(runContext.appName, safeSummary, {
+        notifyAppEvent(runContext.appName, input.message, {
           appId: runContext.appId,
+          entryId: entry.id,
+          runId: team ? undefined : entry.runId,
+          teamId: team?.teamId,
+          epochId: team?.epochId,
           // External channels are now AI-driven via notify_channel tool
         })
       }
@@ -212,24 +382,25 @@ export function createReportToolServer(
           onEscalation(entryId)
         }
 
-        // Broadcast escalation event for real-time UI update
-        broadcastToAll('app:escalation:new', {
+        // Broadcast escalation event for real-time UI update. Carry team context
+        // when this is a team escalation so team-aware consumers can attribute it
+        // (the team view also reacts via the team:updated status change).
+        const escalationEvent = {
           appId: runContext.appId,
           entryId,
-          question: input.question ?? content.summary,
+          question: content.summary,
           choices: input.choices ?? [],
-        })
-        sendToRenderer('app:escalation:new', {
-          appId: runContext.appId,
-          entryId,
-          question: input.question ?? content.summary,
-          choices: input.choices ?? [],
-        })
+          ...(content.teamContext
+            ? { teamId: content.teamContext.teamId, epochId: content.teamContext.epochId }
+            : {}),
+        }
+        broadcastToAll('app:escalation:new', escalationEvent)
+        sendToRenderer('app:escalation:new', escalationEvent)
 
         return textResult(
           `Escalation sent to user (entry: ${entryId}). ` +
-          'The user has been notified. End this run now — you will be ' +
-          'resumed with the user\'s response once they reply.'
+          resumeExpectation(!!team) +
+          describeOpenQuestions(store, runContext, entryId)
         )
       }
 

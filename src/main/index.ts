@@ -21,6 +21,11 @@ const isDev = process.env.NODE_ENV === 'development'
 log.transports.file.level = 'info'           // Always log info+ to file
 log.transports.console.level = isDev ? 'debug' : 'info'
 log.transports.file.maxSize = 5 * 1024 * 1024 // 5MB per file, auto-rotate
+// Default is sync fs.writeFileSync per line, which blocks the main process
+// event loop (and every window with it) on every log call. Async queues
+// writes instead. Must be set before the first log call: the file object
+// caches this at creation and ignores later changes.
+log.transports.file.sync = false
 
 // Catch unhandled errors and log them.
 // Use onError callback to suppress benign/transient errors — returning false prevents
@@ -103,7 +108,7 @@ net.setDefaultAutoSelectFamily(false)
 // Executed after page load to avoid blocking startup
 // Note: fix-path is ESM-only, loaded dynamically to support both CJS and ESM builds
 
-import { app, autoUpdater as nativeAutoUpdater, BrowserWindow, Menu, crashReporter } from 'electron'
+import { app, autoUpdater as nativeAutoUpdater, BrowserWindow, Menu, crashReporter, nativeImage } from 'electron'
 import open from 'open'
 
 // GPU compatibility: Disable hardware acceleration on Windows to prevent blank window issues
@@ -127,15 +132,20 @@ app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled')
 // Must be called before app.whenReady() and requestSingleInstanceLock() so that
 // each build variant (e.g. Halo vs Halo-Enterprise) uses its own userData directory.
 // This isolates cookies, sessions, localStorage, Claude SDK config, etc.
-import { getDataFolderName, DEFAULT_DATA_FOLDER_NAME } from './foundation/product-config'
+import { getDataFolderName, DEFAULT_DATA_FOLDER_NAME, getMacIconPath } from './foundation/product-config'
 import { isHostnameTrustedForCertificates } from './services/browser-policy.service'
 import { join as joinPath } from 'path'
+import { isolateLogPath, logFatal } from './foundation/logging'
 const dataFolderName = getDataFolderName()
 if (dataFolderName !== DEFAULT_DATA_FOLDER_NAME) {
   const appDataPath = app.getPath('appData')
   app.setPath('userData', joinPath(appDataPath, dataFolderName))
   console.log(`[Main] userData isolated to: ${joinPath(appDataPath, dataFolderName)}`)
 }
+
+// Log path isolation (per-variant / per-cluster-node) — see
+// foundation/logging/log-isolation.ts for the rules. Must run pre-ready.
+isolateLogPath(app)
 
 // Single instance lock: Prevent multiple instances of the application
 // Must be called before app.whenReady()
@@ -152,7 +162,10 @@ if (!gotTheLock) {
 
 // Handle second-instance event (when user tries to launch another instance)
 // Note: This event only fires on the primary instance
-app.on('second-instance', () => {
+app.on('second-instance', (_event, argv) => {
+  // Windows/Linux deliver halo:// deep links via the second instance's argv.
+  handleDeepLinkArgv(argv)
+
   // Focus the existing window when a second instance is launched
   if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow()
@@ -175,6 +188,10 @@ app.on('second-instance', () => {
     app.dock?.show()
   }
 })
+
+// halo:// deep links (office invites): register the protocol handler + macOS
+// open-url listener before ready — a link click can be what launches the app.
+registerDeepLinkHandling()
 
 // Trust certificates for hosts covered by built-in browser allowlist domain
 // patterns (never user custom entries or CIDR ranges — see
@@ -205,6 +222,7 @@ import { initializeApp } from './foundation/config.service'
 import { applyDisplayScale, currentDisplayScale, nudgeDisplayScale, setDisplayScale, DISPLAY_STEP, registerDisplayHandlers } from './services/display.service'
 import { flushAllPendingIndexWrites } from './services/conversation.service'
 import { shutdownRemoteAccess } from './services/remote'
+import { registerDeepLinkHandling, handleDeepLinkArgv } from './services/deep-link.service'
 import { stopOpenAICompatRouter } from './openai-compat-router'
 import { manualCheckForUpdates } from './services/updater.service'
 import { initAnalytics } from './services/analytics'
@@ -401,15 +419,28 @@ function createWindow(): void {
     // macOS: hiddenInset for traffic lights in content area
     // Windows/Linux: hidden + titleBarOverlay for native buttons overlay
     titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
-    // Fine-tuned for visual alignment with 40px header
-    trafficLightPosition: isMac ? { x: 15, y: 11 } : undefined,
-    // Windows/Linux: native window controls overlay in content area
+    // Vertically centered on the dedicated clearance strip rendered above
+    // the whole NavRail+Header row (MAC_TRAFFIC_LIGHT_CLEARANCE_PX in
+    // App.tsx). y is the top of the traffic-light button group, not its
+    // center — the true group height isn't documented/queryable, so this is
+    // tuned empirically rather than derived from a formula. That strip (not
+    // NavRail) compensates for zoom via --display-scale.
+    trafficLightPosition: isMac ? { x: 8, y: 6 } : undefined,
+    // Windows/Linux: native window controls overlay in content area.
+    // Matches globals.css's dark-theme `--background`/`--foreground`
+    // (the default theme) exactly, for the brief window before the renderer
+    // loads and calls setTitleBarOverlay with the live (possibly light)
+    // theme's actual tokens — see App.tsx's applyTheme.
     titleBarOverlay: !isMac ? {
-      color: '#0a0a0a',
-      symbolColor: '#ffffff',
-      height: 40
+      color: '#0c0e12',
+      symbolColor: '#e7e9ee',
+      // One pixel short of Header's actual 48px height (h-12): tall enough
+      // to vertically center the caption buttons in it, but leaves the
+      // header's own 1px bottom border un-overpainted by the overlay's
+      // opaque fill so it doesn't visually vanish under the buttons.
+      height: 47
     } : undefined,
-    backgroundColor: '#0a0a0a',
+    backgroundColor: '#0c0e12',
     webPreferences: {
       preload: join(__dirname, '../preload/index.mjs'),
       sandbox: false,
@@ -526,6 +557,14 @@ app.whenReady().then(async () => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.halo.app')
 
+  // Preview the brand-correct Dock icon in unpackaged dev builds. Packaged
+  // builds get their icon baked into the .app by electron-builder and don't
+  // need this — without it, dev mode just shows Electron's default icon.
+  if (!app.isPackaged && process.platform === 'darwin') {
+    const icon = nativeImage.createFromPath(getMacIconPath())
+    if (!icon.isEmpty()) app.dock?.setIcon(icon)
+  }
+
   // Register custom protocols (halo-file://, etc.)
   registerProtocols()
 
@@ -554,7 +593,7 @@ app.whenReady().then(async () => {
     await bootServerMode().catch((err) => {
       // Fail fast with a non-zero exit so the orchestrator restarts the
       // container instead of leaving a process up with no HTTP server.
-      console.error('[ServerMode] fatal boot error, exiting:', (err as Error)?.stack || err)
+      logFatal('[ServerMode] fatal boot error, exiting:', (err as Error)?.stack || err)
       app.exit(1)
     })
     return
@@ -565,6 +604,11 @@ app.whenReady().then(async () => {
 
   // Create window first (before analytics, so Baidu provider can find the window)
   createWindow()
+
+  // Windows/Linux cold start FROM a halo:// link: the URL rides this process's
+  // own argv (no second instance exists yet). Buffered until the renderer pulls
+  // it via team:consume-pending-invite.
+  handleDeepLinkArgv(process.argv)
 
   // ========================================
   // PHASED INITIALIZATION

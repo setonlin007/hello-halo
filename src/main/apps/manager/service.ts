@@ -41,7 +41,7 @@ import {
   McpCommandBlockedError,
 } from './errors'
 import { isMcpCommandBlocked } from '../../services/security-policy'
-import { seedAppKnowledgeBases } from '../../services/tlon'
+import { seedAppKnowledgeBases, unbindAppFromAllKBs } from '../../services/tlon'
 import type { McpAppChange } from '../../services/app-bridge'
 import { syncSkillToFilesystem, removeSkillFromFilesystem } from './skill-sync'
 import { withSkillMdName } from '../../../shared/skill-frontmatter'
@@ -216,6 +216,8 @@ export function createAppManagerService(deps: AppManagerDeps): AppManagerService
    * Global: {haloDir}/apps/{appId}/
    */
   function resolveWorkDir(appId: string, spaceId: string | null): string {
+    const app = store.getById(appId)
+    if (app?.dataPath) return app.dataPath
     if (spaceId === null) {
       return join(getGlobalAppDir(), 'apps', appId)
     }
@@ -603,6 +605,11 @@ export function createAppManagerService(deps: AppManagerDeps): AppManagerService
         removeSkillFromFilesystem(app, getSpacePath)
       }
 
+      // The row is gone after this, so any KB still bound to it would be a
+      // dangling reference. Only done here (not on soft uninstall) — see
+      // unbindAppFromAllKBs's doc comment.
+      unbindAppFromAllKBs(appId)
+
       // Hard-delete the database record
       store.delete(appId)
 
@@ -727,14 +734,41 @@ export function createAppManagerService(deps: AppManagerDeps): AppManagerService
       store.updateConfig(appId, config)
     },
 
+    // Writes the spec, which is the only interval the scheduler reads. An
+    // earlier implementation stored it as a user override instead, so the
+    // settings panel and this API wrote to two different places and the
+    // override silently won.
     updateFrequency(appId: string, subscriptionId: string, frequency: string): void {
       const app = requireApp(appId)
-      const overrides = { ...app.userOverrides }
-      if (!overrides.frequency) {
-        overrides.frequency = {}
+      if (app.spec.type !== 'automation') {
+        throw new Error(`App ${appId} has no subscriptions to schedule`)
       }
-      overrides.frequency[subscriptionId] = frequency
-      store.updateOverrides(appId, overrides)
+
+      const subscriptions = app.spec.subscriptions ?? []
+      const index = subscriptions.findIndex(
+        (sub, i) => (sub.id ?? String(i)) === subscriptionId && sub.source.type === 'schedule'
+      )
+      if (index === -1) {
+        throw new Error(`Schedule subscription not found: ${appId}/${subscriptionId}`)
+      }
+
+      // Callers pass either an interval ("30m") or a cron expression
+      // ("0 8 * * *"). They occupy the same slot and are mutually exclusive, so
+      // the one not being set is cleared — a leftover would keep competing for
+      // the schedule. The spec's own validation rejects a malformed value.
+      const isInterval = /^\d+[smhd]$/.test(frequency.trim())
+      const schedule = isInterval
+        ? { every: frequency.trim(), cron: undefined }
+        : { every: undefined, cron: frequency.trim() }
+
+      const target = subscriptions[index]
+      const next = subscriptions.map((sub, i) =>
+        i === index
+          ? { ...sub, source: { ...target.source, config: { ...target.source.config, ...schedule } } }
+          : sub
+      )
+
+      service.updateSpec(appId, { subscriptions: next })
     },
 
     updateOverrides(appId: string, partial: Partial<InstalledApp['userOverrides']>): void {
@@ -884,6 +918,11 @@ export function createAppManagerService(deps: AppManagerDeps): AppManagerService
 
       const oldSpaceId = app.spaceId
 
+      // Freeze identity storage before the default environment can change.
+      if (app.spec.type === 'automation') {
+        store.pinDataPath(appId, resolveWorkDir(appId, oldSpaceId))
+      }
+
       // For skill apps: remove from the old FS location before updating the DB.
       // If the DB update fails below, the skill file is already gone — this is
       // acceptable because the DB is authoritative; a re-sync can restore the file.
@@ -936,6 +975,12 @@ export function createAppManagerService(deps: AppManagerDeps): AppManagerService
     getApp(appId: string): InstalledApp | null {
       return store.getById(appId)
     },
+
+    getStudioSummary(language, excludeIds) { return store.getStudioSummary(language, excludeIds) },
+
+    listPeopleDirectory(filter) { return store.listPeopleDirectory(filter) },
+
+    listPersonIdsByStatus(statuses) { return store.listPersonIdsByStatus(statuses) },
 
     listApps(filter?: AppListFilter): InstalledApp[] {
       return store.list(filter)
@@ -992,6 +1037,11 @@ export function createAppManagerService(deps: AppManagerDeps): AppManagerService
     getAppWorkDir(appId: string): string {
       const app = requireApp(appId)
       const workDir = resolveWorkDir(appId, app.spaceId)
+
+      if (app.dataPath && !existsSync(workDir)) {
+        console.warn('[AppManager] Pinned digital human storage is unavailable', { appId })
+        throw new Error('The digital human memory directory is unavailable. Restore it before continuing.')
+      }
 
       // Auto-create if missing (contract: returned path always exists)
       ensureDir(workDir)

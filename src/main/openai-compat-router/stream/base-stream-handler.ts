@@ -11,7 +11,7 @@ import { Readable } from 'node:stream'
 import type { Response as ExpressResponse } from 'express'
 import { jsonrepair } from 'jsonrepair'
 import { SSEWriter } from './sse-writer'
-import type { AnthropicStopReason, StreamToolCallState } from '../types'
+import type { AnthropicStopReason, AnthropicWebSearchResult, StreamToolCallState } from '../types'
 import { safeJsonParse } from '../utils'
 import { estimateUsageTokens } from '../utils/usage-estimator'
 import { createEmptyUsage, type NormalizedUsage } from '../converters/response/usage'
@@ -526,7 +526,7 @@ export abstract class BaseStreamHandler {
 
   protected writeWebSearchResult(
     toolUseId: string,
-    results: Array<{ type: string; url?: string; title?: string }>
+    results: AnthropicWebSearchResult[]
   ): void {
     if (this.isFinished) return
 

@@ -113,6 +113,12 @@ vi.mock('../../../../src/main/services/analytics/types', () => ({
 vi.mock('../../../../src/main/foundation/product-config', () => ({
   getImChannelsPermissionDefaults: vi.fn(() => ({})),
 }))
+vi.mock('../../../../src/main/apps/team', () => ({
+  getTeamStore: vi.fn(() => ({})),
+}))
+vi.mock('../../../../src/main/apps/runtime/team', () => ({
+  getActiveTeamRuntime: vi.fn(() => undefined),
+}))
 
 vi.mock('../../../../src/main/apps/manager', () => ({
   getAppManager: vi.fn(() => ({

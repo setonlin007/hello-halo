@@ -17,6 +17,8 @@ import { existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync } fr
 import { join } from 'path'
 import { jsonrepair } from 'jsonrepair'
 import { TRANSPARENT_TOOLS } from '../../services/agent/constants'
+import type { TeamTriggerContext } from '../../../shared/apps/team-types'
+import type { ImageAttachment, ImageMediaType } from '../../../shared/types/image-attachment'
 
 // ============================================
 // Types
@@ -30,6 +32,7 @@ export interface StoredEvent {
   type: string
   /** Whether this is a synthetic trigger message (not from SDK stream) */
   _isTrigger?: boolean
+  _teamOrigin?: Pick<TeamTriggerContext, 'kind' | 'correlationId'>
   /** The SDK message payload */
   message?: {
     role?: string
@@ -65,15 +68,6 @@ interface ThoughtsSummaryRecord {
   duration?: number
 }
 
-/** Image attachment record — matches renderer's ImageAttachment for bubble display */
-interface ImageRecord {
-  id: string
-  type: 'image'
-  mediaType: string
-  data: string
-  name?: string
-}
-
 /**
  * Message record returned to the renderer.
  * Matches renderer's Message interface so MessageItem renders correctly.
@@ -81,11 +75,13 @@ interface ImageRecord {
 interface MessageRecord {
   id: string
   role: 'user' | 'assistant'
+  metadata?: { teamTriggerKind?: string; correlationId?: string }
   content: string
   timestamp: string
   thoughts?: ThoughtRecord[]
   thoughtsSummary?: ThoughtsSummaryRecord
-  images?: ImageRecord[]
+  /** Images the user attached to this message (trigger records only) */
+  images?: ImageAttachment[]
 }
 
 // ============================================
@@ -100,7 +96,7 @@ export interface SessionWriter {
    * stored as base64 image blocks in the trigger content (same trade-off as
    * main-chat conversation JSON) so chat bubbles survive the JSONL reload.
    */
-  writeTrigger(content: string, images?: Array<{ mediaType: string; data: string; name?: string }>): void
+  writeTrigger(content: string, images?: ImageAttachment[], teamOrigin?: Pick<TeamTriggerContext, 'kind' | 'correlationId'>): void
 }
 
 /** Get the directory for run session files */
@@ -141,7 +137,7 @@ export function openSessionWriter(spacePath: string, appId: string, runId: strin
       appendLine({ _ts: new Date().toISOString(), ...event } as StoredEvent)
     },
 
-    writeTrigger(content, images): void {
+    writeTrigger(content, images, teamOrigin): void {
       const blocks: Array<Record<string, unknown>> = [{ type: 'text', text: content }]
       for (const img of images ?? []) {
         blocks.push({
@@ -154,6 +150,7 @@ export function openSessionWriter(spacePath: string, appId: string, runId: strin
         _ts: new Date().toISOString(),
         type: 'user',
         _isTrigger: true,
+        ...(teamOrigin ? { _teamOrigin: teamOrigin } : {}),
         message: { role: 'user', content: blocks },
       })
     },
@@ -309,6 +306,7 @@ export function convertEventsToMessages(events: StoredEvent[]): MessageRecord[] 
   // ── Text merge state (mirrors stream-processor.ts logic) ──
   // lastText holds the candidate final text for the current turn.
   // hadSubstantiveTool tracks whether a non-transparent tool appeared since lastText was set.
+  let teamMetadata: MessageRecord['metadata']
   let lastText = ''
   let lastTextTs = ''
   let hadSubstantiveTool = false
@@ -336,6 +334,7 @@ export function convertEventsToMessages(events: StoredEvent[]): MessageRecord[] 
     const record: MessageRecord = {
       id: `session-msg-${++msgIdx}`,
       role: 'assistant',
+      ...(teamMetadata ? { metadata: teamMetadata } : {}),
       content,
       timestamp: lastTextTs || lastThoughtTs || pendingResultTs || new Date().toISOString(),
     }
@@ -382,15 +381,17 @@ export function convertEventsToMessages(events: StoredEvent[]): MessageRecord[] 
         // Normal user message (trigger or escalation response).
         // Flush the current turn before showing the user message.
         flush()
+        teamMetadata = event._teamOrigin ? { teamTriggerKind: event._teamOrigin.kind ?? 'human_message', correlationId: event._teamOrigin.correlationId } : undefined
         const textContent = extractTextContent(content)
         // Image blocks become bubble attachments only for trigger records (our
         // own format) — SDK round-trip user events may carry image blocks that
         // are tool plumbing, not something the user attached.
-        const images = event._isTrigger ? extractImageRecords(content, msgIdx + 1) : []
+        const images = event._isTrigger ? extractImageAttachments(content, msgIdx + 1) : []
         if (textContent || images.length > 0) {
           messages.push({
             id: `session-msg-${++msgIdx}`,
             role: 'user',
+            ...(teamMetadata ? { metadata: teamMetadata } : {}),
             content: textContent,
             timestamp: ts,
             ...(images.length > 0 ? { images } : {}),
@@ -726,15 +727,20 @@ function extractTextContent(content: unknown): string {
     .join('')
 }
 
-/** Rebuild ImageRecords from base64 image blocks in a trigger record's content */
-function extractImageRecords(content: unknown, msgIdx: number): ImageRecord[] {
+/**
+ * Rebuild image attachments from base64 image blocks in a trigger record.
+ *
+ * `msgIdx` only seeds the bubble id — the stored block has no id of its own,
+ * so it just has to be stable within one read for React keys to hold.
+ */
+function extractImageAttachments(content: unknown, msgIdx: number): ImageAttachment[] {
   if (!Array.isArray(content)) return []
   return content
     .filter((b: any) => b.type === 'image' && b.source?.type === 'base64' && b.source.data)
     .map((b: any, i: number) => ({
       id: `session-img-${msgIdx}-${i}`,
       type: 'image' as const,
-      mediaType: b.source.media_type || 'image/png',
+      mediaType: (b.source.media_type || 'image/png') as ImageMediaType,
       data: b.source.data,
       ...(b._name ? { name: b._name } : {}),
     }))

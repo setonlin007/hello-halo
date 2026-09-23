@@ -65,7 +65,8 @@ describe.each(CASES)('$label category contract', ({ source, build, payload }) =>
 
   beforeEach(() => {
     adapter = build()
-    fetchMock = vi.fn(() => Promise.resolve(
+    fetchMock = vi.fn()
+    fetchMock.mockImplementation(() => Promise.resolve(
       new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } })
     ))
     vi.stubGlobal('fetch', fetchMock)

@@ -21,6 +21,7 @@ import { getConfig } from '../foundation/config.service'
 import { v4 as uuidv4 } from 'uuid'
 import type { FileChangesSummary } from '../../shared/file-changes'
 import type { KBSource } from '../../shared/types/tlon'
+import type { ImageAttachment } from '../../shared/types/image-attachment'
 
 // Re-export for existing consumers
 export type { FileChangesSummary } from '../../shared/file-changes'
@@ -50,17 +51,6 @@ interface Thought {
   }
 }
 
-type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
-
-interface ImageAttachment {
-  id: string
-  type: 'image'
-  mediaType: ImageMediaType
-  data: string
-  name?: string
-  size?: number
-}
-
 interface TokenUsage {
   inputTokens: number
   outputTokens: number
@@ -75,7 +65,7 @@ interface ThoughtsSummary {
   types: Partial<Record<ThoughtType, number>>
 }
 
-interface Message {
+export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
@@ -87,9 +77,26 @@ interface Message {
   tokenUsage?: TokenUsage
   metadata?: {
     fileChanges?: FileChangesSummary
+    /**
+     * Present on a message delivered by another conversation (role:'system',
+     * source:'cross-conversation'). fromConversationTitle is a snapshot taken
+     * at delivery time — the source may since be renamed or deleted, so the
+     * collapsed label falls back to it when the live title can't be resolved.
+     */
+    fromConversationId?: string
+    fromConversationTitle?: string
+    summary?: string
+    /**
+     * Audit trail: the correlation id (if this delivery was a `waitForReply`
+     * call) and the forward-chain depth it carried. Runtime forward-depth
+     * decisions read the in-memory tracking in circuit-breaker.ts, never this
+     * field — it exists for audit/UI display only.
+     */
+    correlationId?: string
+    forwardDepth?: number
   }
   error?: string  // Error message when assistant response failed (e.g., 429 rate limit)
-  source?: string  // How the message entered the conversation (e.g., 'injection')
+  source?: string  // How the message entered the conversation (e.g., 'injection', 'cross-conversation')
   sources?: KBSource[]  // Knowledge-base documents the agent Read this turn (clickable citations)
 }
 
@@ -120,7 +127,7 @@ export interface ConversationMeta {
   engineId?: 'anthropic' | 'halo' | 'codex' | null
 }
 
-interface Conversation extends ConversationMeta {
+export interface Conversation extends ConversationMeta {
   messages: Message[]
   sessionId?: string
   version?: number  // 2 = thoughts stored separately
@@ -879,6 +886,43 @@ export function addMessage(spaceId: string, conversationId: string, message: Omi
   touchSpaceActivity(spaceId)
 
   return newMessage
+}
+
+/**
+ * Patch one message by id — re-reads the current cached/on-disk state before
+ * touching it, and mutates only that one entry rather than replacing the
+ * whole `messages` array.
+ *
+ * This is NOT interchangeable with "read the conversation, splice a new
+ * array, write it back": that shape takes a SNAPSHOT of `messages`, and if
+ * another writer (e.g. the session consumer appending its own assistant
+ * placeholder via `addMessage` while a turn is running) writes in between the
+ * snapshot and the write-back, the snapshot's write silently reverts that
+ * other writer's entry — a real data loss, not a cosmetic race. Keying on the
+ * id and mutating the array `cachedRead` hands back (the same object every
+ * writer shares in-cache, per `cachedRead`'s cache-hit path) means this only
+ * ever touches its own entry, however many other entries were added around it.
+ */
+export function updateMessageById(
+  spaceId: string,
+  conversationId: string,
+  messageId: string,
+  patch: Partial<Omit<Message, 'id'>>
+): Message | null {
+  const result = cachedRead(spaceId, conversationId)
+  if (!result) return null
+
+  const { conversation, filePath, conversationsDir } = result
+  const index = conversation.messages.findIndex((m) => m.id === messageId)
+  if (index === -1) return null
+
+  conversation.messages[index] = { ...conversation.messages[index], ...patch }
+  conversation.updatedAt = new Date().toISOString()
+
+  cachedWrite(conversationId, conversation, filePath, conversationsDir, spaceId)
+  debouncedUpdateIndexEntry(conversationsDir, spaceId, conversationId, toMeta(conversation))
+
+  return conversation.messages[index]
 }
 
 /**

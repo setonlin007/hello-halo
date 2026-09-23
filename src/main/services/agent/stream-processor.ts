@@ -436,10 +436,9 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
   let drainStartTime: number | null = null
   const DRAIN_TIMEOUT_MS = 5_000  // Safety: force break if result never arrives
 
-  // [TEAM-DEBUG] Diagnostic tracking for post-result stream behavior
-  let resultReceivedAt: number | null = null  // Timestamp when first result arrived
-  let postResultEventCount = 0               // Events received AFTER result
-  let loopIterationCount = 0                 // Total loop iterations
+  let resultReceivedAt: number | null = null
+  let postResultEventCount = 0
+  let loopIterationCount = 0
 
   // Text block merge strategy:
   // AI sometimes splits its final reply across consecutive text blocks. We merge them.
@@ -546,17 +545,20 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
       continue
     }
 
-    // [TEAM-DEBUG] Log every message that arrives AFTER result to understand SDK stream lifecycle
+    // The SDK keeps emitting after `result`; how long it does so and what it
+    // sends is the only visibility into that tail.
     if (resultReceivedAt !== null) {
-      const msSinceResult = Date.now() - resultReceivedAt
-      const subtype = (sdkMessage as any).subtype ?? ''
-      const parentId = (sdkMessage as any).parent_tool_use_id ?? null
       postResultEventCount++
-      console.log(
-        `[TEAM-DEBUG][${conversationId}] POST-RESULT event #${postResultEventCount}` +
-        ` +${msSinceResult}ms | type=${sdkMessage.type}${subtype ? ` subtype=${subtype}` : ''}` +
-        `${parentId ? ` parent=${String(parentId).slice(0, 8)}` : ''}`
-      )
+      if (isDeveloperMode()) {
+        const msSinceResult = Date.now() - resultReceivedAt
+        const subtype = (sdkMessage as any).subtype ?? ''
+        const parentId = (sdkMessage as any).parent_tool_use_id ?? null
+        console.log(
+          `[Agent][${conversationId}] post-result event #${postResultEventCount}` +
+          ` +${msSinceResult}ms | type=${sdkMessage.type}${subtype ? ` subtype=${subtype}` : ''}` +
+          `${parentId ? ` parent=${String(parentId).slice(0, 8)}` : ''}`
+        )
+      }
     }
 
     // Notify caller of raw SDK message (for JSONL persistence in automation)
@@ -775,7 +777,9 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
               thought.isStreaming = false
             }
 
-            console.log(`[Agent][${conversationId}] Thinking block complete, length: ${blockState.content.length}`)
+            if (isDeveloperMode()) {
+              console.log(`[Agent][${conversationId}] Thinking block complete, length: ${blockState.content.length}`)
+            }
           } else if (blockState.type === 'tool_use') {
             // Tool use block complete - parse JSON and send final state
             let toolInput: Record<string, unknown> = {}
@@ -848,7 +852,9 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
           })
           // Update lastTextContent — currentStreamingText already contains merged consecutive blocks
           lastTextContent = currentStreamingText
-          console.log(`[Agent][${conversationId}] Text block completed, length: ${currentStreamingText.length}`)
+          if (isDeveloperMode()) {
+            console.log(`[Agent][${conversationId}] Text block completed, length: ${currentStreamingText.length}`)
+          }
         }
       }
 
@@ -943,7 +949,9 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
             incrementToolError(conversationId, toolUseThought?.toolName)
           }
 
-          console.log(`[Agent][${conversationId}] Tool result merged into thought ${toolUseThoughtId}`)
+          if (isDeveloperMode()) {
+            console.log(`[Agent][${conversationId}] Tool result merged into thought ${toolUseThoughtId}`)
+          }
         } else {
           // No mapping found - fall back to separate thought (shouldn't happen normally)
           sessionState.thoughts.push(thought)
@@ -958,7 +966,9 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
           if (thought.isError) {
             incrementToolError(conversationId, thought.toolName)
           }
-          console.log(`[Agent][${conversationId}] Tool result fallback (no mapping): ${thought.id}`)
+          if (isDeveloperMode()) {
+            console.log(`[Agent][${conversationId}] Tool result fallback (no mapping): ${thought.id}`)
+          }
         }
       } else {
         // Non tool_result thoughts - handle normally
@@ -1112,24 +1122,20 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
       receivedResult = true  // Mark that we received a result message
       resultReceivedAt = Date.now()
 
-      // [TEAM-DEBUG] Snapshot active team agents at result time
-      const teamThoughts = sessionState.thoughts.filter(
-        t => t.type === 'tool_use' && t.toolName === 'Agent' && (t.toolInput as any)?.team_name
-      )
-      if (teamThoughts.length > 0) {
-        const summary = teamThoughts.map(t =>
-          `${(t.toolInput as any)?.name ?? '?'}(${t.taskProgress?.status ?? 'no-task-started'})`
-        ).join(', ')
-        console.log(
-          `[TEAM-DEBUG][${conversationId}] result received at iteration #${loopIterationCount}` +
-          ` | team agents: [${summary}]` +
-          ` | subtype=${(sdkMessage as any).subtype ?? 'success'}`
+      // Which teammates were still mid-task when the turn ended — the shape a
+      // stalled team turn leaves behind.
+      if (isDeveloperMode()) {
+        const teamThoughts = sessionState.thoughts.filter(
+          t => t.type === 'tool_use' && t.toolName === 'Agent' && (t.toolInput as any)?.team_name
         )
-      } else {
+        const summary = teamThoughts.length > 0
+          ? `team agents: [${teamThoughts.map(t =>
+              `${(t.toolInput as any)?.name ?? '?'}(${t.taskProgress?.status ?? 'no-task-started'})`
+            ).join(', ')}]`
+          : 'no team agents in session'
         console.log(
-          `[TEAM-DEBUG][${conversationId}] result received at iteration #${loopIterationCount}` +
-          ` | no team agents in session` +
-          ` | subtype=${(sdkMessage as any).subtype ?? 'success'}`
+          `[Agent][${conversationId}] result received at iteration #${loopIterationCount}` +
+          ` | ${summary} | subtype=${(sdkMessage as any).subtype ?? 'success'}`
         )
       }
 

@@ -181,7 +181,7 @@ export function usePresetModels(params: UsePresetModelsParams): UsePresetModelsR
         return
       }
 
-      const data = await response.json()
+      const data = await response.json() as { data?: unknown } | null
       if (!isCurrent()) return
 
       if (!data || !Array.isArray(data.data)) {

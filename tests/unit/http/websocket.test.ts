@@ -37,8 +37,12 @@ vi.mock('uuid', () => {
 })
 
 const authenticateWebSocket = vi.fn()
+const parseCredentialType = vi.fn((_token: string) => 'remote-control')
+const verifyOfficeCredential = vi.fn(() => null)
 vi.mock('../../../src/main/http/auth/index', () => ({
   authenticateWebSocket: (...args: unknown[]) => authenticateWebSocket(...args),
+  parseCredentialType: (...args: unknown[]) => parseCredentialType(...args),
+  verifyOfficeCredential: (...args: unknown[]) => verifyOfficeCredential(...args),
 }))
 
 const terminalInput = vi.fn()

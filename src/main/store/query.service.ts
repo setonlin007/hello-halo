@@ -79,8 +79,8 @@ function rowToEntry(row: ItemRow): RegistryEntry & { _registryId: string } {
     requires_skills: row.requires_skills ? safeParse<string[]>(row.requires_skills, []) : undefined,
     created_at: row.created_at ?? undefined,
     updated_at: row.updated_at ?? undefined,
-    i18n: row.i18n ? safeParse<Record<string, { name?: string; description?: string }>>(row.i18n, undefined) : undefined,
-    meta: row.meta ? safeParse<Record<string, unknown>>(row.meta, undefined) : undefined,
+    i18n: row.i18n ? safeParse<Record<string, { name?: string; description?: string }> | undefined>(row.i18n, undefined) : undefined,
+    meta: row.meta ? safeParse<Record<string, unknown> | undefined>(row.meta, undefined) : undefined,
     _registryId: row.registry_id,
   }
 }

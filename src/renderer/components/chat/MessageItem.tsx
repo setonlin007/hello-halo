@@ -326,8 +326,8 @@ export const MessageItem = memo(function MessageItem({ message, previousCost = 0
     </div>
   ) : (
     <div
-      className={`rounded-2xl px-4 py-3 ${
-        isUser ? 'message-user' : 'message-assistant'
+      className={`rounded-lg text-sm ${
+        isUser ? 'message-user px-3.5 py-2.5' : 'message-assistant px-4 py-3'
       } ${isStreaming ? 'streaming-message' : ''} ${isWorking ? 'message-working' : ''} ${!isInContainer ? 'max-w-[85%]' : 'w-full'}`}
     >
       {/* Working indicator - shows when AI is working */}
@@ -381,6 +381,20 @@ export const MessageItem = memo(function MessageItem({ message, previousCost = 0
             <span className="text-sm font-medium">{t('Something went wrong')}</span>
           </div>
           <p className="mt-1.5 text-sm text-destructive/80">{message.error}</p>
+        </div>
+      )}
+
+      {/* A user message that failed to send carries a compact red marker so a
+          non-delivery is never mistaken for delivered — the bubble itself shows the
+          truth, not just a transient banner (WeChat-style failed indicator). */}
+      {isUser && message.error && (
+        <div className="mt-1.5 flex items-start gap-1.5 text-destructive">
+          <svg className="w-3.5 h-3.5 mt-0.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="8" x2="12" y2="12" />
+            <line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          <span className="text-xs leading-snug">{message.error}</span>
         </div>
       )}
 
