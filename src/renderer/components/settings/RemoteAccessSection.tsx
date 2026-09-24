@@ -14,7 +14,6 @@ import {
   type PasswordPolicyCode,
 } from '../../../shared/auth/password-policy'
 import type { RemoteAccessStatus } from './types'
-import type { HaloConfig } from '../../types'
 
 type TranslateFn = (text: string, options?: Record<string, unknown>) => string
 
@@ -41,12 +40,7 @@ function describePolicyFailure(codes: PasswordPolicyCode[], t: TranslateFn): str
   return t('Password must include: {{items}}', { items: fragments.join(', ') })
 }
 
-interface RemoteAccessSectionProps {
-  config: HaloConfig | null
-  setConfig: (config: HaloConfig) => void
-}
-
-export function RemoteAccessSection({ config, setConfig }: RemoteAccessSectionProps) {
+export function RemoteAccessSection() {
   const { t } = useTranslation()
 
   // Build-time security policy. While `null` (first fetch in flight)
@@ -70,11 +64,6 @@ export function RemoteAccessSection({ config, setConfig }: RemoteAccessSectionPr
   // re-toggling will succeed with a fresh PIN; the message tells the user
   // why their previously paired devices stopped working.
   const [enableError, setEnableError] = useState<string | null>(null)
-
-  // Federation gateway settings state
-  const [gatewayInput, setGatewayInput] = useState(config?.federation?.gatewayUrl || '')
-  const [gatewayError, setGatewayError] = useState<string | null>(null)
-  const [gatewaySaved, setGatewaySaved] = useState(false)
 
   // Change-address flow (revoke + re-issue a new permanent hostname)
   const [showReset, setShowReset] = useState(false)
@@ -170,35 +159,6 @@ export function RemoteAccessSection({ config, setConfig }: RemoteAccessSectionPr
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text)
-  }
-
-  const handleGatewaySave = async () => {
-    const value = gatewayInput.trim()
-    if (value) {
-      try {
-        const u = new URL(value)
-        const supported = ['http:', 'https:', 'ws:', 'wss:']
-        if (!supported.includes(u.protocol)) {
-          setGatewayError(t('Unsupported protocol. Use http://, https://, ws://, wss://'))
-          return
-        }
-      } catch {
-        setGatewayError(t('Invalid gateway URL. Example: https://gateway.example.com'))
-        return
-      }
-    }
-    setGatewayError(null)
-    try {
-      const updatedFederation = { ...config?.federation, gatewayUrl: value || undefined }
-      const updatedConfig = { ...config, federation: updatedFederation } as HaloConfig
-      await api.setConfig({ federation: updatedFederation })
-      setConfig(updatedConfig)
-      setGatewaySaved(true)
-      setTimeout(() => setGatewaySaved(false), 2000)
-    } catch (error) {
-      console.error('[RemoteAccessSection] Failed to save gateway URL:', error)
-      setGatewayError(t('Failed to save'))
-    }
   }
 
   const handleResetAddress = async () => {
@@ -564,33 +524,6 @@ export function RemoteAccessSection({ config, setConfig }: RemoteAccessSectionPr
             )}
           </>
         )}
-
-        {/* Federation Gateway */}
-        <div className="pt-4 border-t border-border space-y-2">
-          <p className="font-medium">{t('Federation Gateway')}</p>
-          <p className="text-sm text-muted-foreground">
-            {t('Relay team collaboration through a gateway server so members outside your local network can join. Leave empty for LAN-only teams.')}
-          </p>
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <input
-              type="text"
-              value={gatewayInput}
-              onChange={(e) => {
-                setGatewayInput(e.target.value)
-                setGatewayError(null)
-              }}
-              placeholder={t('https://gateway.example.com')}
-              className="flex-1 px-2 py-1 text-sm bg-input rounded border border-border focus:border-primary focus:outline-none"
-            />
-            <button
-              onClick={handleGatewaySave}
-              className="text-xs px-3 py-1.5 bg-primary text-primary-foreground rounded hover:bg-primary/90"
-            >
-              {gatewaySaved ? t('Saved') : t('Save')}
-            </button>
-          </div>
-          {gatewayError && <p className="text-xs text-red-500">{gatewayError}</p>}
-        </div>
       </div>
     </section>
   )

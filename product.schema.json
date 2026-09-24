@@ -281,6 +281,17 @@
       },
       "additionalProperties": false
     },
+    "federation": {
+      "type": "object",
+      "description": "Office federation defaults (enterprise/custom builds only). Omit the whole block to keep pure-LAN offices.",
+      "properties": {
+        "gatewayUrl": {
+          "type": "string",
+          "description": "Gateway that relays office collaboration between networks, used when the user has not set federation.gatewayUrl in config.json. Accepts http(s):// or ws(s)://."
+        }
+      },
+      "additionalProperties": false
+    },
     "registryOverrides": {
       "type": "object",
       "description": "Per-built-in-registry override map (enterprise/custom builds only). Keys are built-in registry IDs ('official', 'mcp-official', 'smithery', 'claude-skills', 'skillhub'). Each entry is merged on top of the built-in defaults during ensureBuiltinRegistries() on every startup. Omit any field to keep the built-in default. Open-source builds omit this entirely.",

@@ -375,6 +375,27 @@
     "path": "/api/wecom-bot/scan-auth/create-assistant"
   },
   {
+    "method": "POST",
+    "path": "/api/feishu-bot/scan-auth/start"
+  },
+  {
+    "method": "POST",
+    "path": "/api/feishu-bot/scan-auth/poll"
+  },
+  {
+    "method": "POST",
+    "path": "/api/feishu-bot/scan-auth/cancel"
+  },
+  {
+    "method": "POST",
+    "path": "/api/feishu-bot/scan-auth/create-assistant"
+  },
+  {
+    "method": "POST",
+    "path": "/api/feishu-bot/reachability",
+    "group": "channels"
+  },
+  {
     "method": "GET",
     "path": "/api/im-channels/status",
     "group": "channels"
@@ -756,6 +777,14 @@
   },
   {
     "method": "GET",
+    "path": "/api/teams/collab-for-conversation/:conversationId"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/save-collab"
+  },
+  {
+    "method": "GET",
     "path": "/api/teams/:teamId"
   },
   {
@@ -769,6 +798,10 @@
   {
     "method": "POST",
     "path": "/api/teams/:teamId/members/:appId/send"
+  },
+  {
+    "method": "POST",
+    "path": "/api/teams/:teamId/members/:appId/stop"
   },
   {
     "method": "GET",

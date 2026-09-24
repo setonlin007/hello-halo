@@ -37,18 +37,19 @@ import { isServerMode } from '../foundation/runtime-mode'
 import { isHttpLoggingEnabled, logHttpRequest, logHttpResponse, logHttpResponseBody } from '../foundation/logging'
 
 // ============================================================================
-// Preserve originals before any global patching
+// Baseline transports
 // ============================================================================
 
 /**
- * Original global fetch — captured before initGlobalProxy() patches globalThis.fetch.
- * Used internally in the DIRECT path to avoid infinite recursion.
+ * The DIRECT path's fetch.
+ *
+ * Nothing here patches `globalThis.fetch` or `https.globalAgent`: proxying is
+ * opt-in per call site. Plain `fetch()` and `node:https` in the main process
+ * therefore ignore both the app proxy and the system proxy — code that must
+ * honor them has to call `proxyFetch`, or take an agent from
+ * `resolveProxyAgent` when it owns its own transport.
  */
 const _originalFetch: typeof fetch = globalThis.fetch
-
-/** Default Node.js agents — restored when proxy is cleared */
-const _defaultHttpAgent = http.globalAgent
-const _defaultHttpsAgent = https.globalAgent
 
 // ============================================================================
 // Proxy Resolution Cache
@@ -503,6 +504,22 @@ function makeRequest(
     })
 
     nodeReq.on('error', reject)
+
+    // Honor init.signal on this path too. The DIRECT path gets abort for free
+    // from native fetch; without this, a caller that aborts a proxied request
+    // keeps waiting for a socket nobody is going to close.
+    const signal = init?.signal
+    if (signal) {
+      const onAbort = (): void => {
+        nodeReq.destroy(signal.reason instanceof Error ? signal.reason : new Error('Aborted'))
+      }
+      if (signal.aborted) {
+        onAbort()
+      } else {
+        signal.addEventListener('abort', onAbort, { once: true })
+        nodeReq.on('close', () => signal.removeEventListener('abort', onAbort))
+      }
+    }
 
     // Write request body
     if (init?.body != null) {

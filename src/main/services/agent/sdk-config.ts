@@ -33,6 +33,8 @@ import {
 } from '../../../shared/constants/model-runtime-limits'
 import { getActiveEngine } from './resolved-sdk'
 import { getDeviceIdentity } from '../../foundation/device-identity'
+import { applyOfficeRuntimeEnv } from '../office-runtime'
+import { buildRequestIdentity } from './request-identity-factory'
 
 // ============================================
 // Configuration
@@ -93,7 +95,7 @@ export interface SdkEnvParams {
   configDirMode?: 'halo' | 'cc' | 'custom'
   /** Custom config dir path (when configDirMode === 'custom') */
   customConfigDir?: string
-  /** Enable Agent Teams (multi-agent collaboration) */
+  /** Legacy setting retained for config compatibility; Halo Team MCP is always used. */
   enableTeams?: boolean
   /**
    * Resolved per-model capability numbers (preset + user override merged).
@@ -240,7 +242,7 @@ export interface BaseSdkOptionsParams {
   configDirMode?: 'halo' | 'cc' | 'custom'
   /** Custom config dir path (when configDirMode === 'custom') */
   customConfigDir?: string
-  /** Enable Agent Teams (multi-agent collaboration) */
+  /** Legacy setting retained for config compatibility; native CC Teams are disabled. */
   enableTeams?: boolean
   /** Tools disabled by user (Extended Capabilities toggles) */
   disabledTools?: string[]
@@ -266,7 +268,7 @@ export interface BaseSdkOptionsParams {
  */
 function buildDisallowedTools(
   userDisabledTools?: string[],
-  enableTeams?: boolean
+  _enableTeams?: boolean
 ): string[] {
   const set = new Set<string>()
 
@@ -274,10 +276,9 @@ function buildDisallowedTools(
   const effectiveDisabled = userDisabledTools ?? [...DEFAULT_DISABLED_TOOLS]
   for (const tool of effectiveDisabled) set.add(tool)
 
-  // When Agent Teams is off, also disable team-related tools
-  if (!enableTeams) {
-    for (const tool of TEAM_TOOLS) set.add(tool)
-  }
+  // Native CC Teams are intentionally unavailable. Halo's Team MCP is the
+  // only supported collaboration surface and is mounted by the broker.
+  for (const tool of TEAM_TOOLS) set.add(tool)
 
   return Array.from(set)
 }
@@ -428,16 +429,27 @@ export function computeCredentialsFingerprint(sdkOptions: Record<string, any>): 
  * exclude it here.
  */
 export function computeSessionInputsFingerprint(sdkOptions: Record<string, any>): string {
-  const mcpKeys = Object.keys(sdkOptions.mcpServers ?? {}).sort().join(',')
+  // List fields are JSON-encoded, not joined: a rule like `Bash(echo a,b)`
+  // contains the would-be separator, and any bare join lets two different rule
+  // sets collapse into one material (['a,b'] vs ['a','b']) — a collision that
+  // reads as "inputs unchanged" and reuses a session built on other rules.
+  const mcpKeys = JSON.stringify(Object.keys(sdkOptions.mcpServers ?? {}).sort())
   const prompt = typeof sdkOptions.systemPrompt === 'string' ? sdkOptions.systemPrompt : ''
   const permissionMode = String(sdkOptions.permissionMode ?? '')
   const disallowed = Array.isArray(sdkOptions.disallowedTools)
-    ? [...sdkOptions.disallowedTools].sort().join(',')
+    ? JSON.stringify([...sdkOptions.disallowedTools].sort())
+    : ''
+  // The auto-allow rules decide which calls the engine settles by itself and
+  // which reach the permission gate — including the command patterns a borrowed
+  // turn runs under. Left out, a narrowed policy would keep the previous turn's
+  // rules for as long as the session was reused.
+  const allowed = Array.isArray(sdkOptions.allowedTools)
+    ? JSON.stringify([...sdkOptions.allowedTools].sort())
     : ''
   const skipPermissions = sdkOptions.extraArgs
     ? String(sdkOptions.extraArgs['dangerously-skip-permissions'] ?? '')
     : ''
-  const material = [mcpKeys, prompt, permissionMode, disallowed, skipPermissions].join('\u0000')
+  const material = [mcpKeys, prompt, permissionMode, disallowed, allowed, skipPermissions].join('\u0000')
   return createHash('sha256').update(material).digest('hex').slice(0, 16)
 }
 
@@ -701,9 +713,8 @@ export function buildSdkEnv(params: SdkEnvParams): Record<string, string | numbe
     // Performance: skip file snapshot I/O (Halo doesn't expose /rewind)
     CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING: '1',
 
-    // Enable Agent Teams (multi-agent collaboration with named teammates)
-    // Only set when explicitly enabled via Settings > Advanced
-    ...(params.enableTeams ? { CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1' } : {}),
+    // Native CC Agent Teams stay disabled. Halo teams are exposed through the
+    // broker's `halo-team` MCP server instead of the opaque CC protocol.
 
     // Per-model runtime limits resolved from preset + user override.
     // - CLAUDE_CODE_MAX_OUTPUT_TOKENS: caps the `max_tokens` request parameter
@@ -761,6 +772,10 @@ export function buildSdkEnv(params: SdkEnvParams): Record<string, string | numbe
     }
     console.log(`[SDK Config] Injected app proxy into subprocess env: ${appProxy}`)
   }
+
+  // Bundled Office runtime: make the halo-node shim resolvable on PATH. No-op
+  // (one log line) when the runtime bundle is absent.
+  applyOfficeRuntimeEnv(env)
 
   // Normalize proxy env vars: add http:// if protocol is missing.
   // Some Windows users (esp. with Clash/V2Ray) set HTTPS_PROXY=127.0.0.1:7890
@@ -940,7 +955,7 @@ export async function buildBaseSdkOptions(params: BaseSdkOptionsParams): Promise
     stderr: stderrHandler || ((data: string) => {
       console.error(`[Agent][${conversationId}] CLI stderr:`, data)
     }),
-    // Use Halo's custom system prompt instead of SDK's 'claude_code' preset.
+    // Use Halo's custom system prompt instead of SDK's 'default' preset.
     // The capability index advertises optional toolsets (agent/toolsets) the AI
     // can ask the user to enable; full tool schemas enter context only once the
     // toolset is enabled and the session is rebuilt. AI Browser is one such
@@ -973,7 +988,7 @@ export async function buildBaseSdkOptions(params: BaseSdkOptionsParams): Promise
   }
 
   // Build disallowed tools list from user config + implicit rules
-  const disallowedTools = buildDisallowedTools(params.disabledTools, params.enableTeams)
+  const disallowedTools = buildDisallowedTools(params.disabledTools, false)
   if (disallowedTools.length > 0) {
     sdkOptions.disallowedTools = disallowedTools
     console.log(`[SDK Config] Disallowed tools (${disallowedTools.length}): ${disallowedTools.join(', ')}`)
@@ -984,18 +999,22 @@ export async function buildBaseSdkOptions(params: BaseSdkOptionsParams): Promise
     sdkOptions.mcpServers = mcpServers
   }
 
-  // CC-compatible client identity for halo engine (subscription gateway fingerprinting)
+  // Request identity — host-injected headers, system prefix and metadata
+  // (halo engine only).
   if (getActiveEngine() === 'halo') {
     try {
-      const ccPkg = require('@anthropic-ai/claude-code/package.json')
-      const sdkPkg = require('@anthropic-ai/sdk/package.json')
-      sdkOptions.clientIdentity = {
-        ccVersion: ccPkg.version,
-        sdkPackageVersion: sdkPkg.version,
+      sdkOptions.requestIdentity = buildRequestIdentity({
         deviceId: getDeviceIdentity().deviceId,
-      }
+        // Halo's conversation id is a uuid, which is what this field requires.
+        sessionId: conversationId,
+      })
     } catch (err) {
-      console.warn('[SDK Config] Failed to build clientIdentity:', (err as Error).message)
+      // Dropped, not fatal: the request still goes out, just without the
+      // identity headers.
+      console.warn(
+        `[Agent][${conversationId}] requestIdentity dropped — this session's requests carry no host identity headers:`,
+        (err as Error).message,
+      )
     }
   }
 

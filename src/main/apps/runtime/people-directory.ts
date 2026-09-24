@@ -11,7 +11,13 @@ export function buildPeopleDirectory(
   memberships: DirectoryMembership[],
   query: PeopleDirectoryQuery,
 ): PeopleDirectoryPage {
-  const excluded = new Set(memberships.filter(member => member.isSystemCoordinator).map(member => member.appId))
+  // Ephemeral-collaboration members exist for one piece of work in a space and
+  // are not standalone digital humans. A dedicated coordinator IS one: the
+  // directory is the only place its model and capabilities can be set, so
+  // hiding it left a digital human the person owns with no way to configure it.
+  const excluded = new Set(
+    memberships.filter(member => member.ephemeral).map(member => member.appId)
+  )
   const counts = store.getDirectoryDecisionCounts()
   // A stop needs the owner exactly as much as an unanswered question does, so
   // it counts towards the badge and survives the attention filter.

@@ -4,6 +4,7 @@
  */
 
 import { useState, useCallback } from 'react'
+import { ChevronLeft } from 'lucide-react'
 import { useAppStore } from '../stores/app.store'
 import { api } from '../api'
 import type { HaloConfig } from '../types'
@@ -20,6 +21,7 @@ import {
   SystemSection,
   AdvancedSection,
   RemoteAccessSection,
+  FederationSection,
   AboutSection,
   MessageChannelsSection,
   RegistrySection,
@@ -28,7 +30,7 @@ import {
 
 export function SettingsPage() {
   const { t } = useTranslation()
-  const { config, setConfig } = useAppStore()
+  const { config, setConfig, navigateBack } = useAppStore()
   const isMobile = useIsMobile()
   const isRemoteMode = api.isRemoteMode()
 
@@ -44,7 +46,17 @@ export function SettingsPage() {
   return (
     <div className="h-full w-full flex flex-col">
       {/* Header */}
-      <Header left={<span className="font-medium text-sm">{t('Settings')}</span>} />
+      <Header
+        left={
+          <button
+            onClick={() => navigateBack('space')}
+            className="flex items-center gap-1.5 text-sm font-medium hover:text-muted-foreground transition-colors"
+          >
+            <ChevronLeft className="w-4 h-4" />
+            {t('Settings')}
+          </button>
+        }
+      />
 
       {/* Main Content Area */}
       <div className="flex-1 flex overflow-hidden">
@@ -97,8 +109,12 @@ export function SettingsPage() {
 
               {/* Remote Access Section - Desktop only */}
               {!isRemoteMode && (
-                <RemoteAccessSection config={config} setConfig={setConfig} />
+                <RemoteAccessSection />
               )}
+
+              {/* Federation Gateway - relays teams across networks, so it must
+                  be reachable on a headless server too */}
+              <FederationSection config={config} setConfig={setConfig} />
 
               {/* Recommend Section */}
               <RecommendSection />

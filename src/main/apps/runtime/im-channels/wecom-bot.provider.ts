@@ -50,14 +50,15 @@ import { readFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join, basename, extname } from 'path'
 import type http from 'node:http'
-import type {
-  ImChannelProvider,
-  ImChannelInstance,
-  ImFileCapability,
-  ImIdentityCapability,
-  ImChannelConfigFieldDef,
-  ImChannelType,
-  ImConnectionState,
+import {
+  imCredentialId,
+  type ImChannelProvider,
+  type ImChannelInstance,
+  type ImFileCapability,
+  type ImIdentityCapability,
+  type ImChannelConfigFieldDef,
+  type ImChannelType,
+  type ImConnectionState,
 } from '../../../../shared/types/im-channel'
 import type {
   InboundMessage,
@@ -80,6 +81,7 @@ import { notifyAppEvent } from '../../../services/notification.service'
 import { resolveProxyAgent } from '../../../services/proxy-fetch'
 import { isServerMode } from '../../../foundation/runtime-mode'
 import { fetchWecomIdentityDirectory } from './wecom-identity-resolve'
+import { downloadWecomMedia } from './wecom-media-download'
 
 // ============================================
 // Constants
@@ -238,6 +240,11 @@ export class WecomBotProvider implements ImChannelProvider {
    * 7-day-expiring credential gets re-pasted.
    */
   readonly hotUpdatableConfigKeys = ['nameResolveUrl']
+
+  /** Two enabled instances sharing a Bot ID would duplicate inbound traffic. */
+  credentialId(config: Record<string, unknown>): string | undefined {
+    return imCredentialId(this.type, config)
+  }
 
   createInstance(instanceId: string, config: Record<string, unknown>): ImChannelInstance {
     return new WecomBotInstance(instanceId, config as unknown as WecomBotProviderConfig)
@@ -586,8 +593,8 @@ class WecomBotInstance implements ImChannelInstance {
       heartbeatInterval: 30_000,
       logger: sdkLogger,
       wsOptions: this.wsAgent ? { agent: this.wsAgent } : undefined,
-      // Media URLs are handed out by WeCom at runtime on hosts we cannot know
-      // up front, so the agent is resolved per download rather than once like
+      // The SDK's own HTTP calls (media upload) hit hosts WeCom hands out at
+      // runtime, so the agent is resolved per request rather than once like
       // the WS one.
       httpAgentResolver: async (url) => (await resolveProxyAgent(url))?.agent ?? null,
     })
@@ -1519,9 +1526,8 @@ class WecomBotInstance implements ImChannelInstance {
     attachments: InboundAttachment[],
     images: ImageAttachment[],
   ): Promise<void> {
-    if (!this.wsClient) return
     try {
-      const { buffer, filename } = await this.wsClient.downloadFile(url, aesKey)
+      const { buffer, filename } = await downloadWecomMedia(url, aesKey)
       const staged = await stageMediaFile(TEMP_DIR, filename || `image_${Date.now()}.jpg`, buffer)
 
       const ext = (url.split('?')[0].split('.').pop() ?? '').toLowerCase()
@@ -1566,9 +1572,8 @@ class WecomBotInstance implements ImChannelInstance {
     fallbackName: string,
     attachments: InboundAttachment[],
   ): Promise<void> {
-    if (!this.wsClient) return
     try {
-      const { buffer, filename } = await this.wsClient.downloadFile(url, aesKey)
+      const { buffer, filename } = await downloadWecomMedia(url, aesKey)
       const staged = await stageMediaFile(TEMP_DIR, filename || fallbackName, buffer)
       attachments.push({ type, filename: staged.filename, localPath: staged.localPath })
       logEvent(this.instanceId, 'info', 'media_download_done', {

@@ -85,6 +85,8 @@ export async function fetchWecomIdentityDirectory(apiKeyUrl: string): Promise<Ma
   try {
     let transport: StreamableHTTPClientTransport
     try {
+      // proxyFetch: honor the app/system proxy — the SDK's default is the
+      // global fetch, which bypasses it.
       transport = new StreamableHTTPClientTransport(new URL(apiKeyUrl), { fetch: proxyFetch })
     } catch (err) {
       // new URL() on a malformed value throws with the invalid input
