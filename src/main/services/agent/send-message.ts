@@ -17,7 +17,7 @@
  */
 
 import { getConfig } from '../../foundation/config.service'
-import { addMessage } from '../conversation.service'
+import { addMessage, updateMessageById } from '../conversation.service'
 import { buildCreationTimeServers, openToolset } from './toolsets/broker'
 import { buildToolsetSection } from './toolsets/capability-index'
 import { getOpenToolsets } from './toolsets/state'
@@ -37,20 +37,24 @@ import {
 } from './helpers'
 import { emitAgentEvent } from './events'
 import {
-  getOrCreateV2Session,
-  closeV2Session,
+  acquireV2Session,
   updateConsumerDisplayModel,
-  markTurnDispatched,
+  type V2SessionLease,
 } from './session-manager'
 import {
   formatCanvasContext,
   buildMessageContent,
 } from './message-utils'
+import { formatTurnAttachments } from './references'
 import { prepareNonVisionImageFallback, OCR_TOOLSET_ID } from './image-attachments'
-import { resolveCredentialsForSdk, buildBaseSdkOptions } from './sdk-config'
-import { applyReasoningEffort } from './reasoning-effort'
+import { resolveCredentialsForSdk, buildUserSessionSdkOptions } from './sdk-config'
+import { resolveSpaceMemorySession, buildSpaceMemoryPreamble } from './space-memory'
+import { applyReasoningEffort, pickReasoningEffort } from './reasoning-effort'
 import { createConversationSink } from './conversation-sink'
+import { prepareGoalInput, setGoalForTurn } from './goal'
 import { flushToolStats } from './stream-processor'
+import { workingDirErrorDetail } from './working-dir'
+import { onAgentError, runPpidScanAndCleanup } from '../health'
 import { analytics } from '../analytics/analytics.service'
 import { AnalyticsEvents } from '../analytics/types'
 
@@ -76,10 +80,14 @@ export async function sendMessage(
     resumeSessionId,
     images,
     thinkingEnabled,
-    canvasContext
+    canvasContext,
+    references,
+    task
   } = request
+  // Validated before the message is recorded, so a refused goal leaves no trace.
+  const turnGoal = request.goal ? prepareGoalInput(request.goal) : null
 
-  console.log(`[Agent] sendMessage: conv=${conversationId}${images && images.length > 0 ? `, images=${images.length}` : ''}${thinkingEnabled ? ', thinking=ON' : ''}${canvasContext?.isOpen ? `, canvas tabs=${canvasContext.tabCount}` : ''}`)
+  console.log(`[Agent] sendMessage: conv=${conversationId}${images && images.length > 0 ? `, images=${images.length}` : ''}${thinkingEnabled ? ', thinking=ON' : ''}${canvasContext?.isOpen ? `, canvas tabs=${canvasContext.tabCount}` : ''}${references?.length ? `, references=${references.length}` : ''}${task ? `, task=${task.type}/${task.variant}` : ''}`)
 
   // Counted here, not at the IPC handler, so every transport that reaches
   // space chat (desktop IPC and remote HTTP) goes through one call site.
@@ -104,21 +112,93 @@ export async function sendMessage(
   if (request.knowledgeBaseId) {
     console.log(`[Agent] KB chat turn: knowledgeBaseId=${request.knowledgeBaseId} ctx=${kbChatCtx ? 'resolved' : 'NULL'} workDir=${workDir}`)
   }
-  const digitalHumansEnabled = config.agent?.enableDigitalHumans !== false
 
   // Accumulate stderr for detailed error messages
   let stderrBuffer = ''
-  // Track whether V2 session was obtained (for defensive cleanup on error)
-  let sessionObtained = false
+  let sessionLease: V2SessionLease | undefined
 
   // Add user message to conversation (with images if provided).
   // Assistant placeholder is NOT created here — it is created by the session
   // consumer when CC emits system:init (unified for user + autonomous turns).
-  addMessage(spaceId, conversationId, {
+  const messageMetadata = {
+    ...(turnGoal ? { goal: turnGoal } : {}),
+    ...(references && references.length > 0 ? { references } : {}),
+    ...(task ? { task } : {}),
+  }
+  const userMessage = addMessage(spaceId, conversationId, {
     role: 'user',
     content: message,
-    images: images
+    images: images,
+    ...(Object.keys(messageMetadata).length > 0 ? { metadata: messageMetadata } : {})
   })
+  let goalApplied = false
+  let dispatchAttempted = false
+  let failureReported = false
+
+  const reportFailure = (error: unknown): void => {
+    if (failureReported) return
+    failureReported = true
+    const err = error as Error
+    if (err.name === 'AbortError') {
+      console.log(`[Agent][${conversationId}] Aborted by user`)
+      return
+    }
+
+    console.error(`[Agent][${conversationId}] Error during send:`, error)
+
+    if (turnGoal && !goalApplied) {
+      const { goal: _goal, ...metadata } = userMessage.metadata ?? {}
+      updateMessageById(spaceId, conversationId, userMessage.id, { metadata })
+      console.warn(`[Agent][${conversationId}] Send failed before its goal was set; dropped the goal from the message`)
+    }
+
+    let errorMessage = err.message || 'Unknown error. Check logs in Settings > System > Logs.'
+    if (process.platform === 'win32') {
+      const isExitCode1 = errorMessage.includes('exited with code 1') ||
+                          errorMessage.includes('process exited') ||
+                          errorMessage.includes('spawn ENOENT')
+      const isBashError = stderrBuffer?.includes('bash') ||
+                          stderrBuffer?.includes('ENOENT') ||
+                          errorMessage.includes('ENOENT')
+
+      if (isExitCode1 || isBashError) {
+        const { detectGitBash } = require('../git-bash')
+        const gitBashStatus = detectGitBash()
+        errorMessage = !gitBashStatus.found
+          ? 'Command execution environment not installed. Please restart the app and complete setup, or install manually in settings.'
+          : `Command execution failed. This may be an environment configuration issue, please try restarting the app.\n\nTechnical details: ${err.message}`
+      }
+    }
+
+    if (stderrBuffer && !errorMessage.includes('Command execution')) {
+      const mcpErrorMatch = stderrBuffer.match(/Error: Invalid MCP configuration:[\s\S]*?(?=\n\s*at |$)/m)
+      const genericErrorMatch = stderrBuffer.match(/Error: [\s\S]*?(?=\n\s*at |$)/m)
+      if (mcpErrorMatch) errorMessage = mcpErrorMatch[0].trim()
+      else if (genericErrorMatch) errorMessage = genericErrorMatch[0].trim()
+    }
+
+    analytics.trackErrorSurface('agent-send', err)
+    const toolSummary = flushToolStats(conversationId)
+    if (toolSummary) {
+      void analytics.track(AnalyticsEvents.TOOL_USAGE_SUMMARY, {
+        source: 'agent', conversationId, ...toolSummary,
+      })
+    }
+
+    emitAgentEvent('agent:error', spaceId, conversationId, { type: 'error', error: errorMessage, ...workingDirErrorDetail(error, spaceId) })
+    try {
+      addMessage(spaceId, conversationId, {
+        role: 'assistant', content: '', error: errorMessage, toolCalls: [],
+      })
+    } finally {
+      emitAgentEvent('agent:complete', spaceId, conversationId, { type: 'complete', duration: 0 })
+    }
+
+    onAgentError(conversationId, errorMessage)
+    void runPpidScanAndCleanup().catch(e => {
+      console.error('[Agent] PPID scan after error failed:', e)
+    })
+  }
 
   try {
     // Load the conversation first: it carries both the resume sessionId and the
@@ -127,12 +207,14 @@ export async function sendMessage(
     const conversation = getConversation(spaceId, conversationId)
     const sessionId = resumeSessionId || conversation?.sessionId
 
-    // Get API credentials (per-conversation pin, falling back to global) and resolve for SDK use
-    const credentials = await getApiCredentialsForConversation(config, conversation)
+    // The conversation's pinned account, or the global selection when it has no pin.
+    const credentials = await getApiCredentialsForConversation(conversation)
     console.log(`[Agent] sendMessage using: ${credentials.provider}, model: ${credentials.model}, prompt: ${config.agent?.promptProfile ?? 'halo'}`)
     console.log(`[Agent] turn_start conv=${conversationId} model=${credentials.model} ts=${Date.now()}`)
 
-    const resolvedCredentials = await resolveCredentialsForSdk(credentials)
+    // The conversation's own level wins over one the send carries (API callers).
+    const pickedEffort = pickReasoningEffort(conversation?.reasoningEffort, request.reasoningEffort)
+    const resolvedCredentials = await resolveCredentialsForSdk(credentials, pickedEffort)
     const electronPath = getHeadlessElectronPath()
 
     // Non-vision models can't receive image blocks: persist images to files and
@@ -181,8 +263,11 @@ export async function sendMessage(
       ? [kbChatCtx.reference]
       : resolveConversationKnowledgeBases(conversation)
 
+    // Space memory — not for a KB-chat turn, which works on one KB's documents.
+    const spaceMemory = kbChatCtx ? null : resolveSpaceMemorySession(spaceId, conversationId)
+
     // Build base SDK options
-    const sdkOptions = await buildBaseSdkOptions({
+    const sdkOptions = await buildUserSessionSdkOptions({
       // Same switch that loads the halo_api_ref tool: a session without the
       // manual has no way to discover the API, so the credentials would only
       // widen what an injected instruction can reach.
@@ -196,26 +281,20 @@ export async function sendMessage(
         console.error(`[Agent][${conversationId}] CLI stderr:`, data)
         stderrBuffer += data
       },
-      maxTurns: config.agent?.maxTurns,
-      promptProfile: config.agent?.promptProfile,
-      configDirMode: config.agent?.configDirMode,
-      customConfigDir: config.agent?.customConfigDir,
-      enableTeams: config.agent?.enableTeams,
-      disabledTools: config.agent?.disabledTools,
-      digitalHumansEnabled,
       toolsetIndex: buildToolsetSection(spaceId, conversationId),
+      memoryInstructions: spaceMemory?.instructions,
+      memoryGuard: spaceMemory?.guard,
     })
 
-    // Apply dynamic configurations (Thinking mode)
     const thinkingBudget = applyReasoningEffort(
-      sdkOptions, thinkingEnabled, resolvedCredentials.capabilities
+      sdkOptions, thinkingEnabled, resolvedCredentials.capabilities, pickedEffort
     )
 
     const t0 = Date.now()
     console.log(`[Agent][${conversationId}] Getting or creating V2 session...`)
 
-    // Get or create persistent V2 session (also starts persistent consumer if new)
-    const v2Session = await getOrCreateV2Session(
+    // The lease protects asynchronous preparation before the consumer sees a turn.
+    sessionLease = await acquireV2Session(
       spaceId, conversationId, sdkOptions, sessionId, workDir,
       {
         displayModel: resolvedCredentials.displayModel,
@@ -224,10 +303,12 @@ export async function sendMessage(
       },
       resolvedKbIds,
       buildMcpServers,
-      resolveKnowledgeBases
+      resolveKnowledgeBases,
+      { creationContext: spaceMemory?.contextKey },
+      reportFailure
     )
 
-    sessionObtained = true
+    const v2Session = sessionLease.session
 
     // Ensure consumer's displayModel is up-to-date.
     // When the session is reused (no rebuild), the consumer retains the old displayModel.
@@ -249,119 +330,50 @@ export async function sendMessage(
     }
     console.log(`[Agent][${conversationId}] ⏱️ V2 session ready: ${Date.now() - t0}ms`)
 
+    if (!sessionLease.isCurrent) throw new Error('The acquired session is no longer available')
+
+    if (turnGoal) {
+      setGoalForTurn(spaceId, conversationId, v2Session, turnGoal, Boolean(sessionId))
+      goalApplied = true
+    }
+
     // Prepare message content (canvas context prefix + multi-modal images).
     // With the non-vision fallback active, image blocks are replaced by the
     // injected attachment-paths block.
     const canvasPrefix = formatCanvasContext(canvasContext)
-    const messageWithContext = canvasPrefix + (imageFallback?.contextBlock ?? '') + message
+    // The space's memory opens a new conversation only: a resumed one carries
+    // it forward in its own transcript.
+    const memoryPreamble = spaceMemory && !sessionId
+      ? await buildSpaceMemoryPreamble(spaceMemory.layout, conversationId)
+      : ''
+    const attachments = formatTurnAttachments({ references, task, taskInstructions: request.taskInstructions, workDir })
+    const messageWithContext = memoryPreamble + canvasPrefix + attachments + (imageFallback?.contextBlock ?? '') + message
     const messageContent = buildMessageContent(messageWithContext, imageFallback ? undefined : images)
 
-    // Send to CC's REPL — consumer handles the response. Mark the dispatch
-    // BEFORE send: from here until system:init the consumer looks idle, and an
-    // unguarded rebuild in that window would destroy this message.
-    markTurnDispatched(conversationId)
+    // Dispatch transfers lease protection to awaiting-init before releasing it.
+    dispatchAttempted = true
     if (typeof messageContent === 'string') {
-      v2Session.send(messageContent)
+      await sessionLease.send(messageContent, reportFailure)
     } else {
       const userMessage = {
         type: 'user' as const,
         message: { role: 'user' as const, content: messageContent }
       }
-      v2Session.send(userMessage as any)
+      await sessionLease.send(userMessage as any, reportFailure)
     }
 
     console.log(`[Agent][${conversationId}] Message sent to REPL (${typeof messageContent === 'string' ? messageContent.length : 'multi-modal'} chars). Consumer handles response.`)
 
   } catch (error: unknown) {
-    const err = error as Error
-
-    if (err.name === 'AbortError') {
-      console.log(`[Agent][${conversationId}] Aborted by user`)
-      return
-    }
-
-    console.error(`[Agent][${conversationId}] Error during send:`, error)
-
-    // Extract detailed error message
-    let errorMessage = err.message || 'Unknown error. Check logs in Settings > System > Logs.'
-
-    // Windows: Check for Git Bash related errors
-    if (process.platform === 'win32') {
-      const isExitCode1 = errorMessage.includes('exited with code 1') ||
-                          errorMessage.includes('process exited') ||
-                          errorMessage.includes('spawn ENOENT')
-      const isBashError = stderrBuffer?.includes('bash') ||
-                          stderrBuffer?.includes('ENOENT') ||
-                          errorMessage.includes('ENOENT')
-
-      if (isExitCode1 || isBashError) {
-        const { detectGitBash } = require('../git-bash')
-        const gitBashStatus = detectGitBash()
-        errorMessage = !gitBashStatus.found
-          ? 'Command execution environment not installed. Please restart the app and complete setup, or install manually in settings.'
-          : `Command execution failed. This may be an environment configuration issue, please try restarting the app.\n\nTechnical details: ${err.message}`
+    if (!dispatchAttempted) {
+      if (!sessionLease || sessionLease.isCurrent) {
+        reportFailure(error)
+      } else {
+        console.warn(`[Agent][${conversationId}] Discarded retired session's preparation failure`)
       }
+      sessionLease?.close()
     }
-
-    if (stderrBuffer && !errorMessage.includes('Command execution')) {
-      const mcpErrorMatch = stderrBuffer.match(/Error: Invalid MCP configuration:[\s\S]*?(?=\n\s*at |$)/m)
-      const genericErrorMatch = stderrBuffer.match(/Error: [\s\S]*?(?=\n\s*at |$)/m)
-      if (mcpErrorMatch) errorMessage = mcpErrorMatch[0].trim()
-      else if (genericErrorMatch) errorMessage = genericErrorMatch[0].trim()
-    }
-
-    // Telemetry: surface this error to the global error map and drain any
-    // tool stats that processStream couldn't (e.g. crash during sendMessage
-    // before the stream even started). Both calls are fire-and-forget and
-    // internally try/caught — they never re-throw into this path.
-    //
-    // Idempotency note: when processStream DID run to completion, it already
-    // flushed the toolStatsMap entry for this conversationId, so flushToolStats
-    // here returns null and the inner emit is skipped. This is intentional
-    // belt-and-suspenders: the only path where this branch fires non-null is
-    // a crash BEFORE processStream took over the stats map.
-    analytics.trackErrorSurface('agent-send', err)
-    const toolSummary = flushToolStats(conversationId)
-    if (toolSummary) {
-      void analytics.track(AnalyticsEvents.TOOL_USAGE_SUMMARY, {
-        source: 'agent',
-        conversationId,
-        ...toolSummary,
-      })
-    }
-
-    emitAgentEvent('agent:error', spaceId, conversationId, {
-      type: 'error',
-      error: errorMessage
-    })
-
-    // No assistant placeholder exists (it's created by consumer on system:init,
-    // which never fired because send failed). Create one now to hold the error.
-    addMessage(spaceId, conversationId, {
-      role: 'assistant',
-      content: '',
-      error: errorMessage,
-      toolCalls: [],
-    })
-
-    // Emit complete so frontend transitions out of generating state
-    emitAgentEvent('agent:complete', spaceId, conversationId, {
-      type: 'complete',
-      duration: 0,
-    })
-
-    // Defensive cleanup: close session + consumer if error occurred after session
-    // was obtained (e.g., send() threw due to broken transport). Without this,
-    // the consumer loop would spin on a potentially corrupted session.
-    // Matches old architecture's behavior of always closing on error.
-    if (sessionObtained) {
-      closeV2Session(conversationId)
-    }
-
-    const { onAgentError, runPpidScanAndCleanup } = await import('../health')
-    onAgentError(conversationId, errorMessage)
-    runPpidScanAndCleanup().catch(e => {
-      console.error('[Agent] PPID scan after error failed:', e)
-    })
+  } finally {
+    sessionLease?.release()
   }
 }

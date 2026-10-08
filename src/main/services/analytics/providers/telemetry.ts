@@ -52,6 +52,7 @@
 
 import { BaseProvider, BaseProviderOptions } from './base'
 import type { AnalyticsEvent, UserContext } from '../types'
+import { HOME_EVENT_NAMES, homeEventWhitelist } from '../../../../shared/analytics/home-telemetry'
 
 /** Hard cap on in-memory queue length. Reaching this triggers an immediate flush. */
 const MAX_QUEUE_SIZE = 100
@@ -142,10 +143,13 @@ const EVENT_WHITELIST: Record<string, readonly string[]> = {
   // Session / navigation
   'session.start':  ['view', 'platform', 'startedAt'],
   'session.end':    ['view', 'platform', 'durationMs'],
-  'page.view':      ['view', 'from'],
+  'page.view':      ['view', 'from', 'shell'],
+
+  // Home shell, navigation and the pages they lead to
+  ...Object.fromEntries(HOME_EVENT_NAMES.map((event) => [event, homeEventWhitelist(event)])),
 
   // Store funnel (identifiers only — slug/type, never user content)
-  'store.view':                ['tab', 'ref'],
+  'store.view':                ['tab', 'ref', 'entry', 'shell'],
   'store.detail.view':         ['appId', 'appType', 'installedState', 'source'],
   'store.card.click':          ['appId', 'appType', 'source'],
   'store.search':              ['resultCount', 'tabScope'],
@@ -169,7 +173,7 @@ const EVENT_WHITELIST: Record<string, readonly string[]> = {
 
   // Digital human lifecycle
   'app.installed':      ['appId', 'specId', 'version', 'type', 'installSource', 'durationMs'],
-  'app.uninstalled':    ['appId', 'specId', 'type'],
+  'app.uninstalled':    ['appId', 'specId', 'type', 'reason'],
   'app.run.started':    ['appId', 'specId', 'runId', 'trigger'],
   'app.run.completed':  ['appId', 'specId', 'runId', 'trigger', 'status', 'durationMs', 'tokensUsed'],
   'app.run.failed':     ['appId', 'specId', 'runId', 'trigger', 'status', 'durationMs', 'tokensUsed', 'errorCode'],
@@ -198,6 +202,27 @@ const EVENT_WHITELIST: Record<string, readonly string[]> = {
                            'totalCalls', 'totalErrors', 'durationMs'],
   'mcp.connect':          ['mcpId', 'status', 'toolCount'],
   'error.surface':        ['area', 'errorCode'],
+
+  // Performance (numbers, booleans and fixed enums only; routed to this provider alone)
+  'perf.heartbeat': [
+    'windowSec', 'samples', 'uptimeMin', 'vdi', 'totalMemMb', 'availPctP50', 'availPctMin', 'availSource',
+    'mainRssMbP50', 'mainRssMbMax', 'mainHeapMbMax', 'rendererMbP50', 'rendererMbMax', 'electronMbMax', 'gpuMbMax',
+    'rendererCountMax', 'agentCountMax', 'agentMbMax', 'elP99MsP50', 'elP99MsMax', 'pressureLowPct',
+    'pressureCriticalPct', 'pressureChanges', 'sessionLimit', 'residentSessionsMax', 'sessionEvictions',
+    'rendererCrashes', 'rendererHangs',
+  ],
+  'perf.process_crash': [
+    'processType', 'mainWindow', 'reason', 'exitCode', 'recovery', 'crashesInWindow', 'pressure', 'availPct',
+    'rendererMb', 'vdi',
+  ],
+  'perf.crash_snapshot': [
+    'previousExit', 'relaunchReason', 'sameVersion', 'snapshotReason', 'snapshotAgeSec', 'lastAvailPct',
+    'lastRendererMb', 'lastMainRssMb', 'lastElectronMb', 'lastAgentMb', 'lastAgentCount', 'lastElP99Ms',
+    'lastPressure', 'crashpadPending', 'latestDumpProcessType', 'latestDumpAgeHours', 'vdi',
+  ],
+  'perf.memory_pressure': [
+    'from', 'to', 'availPct', 'availSource', 'rendererMb', 'agentCount', 'residentSessions', 'sessionLimit', 'vdi',
+  ],
 }
 
 export interface TelemetryProviderConfig extends BaseProviderOptions {

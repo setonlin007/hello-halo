@@ -53,7 +53,7 @@ the WeCom side: workspace admin console → the bot → API 配置 → switch to
 A duplicate `botId` across two *enabled* instances triggers an inline warning
 (`getDuplicateWarning` in `MessageChannelsSection.tsx`) — each real bot can only be bound to one
 digital human at a time; the second instance simply won't be able to claim the WebSocket slot
-(see §5 standby behavior).
+(see §6 standby behavior).
 
 ## 2. Reply scope, quote reply, streaming
 
@@ -70,6 +70,9 @@ digital human at a time; the second instance simply won't be able to claim the W
   (`isQuoteReplyEnabled` gate in `InstanceCard`), and turning Quote Reply off force-clears
   Streaming if it was on. Reason: a suppressed quote bubble routes through the no-req_id push
   path, which streaming needs a req_id-bearing session to attach to.
+- **Processing Notice** (处理中提示, `processingNotice`, default **on**; Halo 3.0 and later) — the
+  same switch on every channel, described in `message-channels/index.md` §2. Greyed out while
+  Streaming is on.
 
 Reply Scope, Quote Reply, and Streaming all take effect on the **next** inbound message with no
 reconnect and no restart of Halo required — `ImChannelManager.configEqual()` deliberately excludes
@@ -112,6 +115,35 @@ Halo capabilities (`allowAiBrowser`, `allowEmail`, `allowNotify`, `allowApps`, `
 (`allowedUserMcp`). `guestPolicy: undefined` (the default when guest access is off) means guests
 get **zero** tool access — chat only.
 
+**Skills for guests** (Halo 3.0 and later; `guestPolicy.allowedSkills`, skill folder names). With
+guest access on, the guest permissions show a **Skills** (技能) group listing the skills this
+digital human can load (global and space skills, as on its skills page), one switch each, **all
+off** by default:
+
+- A guest can use only the skills switched on here; asking for any other is refused, and the
+  refusal names the ones that are allowed.
+- A skill may read its own folder for that guest, even with file viewing off — but not other
+  skills' folders, and never write to them.
+- Everything else a skill does — running commands, changing files, sending email — still needs
+  the guest switches on this page, checked one action at a time. If only `npm run:*` commands are
+  allowed, a skill that tries to run `python3` is refused and told why.
+- A skill whose own pre-approvals (`allowed-tools` in its `SKILL.md`) go beyond what guests are
+  allowed does not load at all, and the reason names the entries that go beyond, e.g.
+  `Bash(python3:*)`. Fix it by allowing the same rule under the guest command settings, or by
+  removing that entry from the skill. A skill with hooks loads only when guests may run any
+  command; one that runs as a sub-agent (`context: fork`) needs **Subtasks** on.
+- **Subtasks** on lets guests' turns hand work to sub-agents, held to the same guest limits.
+- A guest's message that starts with `/` (e.g. `/some-skill`) is passed to the digital human as
+  plain text, never run as a command; the owner's messages are unaffected.
+- The model still sees every skill's name and description, so a guest who asks what it can do
+  may hear about skills that are switched off — using them is still refused.
+- Before 3.0, guests on a permission-controlled bot could not use skills at all.
+
+**Questions from the digital human** (Halo 3.0 and later): when the bound digital human asks for a
+decision, owners get the full question in their direct chat with the bot and answer with
+`/answer <number> <answer>`; groups only learn that a question is waiting. Who receives it and who
+may answer depends on permission control — see `message-channels/index.md` §2.
+
 **The defaults applied to a *new* instance are build-specific, not fixed.** `defaultEnabled`,
 `defaultGuestAccess`, `defaultGuestPolicy`, `ownerIdHint`, and `ownerSetupGuideUrl`
 (`ImChannelsPermissionDefaults`, `src/main/foundation/product-config.ts`) are all read from
@@ -143,7 +175,35 @@ This grant **expires 7 days after authorization** and must be re-copied — the 
 an `expired` status (amber, "re-copy the link from WeCom and paste it here"). Absence of this
 field simply means chat IDs display as-is; it is fully optional and never blocks messaging.
 
-## 5. Multi-device standby (informational, not a failure)
+## 5. Group mentions and commands
+
+WeCom delivers a group message only when the bot is mentioned, and the mention arrives as
+**plain text at the start of the body**: `@Halo AI 团队 这个群的 ID 是什么`. The callback carries
+no structured mention data, and a bot name may contain spaces, so where the name ends cannot be
+told from the text. Halo 3.0 and later does not try (`isCommand` in
+`src/main/apps/runtime/dispatch-inbound.ts`):
+
+- **The digital human reads the message as typed, every `@` included** — its own and anyone
+  else's. `@小助手 @张三 帮忙跟进一下` tells it that 张三 was addressed. There is no "Bot Name" or
+  mention-removal setting, and none is needed.
+- **Commands** (`/stop`, `/clear` and their aliases, listed in
+  `create-digital-human/im-triggers.md`) count in a group when the message starts with `@` and
+  its **last word** is the command: `@Halo AI 团队 /stop`, `@HaloBot /stop` and
+  `@Halo @助手 /clear` all work, and so does a message that is only `/stop`. Case does not
+  matter, and the special space WeCom inserts after a mention counts as a space.
+- **Not commands**: text after the command (`@Halo /stop doing that`), a message that does not
+  start with `@` (`please /stop`), or a word without the slash (`stop`, `停止`). These reach the
+  digital human as ordinary messages.
+- **Direct messages**: the command must be the whole message.
+- By the same rule, any group message that starts with `@` and ends with `/stop` stops the
+  current answer.
+
+Before 3.0, Halo removed the leading `@word` tokens from group messages and matched commands
+against what was left. `@HaloBot /stop` worked, but a bot name with spaces did not
+(`@Halo AI 团队 /stop` became `AI 团队 /stop`, which is not a command), and a leading `@colleague`
+was removed as well.
+
+## 6. Multi-device standby (informational, not a failure)
 
 WeCom's protocol grants the live bot slot to whichever device connected most recently. If the
 same `botId`/`secret` pair is configured on two Halo installs, `ConnectionArbiter`
@@ -154,22 +214,26 @@ The user can force-reclaim immediately via **Use on this device** (calls `reconn
 resets the arbiter and always wins). This is expected behavior for a shared credential, not a
 bug — do not diagnose it as a connection failure.
 
-## 6. Diagnosis
+## 7. Diagnosis
 
 | Symptom | Likely cause | Where to check |
 |---|---|---|
 | Instance stuck "Disconnected", never goes green | Missing/invalid `botId` or `secret`; `start_skip` logged | Console: `event=start_skip reason="missing botId or secret"`; re-check the two fields |
 | Instance stuck "Disconnected" despite correct `botId`/`secret` | WeCom-side bot is configured for "使用 URL 回调" (webhook) instead of "使用长连接" — Halo only speaks the persistent-connection protocol | Have the user check WeCom admin console → the bot → API 配置, switch to 使用长连接 (see §1B) |
 | Instance stuck "Disconnected", network-adjacent | Outbound access to `openws.work.weixin.qq.com:443` is blocked (corporate firewall/proxy) | Ask the user to confirm the machine can reach general internet sites; if behind a strict corporate firewall, IT needs to allow outbound HTTPS to that host |
-| Instance shows sky-blue "Standby" | Same bot credential is live on another device | Normal — see §5. "Use on this device" to reclaim |
+| Instance shows sky-blue "Standby" | Same bot credential is live on another device | Normal — see §6. "Use on this device" to reclaim |
 | Bot connects but never replies to DMs | No owner claimed yet + `permissionEnabled: true` | Have the user DM the bot once (auto-claims); or check `owners` in the instance config |
 | Bot replies in DM but ignores group messages (or vice versa) | `replyScope` mismatch | Check the instance's Reply Scope setting; user gets an explicit rejection message, not silence, when scoped out |
 | Group replies show as plain text, no quote bubble | Quote Reply toggled off for that instance | `quoteReply: false` in config — expected, not a bug |
 | Streaming toggle greyed out / won't turn on | Quote Reply is off | Turn Quote Reply on first — Streaming requires it (§2) |
 | Sender shows an opaque ID instead of a real name | No Name Resolution URL configured, or it expired | §4 — check `identityResolution.status` in instance status; `expired` needs a fresh 7-day grant |
+| A `/stop` or `/clear` sent in a group is answered as an ordinary message | Something follows the command, the message does not start with `@`, or — before 3.0 — the bot's name contains spaces | §5 — end the message with the command: `@Halo AI 团队 /stop` |
 | "This Bot ID is already in use" warning | Same `botId` configured on two enabled instances | Only one instance can hold the WebSocket slot per real bot — delete or disable the duplicate |
 | Owner claimed the wrong user | First DM sender ≠ intended owner | Manually edit **Owner User IDs** in the Permission Control section; replaces the auto-claimed value |
-| `notify_bot` / scheduled push to a chat never delivers | That chat has never messaged the bot before | A chat only becomes a known, pushable session after at least one real inbound message (`ImSessionRegistry`, registered in `dispatch-inbound.ts`) — have the target person or group `@`-mention the bot once first; see `create-digital-human/im-triggers.md` §B |
+| `notify_bot` / scheduled push to a chat never delivers | That chat has never messaged the bot before | A chat only becomes a known, pushable session after at least one real inbound message (`ImSessionRegistry`, registered in `dispatch-inbound.ts`) — have the target person or group `@`-mention the bot once first. On 3.0 and later, a chat that already talks to another bot on this machine can instead be added from the digital human's **Reachable Contacts** → **Add from existing chats**; see `create-digital-human/im-triggers.md` §B |
+| A guest is told a skill cannot be used | The skill is switched off for guests, or its own pre-approvals go beyond the guest switches (the reason names them) | §3 "Skills for guests" — switch it on, or allow the named rule, or remove it from the skill |
+| The owner never gets the digital human's question in IM | Permission control is off and no direct chat has **Auto-sync run result** on, or the bot was offline when the question was asked | `message-channels/index.md` §2 — the question is still open in Halo either way |
+| Every reply is preceded by "✅ 已收到，正在处理…", or the user wants it gone | Processing Notice is on (the default) and the reply took over 5 seconds | §2 — switch **Processing Notice** off, or turn Streaming on |
 
 ## Do not ask / do not assume
 
@@ -178,4 +242,6 @@ bug — do not diagnose it as a connection failure.
 - **Do not offer to configure per-message @-mention filtering.** WeCom's platform itself only
   forwards `@`-mentioned messages to the bot in groups — Halo never even receives the rest. See
   `create-digital-human/im-triggers.md`.
-- **Do not treat `standby` as an error requiring troubleshooting** — see §5.
+- **Do not treat `standby` as an error requiring troubleshooting** — see §6.
+- **Do not send the user looking for a "Bot Name" or mention-removal setting.** None exists:
+  the digital human reads group messages with their mentions, and commands work without it (§5).

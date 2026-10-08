@@ -68,7 +68,7 @@ const { registry, createLocalSession } = vi.hoisted(() => {
 vi.mock('../../../../src/main/services/agent/session-manager', () => ({
   v2Sessions,
   closeV2Session,
-  getOrCreateV2Session: vi.fn(),
+  acquireV2Session: vi.fn(),
   getConsumerHandle: (id: string) => consumers.get(id) ?? null,
   getRunningConsumerIds: () => Array.from(consumers.keys()),
   markTurnDispatched: vi.fn(),
@@ -96,7 +96,7 @@ vi.mock('../../../../src/main/services/agent/helpers', () => ({
 }))
 vi.mock('../../../../src/main/services/agent/sdk-config', () => ({
   resolveCredentialsForSdk: vi.fn(),
-  buildBaseSdkOptions: vi.fn(),
+  buildUserSessionSdkOptions: vi.fn(),
 }))
 vi.mock('../../../../src/main/services/agent/permission-handler', () => ({
   createCanUseTool: vi.fn(),
@@ -107,9 +107,10 @@ vi.mock('../../../../src/main/services/analytics/analytics.service', () => ({
 
 vi.mock('../../../../src/main/services/agent/events', () => ({ emitAgentEvent: vi.fn() }))
 vi.mock('../../../../src/main/services/agent/stream-processor', () => ({ processStream: vi.fn() }))
-vi.mock('../../../../src/main/services/agent/message-utils', () => ({ buildMessageContent: vi.fn() }))
+vi.mock('../../../../src/main/services/agent/message-utils', () => ({ buildMessageContent: vi.fn(), formatCanvasContext: () => '' }))
 
 vi.mock('../../../../src/main/services/ai-browser', () => ({
+  AI_BROWSER_SYSTEM_PROMPT: '',
   createAIBrowserMcpServer: vi.fn(),
   createScopedBrowserContext: vi.fn(),
 }))
@@ -162,10 +163,9 @@ vi.mock('../../../../src/main/apps/runtime/index', () => ({
   getActivityStore: () => activityStore,
 }))
 vi.mock('../../../../src/main/apps/runtime/dispatch-inbound', () => ({
-  flushSupplementBuffer: vi.fn(),
 }))
-vi.mock('../../../../src/main/platform/memory/snapshot', () => ({
-  createMemoryStatusMcpServer: vi.fn(),
+vi.mock('../../../../src/main/services/memory-consolidation', () => ({
+  requestConsolidation: vi.fn(),
 }))
 
 // ============================================
@@ -286,16 +286,14 @@ describe('buildGuestMcpServers guest MCP injection', () => {
   // The full owner MCP set as app-chat builds it before guest filtering.
   const ALL = {
     'web-search': { _: 1 },
-    'halo-memory': { _: 1 },
     'ocr': { _: 1 },
     'ai-browser': { _: 1 },
     'halo-email': { _: 1 },
   }
 
-  it('always injects filesystem-free safe MCPs (web-search, halo-memory)', () => {
+  it('always injects filesystem-free web search, without a memory MCP', () => {
     const out = buildGuestMcpServers(ALL, null, {})
-    expect(out).toHaveProperty('web-search')
-    expect(out).toHaveProperty('halo-memory')
+    expect(Object.keys(out)).toEqual(['web-search'])
   })
 
   it('does NOT inject OCR for a guest without allowOcr (reads local files)', () => {

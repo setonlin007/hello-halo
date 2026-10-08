@@ -10,18 +10,19 @@
 
 import { statSync, existsSync, realpathSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from 'fs'
 import { promises as fsAsync, type Stats } from 'fs'
-import { join, extname, basename, dirname, sep } from 'path'
+import { join, extname, basename, dirname, sep, isAbsolute, resolve as resolvePath } from 'path'
 import { shell } from 'electron'
 import { getTempSpacePath } from '../foundation/config.service'
-import { CPP_LEVEL_IGNORE_DIRS } from '../../shared/constants/ignore-patterns'
 import { MAX_PREVIEW_DOCUMENT_SIZE, formatPreviewSize } from '../../shared/constants/artifact-preview'
-import { getSpace } from './space.service'
+import { getSpace, getSpaceDir } from './space.service'
+import { queryFilesViaWorker } from './watcher-host.service'
+import type { FileQueryItem, FileQueryResult, ResolvedArtifactPath } from '../../shared/types/artifact'
 import {
-  listArtifacts as listArtifactsCached,
   listArtifactsTree as listArtifactsTreeCached,
   loadDirectoryChildren,
-  initSpaceCache,
   ensureSpaceCache,
+  retainSpaceCache,
+  releaseSpaceCache,
   onArtifactChange,
   reconcileLoadedDirs,
   type CachedArtifact,
@@ -59,78 +60,152 @@ function getWorkingDir(spaceId: string): string {
   return getTempSpacePath()
 }
 
+/** Largest result a file query may ask for. */
+export const MAX_FILE_QUERY_LIMIT = 200
+/** Largest flat listing `listArtifacts` returns. */
+const MAX_LISTED_ARTIFACTS = 20_000
+const LIST_INDEX_WAIT_MS = 3000
+
 /**
- * List all artifacts in a space
- * Uses caching and file watching for optimal performance
+ * Best matches for a typed file query (the @ menu), answered from the
+ * watcher's background path index; only `limit` items cross processes.
+ * Watches the space if nothing did yet — the first query of a large space
+ * may report `indexing` with partial results.
  */
-export async function listArtifacts(spaceId: string, maxDepth: number = 2): Promise<Artifact[]> {
-  console.log(`[Artifact] listArtifacts for space: ${spaceId}`)
+export async function queryFiles(spaceId: string, query: string, limit: number): Promise<FileQueryResult> {
+  const boundedLimit = Math.max(0, Math.min(Math.floor(limit) || 0, MAX_FILE_QUERY_LIMIT))
+  return queryPathIndex(spaceId, typeof query === 'string' ? query : '', boundedLimit)
+}
 
+async function queryPathIndex(
+  spaceId: string,
+  query: string,
+  limit: number,
+  maxDepth?: number
+): Promise<FileQueryResult> {
   const workDir = getWorkingDir(spaceId)
+  if (!existsSync(workDir)) return { items: [], truncated: false, indexing: false, hasPaths: false }
 
-  if (!existsSync(workDir)) {
-    console.log(`[Artifact] Directory does not exist: ${workDir}`)
-    return []
-  }
+  await ensureSpaceCache(spaceId, workDir)
+  const result = await queryFilesViaWorker(spaceId, query, limit, maxDepth)
+  if (!result) return { items: [], truncated: false, indexing: false, hasPaths: false }
 
-  const cachedArtifacts = await listArtifactsCached(spaceId, workDir, maxDepth)
-
-  // Convert to Artifact format
-  const artifacts: Artifact[] = cachedArtifacts.map(ca => ({
-    id: ca.id,
-    spaceId: ca.spaceId,
-    conversationId: 'all',
-    name: ca.name,
-    type: ca.type,
-    path: ca.path,
-    relativePath: ca.relativePath,
-    extension: ca.extension,
-    icon: ca.icon,
-    createdAt: ca.createdAt,
-    size: ca.size,
-    preview: undefined  // Don't load preview by default for performance
+  const items: FileQueryItem[] = result.items.map(({ relativePath, isFolder }) => ({
+    path: join(result.rootPath, relativePath),
+    relativePath,
+    name: basename(relativePath),
+    type: isFolder ? 'folder' : 'file',
   }))
-
-  console.log(`[Artifact] Found ${artifacts.length} artifacts`)
-  return artifacts
+  return { items, truncated: result.truncated, indexing: result.indexing, hasPaths: result.hasPaths }
 }
 
-/** Dependency/VCS/build directories are noise in a file count, and recursing
- * into node_modules would dominate the scan time. */
-const COUNT_IGNORE_DIRS = new Set<string>(CPP_LEVEL_IGNORE_DIRS)
+/** Most paths one `resolveArtifactPaths` call answers; the rest are not looked at. */
+export const MAX_RESOLVED_PATHS = 200
+const MAX_RESOLVED_PATH_CHARS = 4096
+/** Filesystem lookups in flight at once, well inside libuv's thread pool. */
+const RESOLVE_CONCURRENCY = 16
+
+const foldCase = process.platform === 'darwin' || process.platform === 'win32'
+  ? (p: string) => p.toLowerCase()
+  : (p: string) => p
+
+/** Whether `child` is `root` or below it, compared as strings (both already resolved). */
+function isLiterallyWithin(child: string, root: string): boolean {
+  const c = foldCase(child)
+  const r = foldCase(root)
+  return c === r || c.startsWith(r.endsWith(sep) ? r : r + sep)
+}
 
 /**
- * How many files a space holds, capped at `limit`.
- *
- * Deliberately not listArtifacts(): that path initializes the space's artifact
- * cache and starts a file watcher for it. Fine for the space you're in, far too
- * much to pay for a number on a card — a caller summarizing every space would
- * leave one watcher running per space.
+ * A path that can only name a file on this machine's own disks: not a network
+ * share (`\\host\share`, `//host/share`), not a Win32 device or extended path
+ * (`\\.\`, `\\?\`), not drive-relative (`C:foo`, which follows that drive's
+ * own current directory). Merely stat-ing a share makes Windows connect to the
+ * host and offer the user's credentials.
  */
-export async function countSpaceFiles(spaceId: string, limit: number, maxDepth = 2): Promise<number> {
-  const workDir = getWorkingDir(spaceId)
-  if (!existsSync(workDir)) return 0
-  return countFilesInDir(workDir, maxDepth, limit)
+function isPlainLocalPath(path: string): boolean {
+  return !/^[\\/]{2}/.test(path) && !/^[A-Za-z]:(?![\\/])/.test(path)
 }
 
-async function countFilesInDir(dir: string, depth: number, limit: number): Promise<number> {
-  let entries
-  try {
-    entries = await fsAsync.readdir(dir, { withFileTypes: true })
-  } catch {
-    return 0
-  }
-
-  let count = 0
-  for (const entry of entries) {
-    if (count >= limit) break
-    if (entry.isFile()) {
-      count += 1
-    } else if (entry.isDirectory() && depth > 0 && !COUNT_IGNORE_DIRS.has(entry.name)) {
-      count += await countFilesInDir(join(dir, entry.name), depth - 1, limit - count)
+async function mapWithLimit<T, R>(items: T[], limit: number, map: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await map(items[index])
     }
   }
-  return Math.min(count, limit)
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
+/**
+ * Which of `paths` name an existing file or folder inside the space —
+ * relative ones resolved against `baseDir` when that lies inside the space,
+ * else against its working directory.
+ *
+ * The paths come from AI replies, so nothing outside the space is ever
+ * touched: each one must lie inside the space as written before the
+ * filesystem is asked about it, and again once links are resolved. An unknown
+ * space answers nothing. One lookup per path, never a scan.
+ */
+export async function resolveArtifactPaths(spaceId: string, paths: string[], baseDir?: string): Promise<ResolvedArtifactPath[]> {
+  const asked = paths.slice(0, MAX_RESOLVED_PATHS).filter((path): path is string => typeof path === 'string')
+  const missing = (path: string): ResolvedArtifactPath => ({ path, absolutePath: null, isDirectory: false })
+  const workDir = getSpaceDir(spaceId)
+  if (!workDir) return asked.map(missing)
+
+  const root = resolvePath(workDir)
+  const realRoot = await fsAsync.realpath(root).catch(() => null)
+  if (!realRoot) return asked.map(missing)
+  const base = baseDir && isAbsolute(baseDir) && isPlainLocalPath(baseDir) && isLiterallyWithin(resolvePath(baseDir), root)
+    ? resolvePath(baseDir)
+    : root
+
+  return mapWithLimit(asked, RESOLVE_CONCURRENCY, async (path) => {
+    if (!path || path.length > MAX_RESOLVED_PATH_CHARS || !isPlainLocalPath(path)) return missing(path)
+    const candidate = resolvePath(base, path)
+    if (!isLiterallyWithin(candidate, root)) return missing(path)
+    try {
+      const real = await fsAsync.realpath(candidate)
+      if (!isLiterallyWithin(real, realRoot)) return missing(path)
+      const stats = await fsAsync.stat(real)
+      return { path, absolutePath: candidate, isDirectory: stats.isDirectory() }
+    } catch {
+      return missing(path)
+    }
+  })
+}
+
+/**
+ * Flat listing of a space down to `maxDepth` path segments, folders first,
+ * capped at MAX_LISTED_ARTIFACTS. Served from the path index; waits briefly
+ * for a space whose index is still being built.
+ */
+export async function listArtifacts(spaceId: string, maxDepth: number = 2): Promise<Artifact[]> {
+  const deadline = Date.now() + LIST_INDEX_WAIT_MS
+  let result = await queryPathIndex(spaceId, '', MAX_LISTED_ARTIFACTS, maxDepth)
+  while (result.indexing && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    result = await queryPathIndex(spaceId, '', MAX_LISTED_ARTIFACTS, maxDepth)
+  }
+
+  return result.items.map(item => {
+    const extension = item.type === 'file' ? extname(item.name).replace('.', '') : ''
+    return {
+      id: item.path,
+      spaceId,
+      conversationId: 'all',
+      name: item.name,
+      type: item.type,
+      path: item.path,
+      relativePath: item.relativePath,
+      extension,
+      icon: item.type === 'folder' ? 'folder' : extension,
+      createdAt: '',
+    }
+  })
 }
 
 // Get artifact by ID
@@ -148,7 +223,7 @@ export function watchArtifacts(
   callback: (artifacts: Artifact[]) => void
 ): () => void {
   // File watching is handled by artifact-cache.service.ts via IPC events
-  // Callers should use api.onArtifactChanged() instead
+  // Callers should use api.onArtifactChangedBatch() instead
   return () => {}
 }
 
@@ -158,7 +233,6 @@ export function watchArtifacts(
  */
 export async function listArtifactsTree(spaceId: string): Promise<{ workspaceRoot: string; nodes: CachedTreeNode[] }> {
   const workDir = getWorkingDir(spaceId)
-  console.log(`[Artifact] listArtifactsTree: spaceId=${spaceId}, workDir=${workDir}`)
 
   if (!existsSync(workDir)) {
     console.log(`[Artifact] Directory does not exist: ${workDir}`)
@@ -167,7 +241,7 @@ export async function listArtifactsTree(spaceId: string): Promise<{ workspaceRoo
 
   const nodes = await listArtifactsTreeCached(spaceId, workDir)
 
-  console.log(`[Artifact] listArtifactsTree: ${nodes.length} root nodes`)
+  console.log(`[Artifact] listArtifactsTree: spaceId=${spaceId} workDir=${workDir} rootNodes=${nodes.length}`)
   return { workspaceRoot: workDir, nodes }
 }
 
@@ -178,10 +252,7 @@ export async function loadTreeChildren(
   spaceId: string,
   dirPath: string
 ): Promise<CachedTreeNode[]> {
-  console.log(`[Artifact] loadTreeChildren for: ${dirPath}`)
-
   const workDir = getWorkingDir(spaceId)
-  console.log(`[Artifact] loadTreeChildren workDir resolved: ${workDir}`)
 
   if (!existsSync(dirPath)) {
     console.log(`[Artifact] Directory does not exist: ${dirPath}`)
@@ -214,17 +285,22 @@ export async function loadTreeChildren(
 }
 
 /**
- * Initialize artifact watcher for a space
+ * A client (renderer instance or remote tab, identified by `clientId`) starts
+ * or keeps showing a space. `recreated`: the client held nothing here, so on a
+ * renewal its view may have missed changes and should be reloaded.
  */
-export async function initArtifactWatcher(spaceId: string): Promise<void> {
+export async function retainArtifactSpace(spaceId: string, clientId: string): Promise<{ recreated: boolean }> {
   const workDir = getWorkingDir(spaceId)
-
   if (!existsSync(workDir)) {
-    console.log(`[Artifact] Cannot init watcher, directory does not exist: ${workDir}`)
-    return
+    console.log(`[Artifact] Cannot retain space, directory does not exist: ${workDir}`)
+    return { recreated: false }
   }
+  return { recreated: await retainSpaceCache(spaceId, workDir, clientId) }
+}
 
-  await ensureSpaceCache(spaceId, workDir)
+/** The client stopped showing the space; its cache and watcher may be released. */
+export async function releaseArtifactSpace(spaceId: string, clientId: string): Promise<void> {
+  await releaseSpaceCache(spaceId, clientId)
 }
 
 /**
@@ -689,7 +765,7 @@ export function detectFileType(filePath: string): FileTypeInfo {
     }
   }
 
-  // PDF → BrowserView
+  // PDF uses the embedded Chromium viewer.
   if (ext === 'pdf') {
     return {
       isText: false,

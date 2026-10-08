@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, statSync } from 'fs'
 import { join } from 'path'
 import type { AppManagerService, InstalledApp } from '../manager'
-import type { ExecutionEnvironment } from '../../../shared/apps/app-types'
+import type { ExecutionEnvironment, MissingConnection } from '../../../shared/apps/app-types'
+import { BUILTIN_MCP_SERVER_IDS } from '../../../shared/apps/builtin-mcp'
 import { getSpace, getSpaceDir } from '../../services/space.service'
+import { WorkingDirectoryUnavailableError } from '../../services/agent'
 import type { ActivityStore } from './store'
 
 /** Capture paths once; resuming a task must not reinterpret its default space. */
@@ -77,20 +79,65 @@ export function validateEnvironmentConnections(
   }
 }
 
+/**
+ * Declared connections an independent run could not use: not installed, or
+ * installed but not running. A run hands only running ones to the model, so
+ * starting without them would leave it short of tools it was built around.
+ * A dependency the owner switched off for this person is a choice, not a gap,
+ * and built-in capabilities are not installable connections.
+ */
+export function missingConnections(
+  app: InstalledApp,
+  manager: Pick<AppManagerService, 'listEffectiveMcpApps'>,
+  spaceId: string,
+): MissingConnection[] {
+  const declared = (app.spec.requires?.mcps ?? [])
+    .filter(dependency => dependency.enabled !== false && !BUILTIN_MCP_SERVER_IDS.has(dependency.id))
+  if (declared.length === 0) return []
+  const installed = manager.listEffectiveMcpApps(spaceId)
+  const missing: MissingConnection[] = []
+  for (const dependency of declared) {
+    const instances = installed.filter(resource => resource.specId === dependency.id)
+    if (instances.some(resource => resource.status === 'active')) continue
+    const instance = instances[0]
+    missing.push({
+      id: dependency.id,
+      name: instance?.spec.name ?? dependency.id,
+      state: !instance ? 'not_installed'
+        : instance.status === 'paused' ? 'disabled'
+          : instance.status === 'needs_login' ? 'needs_login'
+            : 'error',
+    })
+  }
+  return missing
+}
+
 export function legacySessionEnvironmentKey(appId: string, runId: string): string {
   return `legacy-file:${appId}:${runId}`
 }
 
-/** An unavailable original environment blocks continuation instead of moving it. */
+/**
+ * An unavailable original environment blocks continuation instead of moving it.
+ * A missing working directory is told apart: the person can point the space at
+ * another folder from the chat, whereas history and memory must be restored.
+ */
 export function validateExecutionEnvironment(environment: ExecutionEnvironment): void {
   if (!environment.spaceId || !getSpace(environment.spaceId)) {
     throw new Error('The original work space is unavailable. Restore it before continuing.')
   }
-  for (const path of [environment.workDir, environment.spacePath, environment.memoryDir]) {
-    if (!path || !existsSync(path) || !statSync(path).isDirectory()) {
-      throw new Error('The original working directory, history or memory is unavailable. Restore it before continuing.')
+  if (!isDirectory(environment.workDir)) {
+    console.warn(`[Runtime] Working directory does not exist: "${environment.workDir}" (space ${environment.spaceId})`)
+    throw new WorkingDirectoryUnavailableError(environment.workDir, environment.spaceId)
+  }
+  for (const path of [environment.spacePath, environment.memoryDir]) {
+    if (!isDirectory(path)) {
+      throw new Error('The original history or memory is unavailable. Restore it before continuing.')
     }
   }
+}
+
+function isDirectory(path: string | undefined): boolean {
+  return !!path && existsSync(path) && statSync(path).isDirectory()
 }
 
 export function getLegacyAppDataPath(app: InstalledApp): string | undefined {

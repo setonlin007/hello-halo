@@ -1,18 +1,43 @@
 /**
- * System IPC Handlers - Auto launch, window controls, and logging
+ * System IPC Handlers - Auto launch, window controls, logging, and the native
+ * file/folder picker
  */
 
-import { app, BrowserWindow, shell } from 'electron'
-import { dirname } from 'path'
+import { app, BrowserWindow, shell, type OpenDialogOptions } from 'electron'
+import { showOpenDialog } from '../foundation/file-dialog'
+import { dirname, extname } from 'path'
+import { readFile, stat } from 'fs/promises'
 import log from 'electron-log/main.js'
+import type { PickedLocalEntry } from '../../shared/attached-paths'
+import { TITLE_BAR_OVERLAY_HEIGHT } from '../../shared/constants/app-header'
 import { setAutoLaunch, getAutoLaunch } from '../foundation/config.service'
 import { getMainWindow, onMainWindowChange } from '../foundation/window.service'
 import { logFatal } from '../foundation/logging'
 import { relaunchApp } from '../services/lifecycle'
+import { countPendingCrashDumps } from '../services/perf'
 import { systemRpc } from '../../shared/rpc/contracts/system.contract'
 import { registerRawRpcHandlers } from './rpc'
 
 let mainWindow: BrowserWindow | null = null
+
+const IMAGE_MEDIA_TYPES: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+}
+// Matches the composer's own image limit; a larger image is attached by path.
+const MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
+
+async function toPickedEntry(path: string): Promise<PickedLocalEntry> {
+  const info = await stat(path)
+  if (info.isDirectory()) return { path, isDirectory: true }
+  const mediaType = IMAGE_MEDIA_TYPES[extname(path).toLowerCase()]
+  if (!mediaType || info.size > MAX_INLINE_IMAGE_BYTES) return { path, isDirectory: false }
+  const data = (await readFile(path)).toString('base64')
+  return { path, isDirectory: false, image: { data, mediaType, size: info.size } }
+}
 
 export function registerSystemHandlers(): void {
   // Subscribe to window changes to set up event listeners
@@ -66,8 +91,7 @@ export function registerSystemHandlers(): void {
           mainWindow.setTitleBarOverlay({
             color: options.color,
             symbolColor: options.symbolColor,
-            // One pixel short of Header's 48px — see main/index.ts.
-            height: 47
+            height: TITLE_BAR_OVERLAY_HEIGHT
           })
         }
         return { success: true }
@@ -131,6 +155,23 @@ export function registerSystemHandlers(): void {
       }
     },
 
+    // Open the crash reports folder (Crashpad minidumps are kept locally, never
+    // uploaded) so a user can hand them over for diagnosis.
+    openCrashReportsFolder: async () => {
+      try {
+        const dir = app.getPath('crashDumps')
+        const pending = countPendingCrashDumps()
+        const error = await shell.openPath(dir)
+        if (error) throw new Error(error)
+        console.log(`[Settings] system:open-crash-reports-folder - Opened (pending dumps: ${pending})`)
+        return { success: true, data: { path: dir, pending } }
+      } catch (error) {
+        const err = error as Error
+        console.error('[Settings] system:open-crash-reports-folder - Failed:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
     // Open log folder in system file manager
     openLogFolder: async () => {
       console.log('[Settings] system:open-log-folder - Opening log folder')
@@ -164,6 +205,36 @@ export function registerSystemHandlers(): void {
       } catch (error) {
         const err = error as Error
         console.error('[Settings] system:relaunch - Failed:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // Files and folders to attach to a chat message. macOS lets one panel pick
+    // both; elsewhere a panel picks one kind, so it offers files.
+    pickLocalEntries: async () => {
+      try {
+        const options: OpenDialogOptions = {
+          properties: process.platform === 'darwin'
+            ? ['openFile', 'openDirectory', 'multiSelections']
+            : ['openFile', 'multiSelections'],
+        }
+        const result = mainWindow && !mainWindow.isDestroyed()
+          ? await showOpenDialog(mainWindow, options)
+          : await showOpenDialog(options)
+        if (result.canceled) return { success: true, data: [] }
+        const entries: PickedLocalEntry[] = []
+        for (const path of result.filePaths) {
+          try {
+            entries.push(await toPickedEntry(path))
+          } catch (error) {
+            console.warn('[System] pick-local-entries - Skipped unreadable entry:', path, (error as Error).message)
+          }
+        }
+        console.log(`[System] pick-local-entries - Picked ${entries.length} entries`)
+        return { success: true, data: entries }
+      } catch (error) {
+        const err = error as Error
+        console.error('[System] pick-local-entries - Failed:', err.message)
         return { success: false, error: err.message }
       }
     },

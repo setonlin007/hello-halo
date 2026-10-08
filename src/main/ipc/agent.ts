@@ -7,8 +7,6 @@
  */
 
 import {
-  sendMessage,
-  injectMessage,
   stopGeneration,
   getSessionState,
   ensureSessionWarm,
@@ -18,9 +16,14 @@ import {
   listToolsets,
   openToolsetByUser,
   closeToolsetByUser,
+  getConversationGoal,
+  setConversationGoal,
   onAgentEvent,
   onAgentBroadcast
 } from '../services/agent'
+import type { GoalInput } from '../../shared/types/goal'
+import type { AgentInjectRequest, AgentSendRequest } from '../../shared/types/agent-send'
+import * as agentController from '../controllers/agent.controller'
 import { getEngineCapabilities, getActiveEngine, getDegradedFromEngine } from '../services/agent/resolved-sdk'
 import { getEngineAvailability } from '../services/agent/engine-availability'
 import { defaultCapabilitiesFor } from '../services/agent/capabilities'
@@ -31,6 +34,61 @@ import { analytics } from '../services/analytics/analytics.service'
 import { agentRpc } from '../../shared/rpc/contracts/agent.contract'
 import { registerRawRpcHandlers } from './rpc'
 import { markIntentionalStop } from '../apps/runtime'
+import { ipcMain } from 'electron'
+import { shouldDeliverAgentEvent } from '../../shared/agent-event-visibility'
+import { clearDetailConversations, setDetailConversations } from '../services/conversation-detail'
+
+/**
+ * Conversations whose streaming detail each renderer declared it shows, keyed
+ * by webContents id. A renderer that has not declared (yet, or since a reload)
+ * receives status events only.
+ */
+const detailByRenderer = new Map<number, ReadonlySet<string>>()
+const NO_DETAIL: ReadonlySet<string> = new Set()
+const MAX_DECLARED_CONVERSATIONS = 200
+
+/** Renderers whose reload/destroy is already followed (one listener pair each). */
+const hookedRenderers = new Set<number>()
+
+interface DeclaringRenderer {
+  readonly id: number
+  on(event: 'did-navigate', listener: () => void): unknown
+  once(event: 'destroyed', listener: () => void): unknown
+}
+
+/** Record what `sender` renders in detail. Exported for tests. */
+export function applyVisibilityDeclaration(sender: DeclaringRenderer, payload: unknown): void {
+  const ids = Array.isArray(payload)
+    ? payload.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : []
+  if (ids.length > MAX_DECLARED_CONVERSATIONS) {
+    console.warn(`[Agent] Visible-conversation declaration truncated: ${ids.length} > ${MAX_DECLARED_CONVERSATIONS}`)
+  }
+  const id = sender.id
+  if (!hookedRenderers.has(id)) {
+    hookedRenderers.add(id)
+    const forget = () => {
+      detailByRenderer.delete(id)
+      clearDetailConversations(`renderer:${id}`)
+    }
+    // A reload starts a fresh renderer that must declare again; the listeners
+    // stay, so a reloading window never accumulates them.
+    sender.on('did-navigate', forget)
+    sender.once('destroyed', () => {
+      hookedRenderers.delete(id)
+      forget()
+    })
+  }
+  const declared = new Set(ids.slice(0, MAX_DECLARED_CONVERSATIONS))
+  detailByRenderer.set(id, declared)
+  setDetailConversations(`renderer:${id}`, declared)
+}
+
+function registerVisibilityDeclaration(): void {
+  ipcMain.on('agent:set-visible-conversations', (event, payload: unknown) => {
+    applyVisibilityDeclaration(event.sender, payload)
+  })
+}
 
 // Module-level subscription disposables (lifetime = process lifetime)
 // Stored to establish correct Disposable pattern; these are never disposed
@@ -38,6 +96,7 @@ import { markIntentionalStop } from '../apps/runtime'
 const eventSubscriptions: import('../platform/event').IDisposable[] = []
 
 export function registerAgentHandlers(): void {
+  registerVisibilityDeclaration()
 
   // ============================================
   // Event Forwarding (Emitter → IPC + WebSocket)
@@ -47,13 +106,17 @@ export function registerAgentHandlers(): void {
   eventSubscriptions.push(onAgentEvent((e) => {
     const eventData = { ...e.data, spaceId: e.spaceId, conversationId: e.conversationId }
 
-    // 1. Send to Electron renderer via IPC
+    // 1. Send to Electron renderer via IPC — streaming detail only for
+    //    conversations it declared visible, status events for all.
     const mainWindow = getMainWindow()
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(e.channel, eventData)
+      const detail = detailByRenderer.get(mainWindow.webContents.id) ?? NO_DETAIL
+      if (shouldDeliverAgentEvent(e.channel, e.conversationId, detail, e.data)) {
+        mainWindow.webContents.send(e.channel, eventData)
+      }
     }
 
-    // 2. Broadcast to remote WebSocket clients
+    // 2. Broadcast to remote WebSocket clients (same rule, per client)
     try {
       broadcastToWebSocket(e.channel, eventData)
     } catch {
@@ -82,33 +145,8 @@ export function registerAgentHandlers(): void {
   // ============================================
 
   registerRawRpcHandlers(agentRpc, {
-    // Send message to agent (with optional images for multi-modal, optional thinking mode)
-    sendMessage: async (
-      request: {
-        spaceId: string
-        conversationId: string
-        message: string
-        resumeSessionId?: string
-        images?: Array<{
-          id: string
-          type: 'image'
-          mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
-          data: string
-          name?: string
-          size?: number
-        }>
-        thinkingEnabled?: boolean  // Enable extended thinking mode
-      }
-    ) => {
-      try {
-        await sendMessage(request)
-        return { success: true }
-      } catch (error: unknown) {
-        const err = error as Error
-        analytics.trackErrorSurface('agent-send', err)
-        return { success: false, error: err.message }
-      }
-    },
+    // Send message to agent; checked and built field by field by the controller (shared with HTTP)
+    sendMessage: (request: AgentSendRequest) => agentController.sendMessage(request),
 
     // Stop generation for a specific conversation (or all if not specified)
     stopGeneration: async (conversationId?: string) => {
@@ -222,18 +260,7 @@ export function registerAgentHandlers(): void {
 
     // Inject a mid-turn message into an active session.
     // Called when user sends a message while generation is in progress (Agent Team mode).
-    injectMessage: async (
-      data: { conversationId: string; message: string }
-    ) => {
-      try {
-        injectMessage(data.conversationId, data.message)
-        return { success: true }
-      } catch (error: unknown) {
-        const err = error as Error
-        console.error(`[IPC] agent:inject-message error:`, err)
-        return { success: false, error: err.message }
-      }
-    },
+    injectMessage: async (data: AgentInjectRequest) => agentController.injectMessage(data),
 
     // Test MCP server connections
     testMcpConnections: async () => {
@@ -268,7 +295,7 @@ export function registerAgentHandlers(): void {
       }
     },
 
-    // User enables a toolset from the "Tools" menu (schedules a session rebuild)
+    // User enables a toolset from the composer's "+" menu (schedules a session rebuild)
     openToolset: async (data: { spaceId: string; conversationId: string; toolsetId: string }) => {
       try {
         const result = await openToolsetByUser(data.spaceId, data.conversationId, data.toolsetId)
@@ -286,6 +313,28 @@ export function registerAgentHandlers(): void {
         return result.ok ? { success: true } : { success: false, error: result.error }
       } catch (error: unknown) {
         const err = error as Error
+        return { success: false, error: err.message }
+      }
+    },
+
+    // Conversation goal; data is the goal or null
+    getGoal: async (data: { spaceId: string; conversationId: string }) => {
+      try {
+        return { success: true, data: await getConversationGoal(data.spaceId, data.conversationId) }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[IPC] agent:goal-get error:', err)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // Set (or clear with goal: null) the goal on the user's behalf; starts no turn
+    setGoal: async (data: { spaceId: string; conversationId: string; goal: GoalInput | null }) => {
+      try {
+        return { success: true, data: await setConversationGoal(data.spaceId, data.conversationId, data.goal) }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[IPC] agent:goal-set error:', err)
         return { success: false, error: err.message }
       }
     },

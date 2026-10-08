@@ -9,6 +9,7 @@ import {
 import type {
   ApiResponse,
 } from './_shared'
+import type { PickedLocalEntry } from '../../shared/attached-paths'
 
 export const systemApi = {
   // ===== Onboarding =====
@@ -56,11 +57,31 @@ export const systemApi = {
     return window.halo.openLogFolder()
   },
 
+  openCrashReportsFolder: async (): Promise<ApiResponse<{ path: string; pending: number }>> => {
+    if (!isElectron()) {
+      return { success: false, error: 'Only available in desktop app' }
+    }
+    return window.halo.openCrashReportsFolder()
+  },
+
   relaunch: async (): Promise<ApiResponse> => {
     if (!isElectron()) {
       return { success: false, error: 'Only available in desktop app' }
     }
     return window.halo.relaunch()
+  },
+
+  // A remote client's files are not on the host, so their paths mean nothing there.
+  pickLocalEntries: async (): Promise<ApiResponse<PickedLocalEntry[]>> => {
+    if (!isElectron()) {
+      return { success: false, error: 'Only available in desktop app' }
+    }
+    return window.halo.pickLocalEntries()
+  },
+
+  getPathForFile: (file: File): string => {
+    if (!isElectron()) return ''
+    return window.halo.getPathForFile(file)
   },
 
   // ===== Window (Electron only) =====
@@ -107,29 +128,6 @@ export const systemApi = {
       return () => { } // No-op in remote mode
     }
     return window.halo.onWindowMaximizeChange(callback)
-  },
-
-  // ===== Overlay (Electron only) =====
-  // Used for floating UI elements that need to render above BrowserViews
-  showChatCapsuleOverlay: async (): Promise<ApiResponse> => {
-    if (!isElectron()) {
-      return { success: false, error: 'Only available in desktop app' }
-    }
-    return window.halo.showChatCapsuleOverlay()
-  },
-
-  hideChatCapsuleOverlay: async (): Promise<ApiResponse> => {
-    if (!isElectron()) {
-      return { success: false, error: 'Only available in desktop app' }
-    }
-    return window.halo.hideChatCapsuleOverlay()
-  },
-
-  onCanvasExitMaximized: (callback: () => void) => {
-    if (!isElectron()) {
-      return () => { } // No-op in remote mode
-    }
-    return window.halo.onCanvasExitMaximized(callback)
   },
 
   // ===== Git Bash (Windows only, Electron only) =====

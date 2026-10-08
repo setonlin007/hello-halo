@@ -8,7 +8,7 @@
  * automatically reflected everywhere.
  */
 
-import { classifySessionSource, HTTP_SESSION_CHANNEL, LOCAL_SESSION_CHANNEL } from '../types/im-channel'
+import { classifySessionSource, HTTP_SESSION_CHANNEL, IM_CHANNEL_TYPES, LOCAL_SESSION_CHANNEL, type ImChannelType } from '../types/im-channel'
 
 /**
  * Build the virtual conversationId for the native Halo app-chat session.
@@ -112,6 +112,15 @@ export function isLocalSessionKey(conversationId: string): boolean {
   return parsed !== null && parsed.channel === LOCAL_SESSION_CHANNEL
 }
 
+/**
+ * Whether a finished turn in this conversation is the user's to come back to:
+ * regular conversations and the digital-human conversations listed beside
+ * them, not IM, HTTP or team channel sessions.
+ */
+export function isFollowedConversationId(conversationId: string): boolean {
+  return !isAppChatKey(conversationId) || nativeChatAppId(conversationId) !== null
+}
+
 /** Parsed components of a channel-qualified app-chat conversation key. */
 export interface ParsedAppChatKey {
   appId: string
@@ -136,6 +145,51 @@ export function parseAppChatKey(conversationId: string): ParsedAppChatKey | null
   if (!appId || !channel || !chatId) return null
   if (chatType !== 'direct' && chatType !== 'group') return null
   return { appId, channel, chatType, chatId }
+}
+
+/** A conversation the user holds with a digital human on the chat board. */
+export type NativeChatKey =
+  | { appId: string; kind: 'default' }
+  | { appId: string; kind: 'local'; chatId: string }
+
+/**
+ * Parse a chat-board conversation key: the digital human's default session
+ * ("app-chat:{appId}") or one of its local sessions. Null for every other key —
+ * IM, HTTP and team sessions are not conversations the user holds on the chat
+ * board. The one definition of that rule; everything else asks this.
+ */
+export function parseNativeChatKey(conversationId: string): NativeChatKey | null {
+  const parts = conversationId.split(':')
+  if (parts[0] !== 'app-chat') return null
+  if (parts.length === 2) return parts[1] ? { appId: parts[1], kind: 'default' } : null
+  const parsed = parseAppChatKey(conversationId)
+  return parsed && parsed.channel === LOCAL_SESSION_CHANNEL && parsed.chatType === 'direct'
+    ? { appId: parsed.appId, kind: 'local', chatId: parsed.chatId }
+    : null
+}
+
+/** The app a chat-board conversation belongs to (see {@link parseNativeChatKey}). */
+export function nativeChatAppId(conversationId: string): string | null {
+  return parseNativeChatKey(conversationId)?.appId ?? null
+}
+
+/**
+ * The sender identity of one scheduled run of a digital human when it messages
+ * other conversations. Distinct from every chat key: nothing sent to it can
+ * reach the digital human's chats, so a run's messages are one-way notices.
+ * A run started from the desktop also holds its browser pages under this key,
+ * which is how the live-session tray names them after the digital human.
+ *
+ * Format: "app-run:{appId}:{runId}"
+ */
+export function buildRunSenderKey(appId: string, runId: string): string {
+  return `app-run:${appId}:${runId}`
+}
+
+export function parseRunSenderKey(conversationId: string): { appId: string; runId: string } | null {
+  const parts = conversationId.split(':')
+  if (parts.length !== 3 || parts[0] !== 'app-run' || !parts[1] || !parts[2]) return null
+  return { appId: parts[1], runId: parts[2] }
 }
 
 /**
@@ -230,6 +284,22 @@ export function isAppChatKey(conversationId: string): boolean {
 }
 
 /**
+ * Whether an id names one of a space's own conversations rather than a
+ * digital-human session or a scheduled run's sender key. Space conversations
+ * have no prefix of their own, so this is the complement of every other key
+ * family defined here — a new family must be excluded here too.
+ */
+export function isSpaceConversationId(conversationId: string): boolean {
+  return !isAppChatKey(conversationId) && parseRunSenderKey(conversationId) === null
+}
+
+/** The digital human any app-chat key belongs to (chat board, IM, HTTP, team); null for other ids. */
+export function appChatAppId(conversationId: string): string | null {
+  if (!isAppChatKey(conversationId)) return null
+  return conversationId.split(':')[1] || null
+}
+
+/**
  * Allowed charset for the caller-controlled segments of an externally-supplied
  * conversation key (an HTTP chatId, a team key's teamId/epochId).
  *
@@ -265,9 +335,11 @@ export type HttpConversationIdResult =
  *   - a native local key      → "app-chat:{appId}:local:direct:{sessionUuid}"
  *   - a team-channel key      → "app-chat:{appId}:team:{teamId}:{epochId}"
  *
- * Rejects everything else — in particular IM-channel keys (an HTTP caller must
- * never be able to address or inject into an IM session) and segments outside
- * the filename-safe charset. The 'local' channel is permitted so the remote
+ * Rejects everything else — in particular IM-channel keys, so these routes can
+ * never send into an IM session — and segments outside the filename-safe
+ * charset. An HTTP caller still reads, stops and clears IM sessions, through
+ * the im-chat routes, which address one by its parts and check them with
+ * {@link resolveHttpImChat}. The 'local' channel is permitted so the remote
  * web client (an authenticated Halo UI that reaches the same endpoint over
  * HTTP) can drive the user's native multi-sessions; it is non-pushable and
  * carries no more capability than an 'http' session. The 'team' channel is
@@ -324,4 +396,44 @@ export function resolveHttpConversationId(
     }
   }
   return { ok: true, conversationId: raw }
+}
+
+/**
+ * An IM chat id as the platform hands it over. The platform chooses it (a
+ * WeChat one carries "@" and "."), so only what would change the address is
+ * refused: ":" ends a key segment, a slash or ".." reaches out of the
+ * transcript file's folder, whitespace and control characters belong to no id.
+ */
+const IM_CHAT_ID_PATTERN = /^[^\s:/\\\p{Cc}]{1,256}$/u
+
+export type HttpImChatResult =
+  | { ok: true; channel: ImChannelType; chatType: 'direct' | 'group'; chatId: string }
+  | { ok: false; error: string }
+
+/**
+ * Validate the parts an HTTP caller names an IM session by on the im-chat
+ * routes (read, stop, clear): a channel that is an IM channel, a chat type,
+ * and a chat id that keeps the session key and its transcript file where they
+ * belong. The same shape check {@link resolveHttpConversationId} gives the
+ * chat routes; "http" and "local" sessions are addressed there, by key.
+ *
+ * @param chatType - Defaults to "direct" when absent
+ */
+export function resolveHttpImChat(channel: unknown, chatType: unknown, chatId: unknown): HttpImChatResult {
+  if (typeof channel !== 'string' || !(IM_CHANNEL_TYPES as readonly string[]).includes(channel)) {
+    return {
+      ok: false,
+      error: `Invalid channel: expected one of ${IM_CHANNEL_TYPES.join(', ')}; address "http" and "local" sessions by conversationId on the chat routes`,
+    }
+  }
+  if (chatType !== undefined && chatType !== 'direct' && chatType !== 'group') {
+    return { ok: false, error: 'Invalid chatType: expected "direct" or "group"' }
+  }
+  if (typeof chatId !== 'string' || !IM_CHAT_ID_PATTERN.test(chatId) || chatId.includes('..')) {
+    return {
+      ok: false,
+      error: 'Invalid chatId: 1-256 characters, without whitespace, ":", "/", "\\" or ".."',
+    }
+  }
+  return { ok: true, channel: channel as ImChannelType, chatType: chatType ?? 'direct', chatId }
 }

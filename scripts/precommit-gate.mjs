@@ -84,16 +84,11 @@ const UNGATEABLE_TESTS = {
 }
 
 /**
- * Same runner as `npm run test:unit`. Plain `npx vitest` loads better-sqlite3,
- * which is built against Electron's ABI, and dies with ERR_DLOPEN_FAILED —
- * a real binary mismatch that reads exactly like a broken test.
+ * Use the app's Node version, matching `npm run test:unit`.
  */
 const UNIT_RUNNER = [
-  'npx',
-  'cross-env',
-  'ELECTRON_RUN_AS_NODE=1',
-  'electron',
-  'node_modules/vitest/vitest.mjs',
+  'node',
+  'scripts/run-vitest.mjs',
   'run',
   '--config',
   'tests/vitest.config.ts'

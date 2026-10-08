@@ -73,7 +73,6 @@ export function StreamingBubble({
       // Skip if already clean: state setters are in the dep array, so an
       // unconditional reset here would loop.
       if (activeSnapshotLen === 0 && segments.length === 0 && scrollOffset === 0) return
-      console.log(`[StreamingBubble] 🆕 New text block detected: version → ${textBlockVersion}`)
       // Reset all state for new text block
       setActiveSnapshotLen(0)
       setSegments([])
@@ -141,7 +140,6 @@ export function StreamingBubble({
   useEffect(() => {
     if (!content && thoughts.length === 0) {
       // Full reset for new conversation
-      console.log(`[StreamingBubble] 🔄 Full reset (new conversation)`)
       setSegments([])
       setScrollOffset(0)
       setCurrentHeight(0)
@@ -221,7 +219,7 @@ export function StreamingBubble({
   // Typography and radius must match the settled bubble in MessageItem — this
   // bubble is swapped out for that one the instant the run ends.
   return (
-    <div className="rounded-lg text-sm px-4 py-3 message-assistant message-working w-full overflow-hidden">
+    <div className="rounded-lg px-4 py-3 message-assistant message-working w-full overflow-hidden">
       {/* Working indicator */}
       <div className="flex items-center gap-1.5 mb-2 pb-2 border-b border-border/30 working-indicator-fade">
         <span className="text-xs text-muted-foreground/70">{t('Halo is working')}</span>

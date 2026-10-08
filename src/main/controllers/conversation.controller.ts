@@ -7,6 +7,7 @@ import {
   listConversations as serviceListConversations,
   createConversation as serviceCreateConversation,
   getConversation as serviceGetConversation,
+  getConversationFrom as serviceGetConversationFrom,
   updateConversation as serviceUpdateConversation,
   deleteConversation as serviceDeleteConversation,
   addMessage as serviceAddMessage,
@@ -39,9 +40,14 @@ export function listConversations(spaceId: string): ControllerResponse {
 /**
  * Create a new conversation
  */
-export function createConversation(spaceId: string, title?: string): ControllerResponse {
+export function createConversation(
+  spaceId: string,
+  title?: string,
+  reasoningEffort?: unknown,
+  options?: { ephemeral?: boolean }
+): ControllerResponse {
   try {
-    const conversation = serviceCreateConversation(spaceId, title)
+    const conversation = serviceCreateConversation(spaceId, title, reasoningEffort, { ephemeral: options?.ephemeral === true })
     return { success: true, data: conversation }
   } catch (error: unknown) {
     const err = error as Error
@@ -52,9 +58,11 @@ export function createConversation(spaceId: string, title?: string): ControllerR
 /**
  * Get a specific conversation
  */
-export function getConversation(spaceId: string, conversationId: string): ControllerResponse {
+export function getConversation(spaceId: string, conversationId: string, fromMessageId?: string): ControllerResponse {
   try {
-    const conversation = serviceGetConversation(spaceId, conversationId)
+    const conversation = fromMessageId
+      ? serviceGetConversationFrom(spaceId, conversationId, fromMessageId)
+      : serviceGetConversation(spaceId, conversationId)
     if (conversation) {
       return { success: true, data: conversation }
     }

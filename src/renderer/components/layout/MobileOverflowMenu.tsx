@@ -8,13 +8,16 @@
  */
 
 import { useState } from 'react'
-import { MoreHorizontal, Sparkles, Search, Settings, ChevronRight, X, Globe, TerminalSquare, Loader2 } from 'lucide-react'
+import { MoreHorizontal, Sparkles, Search, Settings, ChevronRight, X, Globe, TerminalSquare, Loader2, GitCompareArrows } from 'lucide-react'
 import { useAppStore } from '../../stores/app.store'
-import { useChatStore } from '../../stores/chat.store'
-import { getModelDisplayName, type AISourcesConfig } from '../../types'
+import { useActiveModelTarget } from '../../hooks/useActiveModelTarget'
+import { openPersonModelSettings } from '../../utils/people-navigation'
+import { getModelDisplayName, getSourceById, type AISourcesConfig } from '../../types'
 import { useTranslation } from '../../i18n'
-import { ModelSelectSheet } from './ModelSelector'
+import { ModelSelectSheet } from '../ai-config/ModelSelector'
 import { useSpaceQuickActions } from '../../hooks/useSpaceQuickActions'
+import { trackHome, trackNavigate } from '../../services/home-telemetry'
+import { trackToolOpen } from '../../services/tool-session-telemetry'
 
 interface MobileOverflowMenuProps {
   onSearch: () => void
@@ -30,16 +33,25 @@ export function MobileOverflowMenu({ onSearch }: MobileOverflowMenuProps) {
   const aiSources: AISourcesConfig = config?.aiSources?.version === 2
     ? config.aiSources
     : { version: 2, currentId: null, sources: [] }
-  // Show the current conversation's pinned model (falls back to global selection).
-  const currentConversation = useChatStore(s => {
-    const conversationId = s.getCurrentSpaceState().currentConversationId
-    return conversationId ? s.conversationCache.get(conversationId) ?? null : null
-  })
-  const currentModelName = getModelDisplayName(
-    aiSources, currentConversation?.modelSourceId, currentConversation?.modelId
-  )
+  // The model the conversation on screen runs on: a regular conversation's own
+  // pin, or the settings of the digital human being talked to.
+  const modelTarget = useActiveModelTarget()
+  const sourceId = modelTarget.kind === 'digital-human' ? modelTarget.modelSourceId : modelTarget.conversation?.modelSourceId
+  const modelId = modelTarget.kind === 'digital-human' ? modelTarget.modelId : modelTarget.conversation?.modelId
+  const isMissingSource = !!sourceId && !getSourceById(aiSources, sourceId)
+  const currentModelName = isMissingSource
+    ? t('Account removed. Choose another account.')
+    : getModelDisplayName(aiSources, sourceId, modelId)
 
-  const { canOpenBrowser, openBrowser, terminalAvailable, terminalCreating, openTerminal } = useSpaceQuickActions()
+  const {
+    canOpenBrowser,
+    openBrowser,
+    terminalAvailable,
+    terminalCreating,
+    openTerminal,
+    canOpenChanges,
+    openChanges,
+  } = useSpaceQuickActions()
 
   const closeMenu = (after?: () => void) => {
     setIsAnimatingOut(true)
@@ -50,10 +62,29 @@ export function MobileOverflowMenu({ onSearch }: MobileOverflowMenuProps) {
     }, 200)
   }
 
+  const openMenu = () => {
+    trackHome('home.header.action', { action: 'more', surface: 'mobile_sheet' })
+    setIsMenuOpen(true)
+  }
+
+  const runAction = (action: 'model' | 'search', after: () => void) => {
+    trackHome('home.header.action', { action, surface: 'mobile_sheet' })
+    closeMenu(after)
+  }
+
+  const handleOpenBrowser = () => closeMenu(() => trackToolOpen('browser', 'mobile_menu', openBrowser()))
+  const handleOpenTerminal = () => closeMenu(() => trackToolOpen('terminal', 'mobile_menu', openTerminal()))
+  const handleOpenChanges = () => closeMenu(() => { void openChanges() })
+
+  const goSettings = () => {
+    trackNavigate('settings', 'header', 'header')
+    closeMenu(() => navigate('settings'))
+  }
+
   return (
     <div className="sm:hidden">
       <button
-        onClick={() => setIsMenuOpen(true)}
+        onClick={openMenu}
         className="p-1.5 hover:bg-secondary rounded-lg transition-colors"
         title={t('More')}
         aria-label={t('More')}
@@ -98,19 +129,26 @@ export function MobileOverflowMenu({ onSearch }: MobileOverflowMenuProps) {
             <div className="py-1 pb-[env(safe-area-inset-bottom)]">
               {/* Model row: label + current value, chains into ModelSelectSheet */}
               <button
-                onClick={() => closeMenu(() => setIsModelSheetOpen(true))}
+                onClick={() => runAction('model', () => {
+                  // A digital human's model is chosen in its settings, not here.
+                  if (modelTarget.kind === 'digital-human') openPersonModelSettings(modelTarget.appId)
+                  else setIsModelSheetOpen(true)
+                })}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
                 <Sparkles className="w-4 h-4 text-muted-foreground flex-shrink-0" />
                 <span className="text-sm text-foreground">{t('Model')}</span>
-                <span className="ml-auto text-sm text-muted-foreground truncate max-w-[160px]">
+                <span className={`ml-auto min-w-0 text-sm text-muted-foreground ${isMissingSource ? 'flex-1 text-right break-words' : 'truncate max-w-[160px]'}`}>
                   {currentModelName}
+                  {isMissingSource && modelTarget.kind === 'digital-human' && (
+                    <span className="mt-1 block text-xs">{t('Change in its settings')}</span>
+                  )}
                 </span>
                 <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
               </button>
 
               <button
-                onClick={() => closeMenu(onSearch)}
+                onClick={() => runAction('search', onSearch)}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
                 <Search className="w-4 h-4 text-muted-foreground flex-shrink-0" />
@@ -118,7 +156,7 @@ export function MobileOverflowMenu({ onSearch }: MobileOverflowMenuProps) {
               </button>
 
               <button
-                onClick={() => closeMenu(() => navigate('settings'))}
+                onClick={goSettings}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
                 <Settings className="w-4 h-4 text-muted-foreground flex-shrink-0" />
@@ -127,7 +165,7 @@ export function MobileOverflowMenu({ onSearch }: MobileOverflowMenuProps) {
 
               {canOpenBrowser && (
                 <button
-                  onClick={() => closeMenu(openBrowser)}
+                  onClick={handleOpenBrowser}
                   className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
                 >
                   <Globe className="w-4 h-4 text-blue-500 flex-shrink-0" />
@@ -137,7 +175,7 @@ export function MobileOverflowMenu({ onSearch }: MobileOverflowMenuProps) {
 
               {terminalAvailable && (
                 <button
-                  onClick={() => closeMenu(openTerminal)}
+                  onClick={handleOpenTerminal}
                   disabled={terminalCreating}
                   className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors disabled:opacity-60"
                 >
@@ -147,6 +185,16 @@ export function MobileOverflowMenu({ onSearch }: MobileOverflowMenuProps) {
                     <TerminalSquare className="w-4 h-4 text-violet-500 flex-shrink-0" />
                   )}
                   <span className="text-sm text-foreground">{t('Open terminal')}</span>
+                </button>
+              )}
+
+              {canOpenChanges && (
+                <button
+                  onClick={handleOpenChanges}
+                  className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
+                >
+                  <GitCompareArrows className="w-4 h-4 text-orange-500 flex-shrink-0" />
+                  <span className="text-sm text-foreground">{t('Changes')}</span>
                 </button>
               )}
             </div>

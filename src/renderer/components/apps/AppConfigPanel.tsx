@@ -14,18 +14,19 @@
  */
 
 import { useState, useEffect, useCallback, lazy, Suspense } from 'react'
-import { Save, RotateCcw, Unplug, Loader2, FileCode, Settings, Code, AlertTriangle, Globe, Bell, Download, ExternalLink, FolderOpen, Send, Trash2, HelpCircle, RefreshCw, X, ChevronDown } from 'lucide-react'
+import { Save, RotateCcw, Unplug, Loader2, FileCode, Settings, Code, AlertTriangle, Globe, Bell, Download, ExternalLink, FolderOpen, Send, Trash2, HelpCircle, RefreshCw, X } from 'lucide-react'
 import { stringify as stringifyYaml, parse as parseYaml } from 'yaml'
 import { useAppsStore } from '../../stores/apps.store'
 import { useAppsPageStore } from '../../stores/apps-page.store'
 import { useTranslation, getCurrentLanguage } from '../../i18n'
-import type { InputDef, SubscriptionDef, AppSpec } from '../../../shared/apps/spec-types'
+import { usesWorkdayCalendar, type InputDef, type SubscriptionDef, type AppSpec } from '../../../shared/apps/spec-types'
 import type { InstalledApp } from '../../../shared/apps/app-types'
 import { resolvePermission } from '../../../shared/apps/app-types'
 import { findMissingRequiredConfig } from '../../../shared/apps/config-validation'
 import { resolveSpecI18n } from '../../utils/spec-i18n'
 import { api } from '../../api'
 import { useSpaceStore } from '../../stores/space.store'
+import { useAppStore } from '../../stores/app.store'
 import { AppModelSelector } from './AppModelSelector'
 import { AppNotifyChannelsSection } from './AppNotifyChannelsSection'
 import { AppCapabilitiesSection } from './AppCapabilitiesSection'
@@ -38,12 +39,18 @@ import { AppKnowledgeSection } from './AppKnowledgeSection'
 import { appTypeLabel } from './appTypeUtils'
 import { sanitizeCommandName } from './skill-import-utils'
 import { SystemPromptEditor } from './SystemPromptEditor'
+import { Disclosure } from '../ui/Disclosure'
 import { Switch } from '../ui/Switch'
+import { MemorySettingsPanel } from '../memory/MemorySettingsPanel'
+import { resolveMemorySettings, type MemoryStatus } from '../../../shared/types/memory'
 import { HttpTriggerCard } from '../common/HttpTriggerCard'
 import { SchedulePicker } from './SchedulePicker'
+import { AppRemindersSection } from './AppRemindersSection'
+import { AppClearChatsAction } from './AppClearChatsAction'
 import {
   extractScheduleValue,
   applyScheduleValue,
+  applyWorkdayCalendar,
   type ScheduleValue,
 } from './schedule-utils'
 
@@ -371,37 +378,6 @@ function SettingsGroup({ id, title, description, summary, dirty, children }: {
  * open/closed toggle. */
 const ADVANCED_EXPANDED_KEY = 'halo-app-settings-advanced-expanded'
 
-function CollapsibleSettingsGroup({ id, title, children }: {
-  id: string
-  title: string
-  children: React.ReactNode
-}) {
-  const [expanded, setExpanded] = useState(() => localStorage.getItem(ADVANCED_EXPANDED_KEY) === 'true')
-
-  const toggle = () => {
-    setExpanded(prev => {
-      const next = !prev
-      if (next) localStorage.setItem(ADVANCED_EXPANDED_KEY, 'true')
-      return next
-    })
-  }
-
-  return (
-    <div id={id} className="scroll-mt-4 bg-card border border-border rounded-xl px-4 py-4 sm:px-5">
-      <button
-        type="button"
-        onClick={toggle}
-        aria-expanded={expanded}
-        className={`flex w-full items-center gap-1.5 text-left ${expanded ? 'pb-3 border-b border-border/70' : ''}`}
-      >
-        <h2 className="text-sm font-semibold text-foreground flex-shrink-0">{title}</h2>
-        <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform ${expanded ? 'rotate-180' : ''}`} />
-      </button>
-      {expanded && <div className="space-y-5 mt-4">{children}</div>}
-    </div>
-  )
-}
-
 // ============================================
 // Settings Tab Content
 // ============================================
@@ -430,6 +406,20 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
 
   // Type-narrowed helpers for automation-specific fields
   const isAutomation = app.spec.type === 'automation'
+
+  const [savingMemory, setSavingMemory] = useState(false)
+  const [memoryError, setMemoryError] = useState<string | null>(null)
+
+  const loadMemoryStatus = useCallback(async (): Promise<MemoryStatus | null> => {
+    const res = await api.appGetMemoryStatus(appId)
+    return res.success ? res.data ?? null : null
+  }, [appId])
+
+  const consolidateMemoryNow = useCallback(async () => {
+    const res = await api.appConsolidateMemory(appId)
+    return res.success ? res.data ?? null : null
+  }, [appId])
+
   const specSystemPromptValue = app.spec.type === 'automation' ? app.spec.system_prompt : ''
   const specSubscriptions = app.spec.type === 'automation' ? (app.spec.subscriptions ?? []) : []
   const specRecommendedModel = app.spec.type === 'automation' ? app.spec.recommended_model : undefined
@@ -601,6 +591,12 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
     await updateAppSpec(appId, { subscriptions: newSubs })
   }
 
+  async function handleWorkdayCalendarToggle(enabled: boolean) {
+    if (!scheduleSubscription) return
+    const updated = applyWorkdayCalendar(scheduleSubscription, enabled)
+    await updateAppSpec(appId, { subscriptions: subscriptions.map(s => s === scheduleSubscription ? updated : s) })
+  }
+
   async function handleOpenDataFolder() {
     const res = await api.appOpenDataFolder(appId)
     if (!res.success) {
@@ -611,8 +607,13 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
   // ── Group quick-jump: a status board as much as a menu ──
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null)
 
+  const aiSources = useAppStore(state => state.config?.aiSources)
+  const hasMissingModelSource = !!app.userOverrides.modelSourceId && !!aiSources &&
+    !aiSources.sources.some(source => source.id === app.userOverrides.modelSourceId)
   const consumedCapabilities = ['ai-browser', 'ai-terminal', 'email', 'im-push'].filter(p => resolvePermission(app, p)).length
-  const modelSummary = app.userOverrides.modelId ?? specRecommendedModel ?? t('Default')
+  const modelSummary = hasMissingModelSource
+    ? t('Account removed. Choose another account.')
+    : app.userOverrides.modelId ?? specRecommendedModel ?? t('Default')
   const missingRequiredConfig = findMissingRequiredConfig(configSchema, app.userConfig)
   const scheduleBadge = currentScheduleValue
     ? (currentScheduleValue.type === 'every' ? currentScheduleValue.every : currentScheduleValue.cron)
@@ -800,10 +801,25 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
             />
           </div>
           {hasSchedule && currentScheduleValue ? (
-            <SchedulePicker
-              value={currentScheduleValue}
-              onChange={handleScheduleValueChange}
-            />
+            <>
+              <SchedulePicker
+                value={currentScheduleValue}
+                onChange={handleScheduleValueChange}
+              />
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm text-foreground">{t('Only on mainland China working days')}</div>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    {t('Skips public holidays and runs on make-up working days. Set the schedule to run every day; the holiday calendar decides which days count.')}
+                  </p>
+                </div>
+                <Switch
+                  checked={usesWorkdayCalendar(scheduleSubscription)}
+                  onCheckedChange={handleWorkdayCalendarToggle}
+                  size="sm"
+                />
+              </div>
+            </>
           ) : !hasSchedule && (
             <p className="text-xs text-muted-foreground">
               {t('No scheduled trigger. This app can be triggered manually or via IM bot.')}
@@ -813,6 +829,8 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
         {/* External systems triggering this digital human over HTTP is a
             trigger like any other, so it lives in this group. */}
         <HttpTriggerCard kind="app" id={appId} />
+        {/* So are the reminders it set in its conversations. */}
+        <AppRemindersSection appId={appId} />
         </SettingsGroup>
       )}
 
@@ -1018,204 +1036,250 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
       </SettingsGroup>
 
       {/* ── Group 7: Advanced (collapsed by default) ── */}
-      <CollapsibleSettingsGroup
-        id="settings-group-advanced"
-        title={t('Advanced')}
-      >
-        <UpgradeSection app={app} appId={appId} t={t} />
+      <div id="settings-group-advanced" className="scroll-mt-4 bg-card border border-border rounded-xl px-4 py-4 sm:px-5">
+        <Disclosure title={t('Advanced')} persistKey={ADVANCED_EXPANDED_KEY}>
+          <UpgradeSection app={app} appId={appId} t={t} />
 
-        {/* ── Spec Info (read-only summary + data directory) ── */}
-        <div className="space-y-2">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-1.5">
-            <FileCode className="w-3.5 h-3.5" />
-            {t('App Spec')}
-          </h3>
-          <div className="bg-secondary rounded-lg p-3 text-xs font-mono space-y-1">
-            <div className="flex gap-2">
-              <span className="text-muted-foreground w-20 flex-shrink-0">{t('Type')}</span>
-              <span className="text-foreground">{t(appTypeLabel(app.spec.type))}</span>
-            </div>
-            <div className="flex gap-2">
-              <span className="text-muted-foreground w-20 flex-shrink-0">{t('Version')}</span>
-              <span className="text-foreground">{app.spec.version}</span>
-            </div>
-            <div className="flex gap-2">
-              <span className="text-muted-foreground w-20 flex-shrink-0">{t('Spec')}</span>
-              <span className="text-foreground">v{app.spec.spec_version}</span>
-            </div>
-            {subscriptions.length > 0 && (
+          {/* ── Spec Info (read-only summary + data directory) ── */}
+          <div className="space-y-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-1.5">
+              <FileCode className="w-3.5 h-3.5" />
+              {t('App Spec')}
+            </h3>
+            <div className="bg-secondary rounded-lg p-3 text-xs font-mono space-y-1">
               <div className="flex gap-2">
-                <span className="text-muted-foreground w-20 flex-shrink-0">{t('Triggers')}</span>
-                <span className="text-foreground">
-                  {subscriptions.map(s => s.source.type).join(', ')}
-                </span>
+                <span className="text-muted-foreground w-20 flex-shrink-0">{t('Type')}</span>
+                <span className="text-foreground">{t(appTypeLabel(app.spec.type))}</span>
               </div>
-            )}
-            {app.spaceId && spaceName && (
-              <div className="flex gap-2 items-center">
-                <span className="text-muted-foreground w-20 flex-shrink-0 flex items-center gap-1">
-                  {t('Workspace')}
-                  <InfoTip text={t('The workspace folder where the digital human saves code files, task outputs, and work artifacts.')} />
-                </span>
-                <button
-                  onClick={() => useSpaceStore.getState().openSpaceFolder(app.spaceId!)}
-                  className="text-foreground hover:text-primary transition-colors flex items-center gap-1 group"
-                >
-                  <FolderOpen className="w-3 h-3 text-muted-foreground group-hover:text-primary transition-colors" />
-                  <span className="underline decoration-dotted underline-offset-2">{spaceName}</span>
-                </button>
+              <div className="flex gap-2">
+                <span className="text-muted-foreground w-20 flex-shrink-0">{t('Version')}</span>
+                <span className="text-foreground">{app.spec.version}</span>
               </div>
-            )}
-            <div className="flex gap-2 items-start">
-              <span className="text-muted-foreground w-20 flex-shrink-0 pt-px flex items-center gap-1">
-                {t('Memory Files')}
-                <InfoTip text={t('Internal runtime state (memory.md and run history). Separate from workspace files and not affected by space operations.')} />
-              </span>
-              <div className="min-w-0 flex-1">
-                {dataPath && (
-                  <p className="text-foreground/60 truncate text-[11px] leading-relaxed select-all" title={dataPath}>
-                    {dataPath}
-                  </p>
-                )}
-                <button
-                  onClick={handleOpenDataFolder}
-                  className="text-foreground hover:text-primary transition-colors flex items-center gap-1 group mt-0.5"
-                  title={t('Reveal in Finder')}
-                >
-                  <FolderOpen className="w-3 h-3 text-muted-foreground group-hover:text-primary transition-colors" />
-                  <span className="underline decoration-dotted underline-offset-2">
-                    {t('Reveal in Finder')}
+              <div className="flex gap-2">
+                <span className="text-muted-foreground w-20 flex-shrink-0">{t('Spec')}</span>
+                <span className="text-foreground">v{app.spec.spec_version}</span>
+              </div>
+              {subscriptions.length > 0 && (
+                <div className="flex gap-2">
+                  <span className="text-muted-foreground w-20 flex-shrink-0">{t('Triggers')}</span>
+                  <span className="text-foreground">
+                    {subscriptions.map(s => s.source.type).join(', ')}
                   </span>
-                </button>
+                </div>
+              )}
+              {app.spaceId && spaceName && (
+                <div className="flex gap-2 items-center">
+                  <span className="text-muted-foreground w-20 flex-shrink-0 flex items-center gap-1">
+                    {t('Workspace')}
+                    <InfoTip text={t('The workspace folder where the digital human saves code files, task outputs, and work artifacts.')} />
+                  </span>
+                  <button
+                    onClick={() => useSpaceStore.getState().openSpaceFolder(app.spaceId!)}
+                    className="text-foreground hover:text-primary transition-colors flex items-center gap-1 group"
+                  >
+                    <FolderOpen className="w-3 h-3 text-muted-foreground group-hover:text-primary transition-colors" />
+                    <span className="underline decoration-dotted underline-offset-2">{spaceName}</span>
+                  </button>
+                </div>
+              )}
+              <div className="flex gap-2 items-start">
+                <span className="text-muted-foreground w-20 flex-shrink-0 pt-px flex items-center gap-1">
+                  {t('Memory Files')}
+                  <InfoTip text={t('Internal runtime state (memory.md and run history). Separate from workspace files and not affected by space operations.')} />
+                </span>
+                <div className="min-w-0 flex-1">
+                  {dataPath && (
+                    <p className="text-foreground/60 truncate text-[11px] leading-relaxed select-all" title={dataPath}>
+                      {dataPath}
+                    </p>
+                  )}
+                  <button
+                    onClick={handleOpenDataFolder}
+                    className="text-foreground hover:text-primary transition-colors flex items-center gap-1 group mt-0.5"
+                    title={t('Reveal in Finder')}
+                  >
+                    <FolderOpen className="w-3 h-3 text-muted-foreground group-hover:text-primary transition-colors" />
+                    <span className="underline decoration-dotted underline-offset-2">
+                      {t('Reveal in Finder')}
+                    </span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
 
-        {/* ── Runtime Control: escape hatch for restarting the agent. Not in
-            Danger Zone because restart is non-destructive (no data loss). ── */}
-        <div className="space-y-2">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            {t('Runtime Control')}
-          </h3>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              onClick={onRestartAgent}
-              disabled={restarting}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-foreground hover:text-primary border border-border hover:border-primary/60 rounded-lg transition-colors disabled:opacity-50"
-            >
-              {restarting
-                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                : <RefreshCw className="w-3.5 h-3.5" />}
-              {t('Restart {{name}}', { name: 'Agent' })}
-            </button>
-            {restartedAt !== null && (
-              <span className="text-xs text-green-500">{t('Restarted')}</span>
-            )}
-          </div>
-          <p className="text-[11px] text-muted-foreground/60">
-            {t('Reloads the prompt and configuration for this digital human across all chat channels. Conversation history is preserved.')}
-          </p>
-        </div>
-
-        {/* ── Danger Zone ── */}
-        <div className="space-y-2">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            {t('Danger zone')}
-          </h3>
-          {showClearMemoryConfirm ? (
-            <div className="p-3 border border-orange-400/30 rounded-lg space-y-2">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 text-orange-400 flex-shrink-0 mt-0.5" />
-                <p className="text-sm text-muted-foreground">
-                  {t('This will permanently delete all memory files (memory.md and run history). The app will start fresh on its next run.')}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={async () => {
-                    setClearingMemory(true)
-                    try {
-                      const res = await api.appClearMemory(appId)
-                      if (!res.success) {
-                        console.error('[AppConfigPanel] clearAppMemory failed:', res.error)
-                      }
-                    } catch (err) {
-                      console.error('[AppConfigPanel] clearAppMemory error:', err)
-                    } finally {
-                      setClearingMemory(false)
-                      setShowClearMemoryConfirm(false)
-                    }
-                  }}
-                  disabled={clearingMemory}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-orange-400 hover:text-orange-300 border border-orange-400/30 hover:border-orange-400/60 rounded-lg transition-colors disabled:opacity-50"
-                >
-                  {clearingMemory ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
-                  {t('Confirm Clear')}
-                </button>
-                <button
-                  onClick={() => setShowClearMemoryConfirm(false)}
-                  disabled={clearingMemory}
-                  className="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground rounded-lg transition-colors disabled:opacity-50"
-                >
-                  {t('Cancel')}
-                </button>
-              </div>
+          {/* ── Memory: this digital human's own memory, and read-only access
+              to what its workspace has learned. ── */}
+          {isAutomation && (
+            <div className="space-y-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                {t('Memory')}
+              </h3>
+              <MemorySettingsPanel
+                settings={resolveMemorySettings(app.userOverrides.memory)}
+                onChange={async (next) => {
+                  // One change at a time: a second click before the first is
+                  // saved would be computed from settings that are about to change.
+                  setSavingMemory(true)
+                  setMemoryError(null)
+                  const ok = await updateAppOverrides(appId, { memory: next })
+                  setSavingMemory(false)
+                  if (!ok) setMemoryError(t('Memory settings could not be saved. Please try again.'))
+                }}
+                disabled={savingMemory}
+                loadStatus={loadMemoryStatus}
+                consolidateNow={consolidateMemoryNow}
+              />
+              {memoryError && <p className="text-xs text-destructive">{memoryError}</p>}
+              {app.spaceId && (
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm text-foreground">{t('Use workspace memory')}</div>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {resolveMemorySettings(app.userOverrides.memory).enabled
+                        ? t('Let this digital human read the topics its workspace has learned, read-only, in every conversation it has. Applies to new conversations.')
+                        : t('Turn memory on to use this.')}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={app.userOverrides.spaceMemoryAccess === true}
+                    disabled={!resolveMemorySettings(app.userOverrides.memory).enabled}
+                    onCheckedChange={async (checked) => {
+                      await updateAppOverrides(appId, { spaceMemoryAccess: checked ? true : undefined })
+                    }}
+                  />
+                </div>
+              )}
             </div>
-          ) : showUninstallConfirm ? (
-            <div className="p-3 border border-red-400/30 rounded-lg space-y-2">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
-                <p className="text-sm text-muted-foreground">
-                  {t('Are you sure you want to uninstall this app? You can reinstall it later.')}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={async () => {
-                    const ok = await uninstallApp(appId)
-                    setShowUninstallConfirm(false)
-                    // Leave the settings of an app that no longer runs; the
-                    // uninstalled view offers reinstall/delete instead.
-                    if (ok) useAppsPageStore.getState().selectApp(appId, 'uninstalled')
-                  }}
-                  className="px-3 py-1.5 text-sm text-red-400 hover:text-red-300 border border-red-400/30 hover:border-red-400/60 rounded-lg transition-colors"
-                >
-                  {t('Confirm Uninstall')}
-                </button>
-                <button
-                  onClick={() => setShowUninstallConfirm(false)}
-                  className="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground rounded-lg transition-colors"
-                >
-                  {t('Cancel')}
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={() => setShowClearMemoryConfirm(true)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-orange-400 hover:text-orange-300 border border-orange-400/30 hover:border-orange-400/60 rounded-lg transition-colors"
-                >
-                  <Trash2 className="w-4 h-4" />
-                  {t('Clear Memory')}
-                </button>
-                <button
-                  onClick={() => setShowUninstallConfirm(true)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-red-400 hover:text-red-300 border border-red-400/30 hover:border-red-400/60 rounded-lg transition-colors"
-                >
-                  <Unplug className="w-4 h-4" />
-                  {t('Uninstall')}
-                </button>
-              </div>
-              <p className="text-[11px] text-muted-foreground/60 mt-1">
-                {t('Memory is the internal runtime state (memory.md and run history). Clearing it does not affect files in the space.')}
-              </p>
-            </>
           )}
-        </div>
-      </CollapsibleSettingsGroup>
+
+          {/* ── Runtime Control: escape hatch for restarting the agent. Not in
+              Danger Zone because restart is non-destructive (no data loss). ── */}
+          <div className="space-y-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              {t('Runtime Control')}
+            </h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={onRestartAgent}
+                disabled={restarting}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-foreground hover:text-primary border border-border hover:border-primary/60 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {restarting
+                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  : <RefreshCw className="w-3.5 h-3.5" />}
+                {t('Restart {{name}}', { name: 'Agent' })}
+              </button>
+              {restartedAt !== null && (
+                <span className="text-xs text-green-500">{t('Restarted')}</span>
+              )}
+            </div>
+            <p className="text-[11px] text-muted-foreground/60">
+              {t('Reloads the prompt and configuration for this digital human across all chat channels. Conversation history is preserved.')}
+              {' '}{t('To start every conversation afresh, use “{{action}}” below.', { action: t('Clear all conversations') })}
+            </p>
+          </div>
+
+          {/* ── Danger Zone ── */}
+          <div className="space-y-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              {t('Danger zone')}
+            </h3>
+            {showClearMemoryConfirm ? (
+              <div className="p-3 border border-orange-400/30 rounded-lg space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-orange-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-sm text-muted-foreground">
+                    {t('This will permanently delete all memory files (memory.md and run history). The app will start fresh on its next run.')}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={async () => {
+                      setClearingMemory(true)
+                      try {
+                        const res = await api.appClearMemory(appId)
+                        if (!res.success) {
+                          console.error('[AppConfigPanel] clearAppMemory failed:', res.error)
+                        }
+                      } catch (err) {
+                        console.error('[AppConfigPanel] clearAppMemory error:', err)
+                      } finally {
+                        setClearingMemory(false)
+                        setShowClearMemoryConfirm(false)
+                      }
+                    }}
+                    disabled={clearingMemory}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-orange-400 hover:text-orange-300 border border-orange-400/30 hover:border-orange-400/60 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {clearingMemory ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                    {t('Confirm Clear')}
+                  </button>
+                  <button
+                    onClick={() => setShowClearMemoryConfirm(false)}
+                    disabled={clearingMemory}
+                    className="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {t('Cancel')}
+                  </button>
+                </div>
+              </div>
+            ) : showUninstallConfirm ? (
+              <div className="p-3 border border-red-400/30 rounded-lg space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-sm text-muted-foreground">
+                    {t('Are you sure you want to uninstall this app? You can reinstall it later.')}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={async () => {
+                      const ok = await uninstallApp(appId)
+                      setShowUninstallConfirm(false)
+                      // Leave the settings of an app that no longer runs; the
+                      // uninstalled view offers reinstall/delete instead.
+                      if (ok) useAppsPageStore.getState().selectApp(appId, 'uninstalled')
+                    }}
+                    className="px-3 py-1.5 text-sm text-red-400 hover:text-red-300 border border-red-400/30 hover:border-red-400/60 rounded-lg transition-colors"
+                  >
+                    {t('Confirm Uninstall')}
+                  </button>
+                  <button
+                    onClick={() => setShowUninstallConfirm(false)}
+                    className="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground rounded-lg transition-colors"
+                  >
+                    {t('Cancel')}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => setShowClearMemoryConfirm(true)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-orange-400 hover:text-orange-300 border border-orange-400/30 hover:border-orange-400/60 rounded-lg transition-colors"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    {t('Clear Memory')}
+                  </button>
+                  <button
+                    onClick={() => setShowUninstallConfirm(true)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-red-400 hover:text-red-300 border border-red-400/30 hover:border-red-400/60 rounded-lg transition-colors"
+                  >
+                    <Unplug className="w-4 h-4" />
+                    {t('Uninstall')}
+                  </button>
+                </div>
+                <p className="text-[11px] text-muted-foreground/60 mt-1">
+                  {t('Memory is the internal runtime state (memory.md and run history). Clearing it does not affect files in the space.')}
+                </p>
+              </>
+            )}
+            <AppClearChatsAction appId={appId} />
+          </div>
+        </Disclosure>
+      </div>
       </div>
     </div>
   )
@@ -1441,7 +1505,7 @@ export function AppConfigPanel({ appId, spaceName }: AppConfigPanelProps) {
     // No scroll container of its own: the page's detail pane scrolls, and a
     // second (never-scrolling) overflow context here would become the sticky
     // group nav's reference frame and keep it from ever sticking.
-    <div className="p-4 sm:p-6 space-y-4">
+    <div className="px-6 py-4 sm:px-10 sm:py-6 space-y-4">
       {/* Tab switcher — right-aligned, above the grouped settings */}
       <div className="flex items-center gap-0.5 bg-secondary rounded-lg p-0.5 w-fit ml-auto">
         <button

@@ -11,7 +11,7 @@
  * - Copy to clipboard, open external
  */
 
-import { useRef, useState, useCallback, useMemo } from 'react'
+import { useRef, useState, useCallback, useMemo, useEffect } from 'react'
 import {
   Copy,
   Check,
@@ -20,11 +20,15 @@ import {
   Save,
   X,
   FileCode,
+  AlertTriangle,
 } from 'lucide-react'
 import { api } from '../../../api'
 import type { CanvasTab } from '../../../stores/canvas.store'
+import { useCanvasActions } from '../../../hooks/useCanvasLifecycle'
 import { useTranslation } from '../../../i18n'
+import { notifyRevealOutcome, referenceExtension, revealInEditor } from '../../references'
 import { CodeMirrorEditor, type CodeMirrorEditorRef } from './CodeMirrorEditor'
+import { countLines } from './count-lines'
 
 // ============================================
 // Types
@@ -35,26 +39,60 @@ interface CodeViewerProps {
   onScrollChange?: (position: number) => void
   onContentChange?: (content: string) => void
   onSaveComplete?: (content: string) => void
+  /** Discard unsaved edits (restore the file's text on disk). */
+  onRevert?: () => void
+  onResolveDiskConflict?: (keep: 'disk' | 'mine') => void
 }
 
 // ============================================
 // Component
 // ============================================
 
-export function CodeViewer({ tab, onScrollChange, onContentChange, onSaveComplete }: CodeViewerProps) {
+export function CodeViewer({
+  tab,
+  onScrollChange,
+  onContentChange,
+  onSaveComplete,
+  onRevert,
+  onResolveDiskConflict,
+}: CodeViewerProps) {
   const { t } = useTranslation()
   const editorRef = useRef<CodeMirrorEditorRef>(null)
 
   // State
   const [copied, setCopied] = useState(false)
-  const [isEditing, setIsEditing] = useState(false)
+  // The viewer remounts on every tab switch; unsaved edits mean the user was
+  // editing, so come back in edit mode.
+  const [isEditing, setIsEditing] = useState(tab.isDirty)
   const [isSaving, setIsSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
 
   // Computed values
   const canOpenExternal = !api.isRemoteMode() && tab.path
   const canEdit = !!tab.path // Can only edit files with a path
-  const lineCount = useMemo(() => (tab.content || '').split('\n').length, [tab.content])
+  const lineCount = useMemo(() => countLines(tab.content || ''), [tab.content])
+
+  // Lines of the file on disk can be pointed at; unsaved edits are not what the AI would read.
+  const tabRef = useRef(tab)
+  tabRef.current = tab
+  const [editorExtensions] = useState(() => [referenceExtension({
+    source: () => {
+      const current = tabRef.current
+      return current.path && !current.isDirty ? { kind: 'file', path: current.path, precision: 'lines' } : null
+    },
+  })])
+
+  // Going back to a place in this file, once its text is in the editor.
+  const { consumeReveal } = useCanvasActions()
+  const reveal = tab.reveal
+  const contentReady = !tab.isLoading && tab.content !== undefined
+  useEffect(() => {
+    if (!reveal || !contentReady) return
+    const view = editorRef.current?.getView()
+    if (!view) return
+    notifyRevealOutcome(revealInEditor(view, { range: reveal.range, quote: reveal.passage ? undefined : reveal.quote, commentId: reveal.commentId }))
+    consumeReveal(tabRef.current.id, reveal.seq)
+  }, [reveal, contentReady, consumeReveal])
 
   // ============================================
   // Handlers
@@ -94,15 +132,12 @@ export function CodeViewer({ tab, onScrollChange, onContentChange, onSaveComplet
     }, 100)
   }, [])
 
-  // Cancel edit mode
+  // Cancel edit mode, discarding unsaved edits
   const handleCancelEdit = useCallback(() => {
-    // Restore original content
-    if (editorRef.current) {
-      editorRef.current.setContent(tab.content || '')
-    }
+    onRevert?.()
     setIsEditing(false)
     setSaveError(null)
-  }, [tab.content])
+  }, [onRevert])
 
   // Save changes
   const handleSave = useCallback(async () => {
@@ -110,8 +145,8 @@ export function CodeViewer({ tab, onScrollChange, onContentChange, onSaveComplet
 
     const newContent = editorRef.current.getContent()
 
-    // Check if content actually changed
-    if (!editorRef.current.hasChanges()) {
+    // Edits from before a remount are only known to the tab, not the editor.
+    if (!tab.isDirty && !editorRef.current.hasChanges()) {
       setIsEditing(false)
       return
     }
@@ -137,7 +172,7 @@ export function CodeViewer({ tab, onScrollChange, onContentChange, onSaveComplet
     } finally {
       setIsSaving(false)
     }
-  }, [tab.path, onSaveComplete, t])
+  }, [tab.path, tab.isDirty, onSaveComplete, t])
 
   // Handle scroll
   const handleScroll = useCallback(
@@ -276,6 +311,32 @@ export function CodeViewer({ tab, onScrollChange, onContentChange, onSaveComplet
         </div>
       </div>
 
+      {tab.diskConflict && (
+        <div
+          role="alert"
+          className="flex flex-col gap-2 px-3 py-2 border-b border-border bg-halo-warning/10 text-xs sm:flex-row sm:items-center sm:justify-between"
+        >
+          <span className="flex items-center gap-1.5 text-foreground">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-halo-warning" />
+            {t('This file changed on disk while you were editing it.')}
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => onResolveDiskConflict?.('disk')}
+              className="px-2 py-1 rounded hover:bg-secondary transition-colors text-muted-foreground"
+            >
+              {t('Load disk version')}
+            </button>
+            <button
+              onClick={() => onResolveDiskConflict?.('mine')}
+              className="px-2 py-1 rounded bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+            >
+              {t('Keep my edits')}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Code Editor */}
       <div className="flex-1 overflow-hidden">
         <CodeMirrorEditor
@@ -286,7 +347,8 @@ export function CodeViewer({ tab, onScrollChange, onContentChange, onSaveComplet
           isEditing={isEditing}
           onChange={isEditing ? onContentChange : undefined}
           onScroll={handleScroll}
-          scrollPosition={tab.scrollPosition}
+          scrollPosition={tab.view.scrollPosition}
+          extensions={editorExtensions}
         />
       </div>
     </div>

@@ -20,12 +20,14 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
-const { channel, appChatCalls } = vi.hoisted(() => ({
+const { channel, appChatCalls, turn } = vi.hoisted(() => ({
   channel: {
     config: undefined as Record<string, unknown> | undefined,
     instance: undefined as Record<string, unknown> | undefined,
   },
   appChatCalls: [] as Record<string, unknown>[],
+  /** How the woken turn answers: its text, how it ended if it stopped short, or how it failed. */
+  turn: { reply: 'answer for the person', ending: undefined as AppChatTurnEnding | undefined, failure: undefined as Error | undefined },
 }))
 
 vi.mock('../../../../../src/main/apps/runtime/app-chat-live-turn', () => ({
@@ -52,15 +54,22 @@ vi.mock('../../../../../src/main/apps/runtime/im-session-registry', () => ({
   getImSessionRegistry: () => null,
 }))
 
+// What a chat is told of a refused local connection is im-error-reply.test's.
+vi.mock('../../../../../src/main/services/agent', () => ({ isRefusedLocalConnection: () => false }))
+
 vi.mock('../../../../../src/main/apps/runtime/app-chat', () => ({
   sendAppChatMessage: async (request: Record<string, unknown>) => {
     appChatCalls.push(request)
-    ;(request.onReply as ((s: string) => void) | undefined)?.('answer for the person')
+    if (turn.failure) throw turn.failure
+    const onReply = request.onReply as ((s: string, ending?: AppChatTurnEnding) => void) | undefined
+    if (turn.ending) onReply?.(turn.reply, turn.ending)
+    else onReply?.(turn.reply)
   },
 }))
 
 import { createDefaultSessionDeps } from '../../../../../src/main/apps/runtime/team'
 import type { TeamStore } from '../../../../../src/main/apps/team'
+import { AppChatTurnInterrupted, withTurnEndingNote, type AppChatTurnEnding } from '../../../../../src/main/apps/runtime/turn-ending'
 
 const TEAM_ID = 'team-1'
 const EPOCH_ID = 'epoch-1'
@@ -96,6 +105,9 @@ function wake(store: TeamStore) {
 beforeEach(() => {
   appChatCalls.length = 0
   pushToChat.mockClear()
+  turn.reply = 'answer for the person'
+  turn.ending = undefined
+  turn.failure = undefined
   channel.config = { id: INSTANCE_ID, teamId: TEAM_ID, appId: MEMBER_APP_ID }
   channel.instance = {
     providerType: 'wecom-bot',
@@ -122,6 +134,56 @@ describe('woken front-desk turn — the IM route is resolved in full', () => {
     expect(pushToChat).toHaveBeenCalledWith(CHAT_ID, 'answer for the person', 'direct')
   })
 
+  it('tells the chat a woken turn stopped at the step limit, and gives the team the text as written', async () => {
+    turn.reply = 'half of the analysis'
+    turn.ending = { kind: 'max_turns', limit: 3 }
+
+    const result = await wake(storeWithEpoch())
+
+    expect(result.finalMessage).toBe('half of the analysis')
+    expect(pushToChat).toHaveBeenCalledWith(
+      CHAT_ID,
+      'half of the analysis\n\n（已达到单次最多 3 步的上限，回复“继续”可接着做）',
+      'direct',
+    )
+  })
+
+  it('tells the chat even when the step limit came before any text', async () => {
+    turn.reply = ''
+    turn.ending = { kind: 'max_turns', limit: 3 }
+
+    await wake(storeWithEpoch())
+
+    expect(pushToChat).toHaveBeenCalledWith(CHAT_ID, '（已达到单次最多 3 步的上限，回复“继续”可接着做）', 'direct')
+  })
+
+  it('tells the chat a woken turn was cut off before writing anything, and the team still gets the failure', async () => {
+    turn.failure = new AppChatTurnInterrupted()
+
+    await expect(wake(storeWithEpoch())).rejects.toBeInstanceOf(AppChatTurnInterrupted)
+
+    expect(pushToChat).toHaveBeenCalledWith(CHAT_ID, withTurnEndingNote('', { kind: 'interrupted' }), 'direct')
+  })
+
+  it('tells the chat a woken turn failed, as it is told of a turn of its own, without this computer\'s paths', async () => {
+    turn.failure = new Error("ENOENT: no such file or directory, open '/Users/lin/space/plan.md'")
+
+    await expect(wake(storeWithEpoch())).rejects.toThrow('ENOENT')
+
+    expect(pushToChat).toHaveBeenCalledWith(CHAT_ID, "⚠️ Error: ENOENT: no such file or directory, open '<local path>'", 'direct')
+  })
+
+  it('logs a push the chat would not take, and does not try again', async () => {
+    pushToChat.mockReturnValueOnce(false)
+    const warnings = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await wake(storeWithEpoch())
+
+    expect(pushToChat).toHaveBeenCalledTimes(1)
+    expect(warnings.mock.calls.some(([line]) => String(line).includes('not taken') && String(line).includes(CHAT_ID))).toBe(true)
+    warnings.mockRestore()
+  })
+
   it('leaves file send undefined for a text-only channel — the same answer the inbound route gives', async () => {
     channel.instance = { providerType: 'wecom-bot', pushToChat }
 
@@ -142,6 +204,15 @@ describe('woken turns that are NOT the front desk stay internal', () => {
     const request = appChatCalls[0]
     expect(request.imSession).toBeUndefined()
     expect(request.imFileSend).toBeUndefined()
+    expect(pushToChat).not.toHaveBeenCalled()
+  })
+
+  it('tells no chat when such a turn fails', async () => {
+    channel.config = { id: INSTANCE_ID, teamId: TEAM_ID, appId: 'someone-else' }
+    turn.failure = new AppChatTurnInterrupted()
+
+    await expect(wake(storeWithEpoch())).rejects.toBeInstanceOf(AppChatTurnInterrupted)
+
     expect(pushToChat).not.toHaveBeenCalled()
   })
 

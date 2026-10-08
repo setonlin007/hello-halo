@@ -8,18 +8,33 @@
  */
 import { create } from 'zustand'
 import { api } from '../../api'
-import type { Conversation, ConversationMeta, Message, ToolCall, Artifact, Thought, AgentEventBase, ImageAttachment, CompactInfo, CanvasContext, AgentErrorType, PendingQuestion, Question, TaskStatus, PulseItem, PulseReadInfo, TaskProgress } from '../../types'
+import type { Conversation, ConversationMeta, Message, ToolCall, Artifact, Thought, AgentEventBase, ImageAttachment, CompactInfo, ApiRetryNotice, CanvasContext, AgentErrorType, WorkDirIssue, PendingQuestion, Question, TaskStatus, PulseItem, PulseReadInfo, TaskProgress } from '../../types'
 import type { SessionInitInfo } from '../../types/slash-command'
 import { PULSE_READ_GRACE_PERIOD_MS } from '../../types'
+import type { ReasoningEffortLevel } from '../../../shared/constants/reasoning-effort'
 import { canvasLifecycle } from '../../services/canvas-lifecycle'
 import type { StoreApi } from 'zustand'
+import type { GoalInput } from '../../../shared/types/goal'
+import type { ApiRetryEvent } from '../../../shared/types/api-retry'
+import type { ContentReference } from '../../../shared/types/content-reference'
 
-// LRU cache size limit
+// Conversation cache bounds (backend/cache.ts): entries, and estimated heap
+// (one conversation can hold megabytes of inline images or v1 thoughts).
 export const CONVERSATION_CACHE_SIZE = 10
+export const CONVERSATION_CACHE_BYTES = 32 * 1024 * 1024
+// Thoughts read on demand, across all cached conversations.
+export const LOADED_THOUGHTS_BYTES = 16 * 1024 * 1024
 
 // Store-level timer for pulseReadAt cleanup (independent of UI components)
 
 // Per-space state (conversations metadata belong to a space)
+export interface SendMessageOptions {
+  /** Set as the conversation goal before this message runs. */
+  goal?: GoalInput
+  /** Places the user pointed at, in the order they added them; the text may then be empty. */
+  references?: ContentReference[]
+}
+
 export interface SpaceState {
   conversations: ConversationMeta[]  // Lightweight metadata, no messages
   currentConversationId: string | null
@@ -46,8 +61,15 @@ export interface SessionState {
   pendingToolApproval: ToolCall | null
   error: string | null
   errorType: AgentErrorType | null  // Special error type for custom UI handling
+  // The folder a turn could not start in; set with 'working_dir_unavailable'
+  workDirIssue?: WorkDirIssue | null
+  // The user has opened this error; it stays on screen but no longer needs
+  // them. Set instead of clearing where the error lives only in this session.
+  errorSeen?: boolean
   // Compact notification
   compactInfo: CompactInfo | null
+  // Model request the engine is waiting to resend; mirrors main, never persisted
+  apiRetry: ApiRetryNotice | null
   // Text block version - increments on each new text block (for StreamingBubble reset)
   textBlockVersion: number
   // Pending question from AskUserQuestion tool
@@ -75,6 +97,7 @@ export function createEmptySessionState(): SessionState {
     error: null,
     errorType: null,
     compactInfo: null,
+    apiRetry: null,
     textBlockVersion: 0,
     pendingQuestion: null,
     queuedMessages: [],
@@ -116,6 +139,10 @@ export interface ChatState {
   // Current space pointer
   currentSpaceId: string | null
 
+  // Reported by the mounted chat view, not inferred from the remembered selection.
+  visibleConversationId: string | null
+  setVisibleConversation: (conversationId: string | null) => void
+
   // Pulse: pending cross-space navigation target (set by navigateToConversation, consumed by SpacePage init)
   pendingPulseNavigation: string | null
 
@@ -150,6 +177,10 @@ export interface ChatState {
   isLoading: boolean
   isLoadingConversation: boolean  // Loading full conversation
 
+  // Conversations that could not be read into the cache, with the reason;
+  // cleared when a read succeeds.
+  conversationLoadErrors: Map<string, string>
+
   // In-memory (non-persisted) composer draft per conversationId — switching
   // the input's digital-human selector stashes/restores each link's unsent
   // text. Keyed by conversationId so it works uniformly for space and
@@ -174,17 +205,20 @@ export interface ChatState {
   getSpaceState: (spaceId: string) => SpaceState
   getCurrentConversation: () => Conversation | null
   getCurrentConversationMeta: () => ConversationMeta | null
-  getCurrentSession: () => SessionState
   getSession: (conversationId: string) => SessionState
   getConversations: () => ConversationMeta[]
   getCurrentConversationId: () => string | null
   getCachedConversation: (conversationId: string) => Conversation | null
+  /** The conversation on screen: the selected digital human's, else the regular one. */
+  getActiveConversationId: () => string | null
+  getActiveConversation: () => Conversation | null
 
   // Space actions
   setCurrentSpace: (spaceId: string) => void
 
   // Conversation actions
-  loadConversations: (spaceId: string) => Promise<void>
+  /** Resolves whether the list was read. */
+  loadConversations: (spaceId: string) => Promise<boolean>
   preloadAllSpaceConversations: (spaceIds: string[]) => void
   createConversation: (spaceId: string) => Promise<Conversation | null>
   selectConversation: (conversationId: string) => void
@@ -192,13 +226,40 @@ export interface ChatState {
   renameConversation: (spaceId: string, conversationId: string, newTitle: string) => Promise<boolean>
   toggleStarConversation: (spaceId: string, conversationId: string, starred: boolean) => Promise<boolean>
   setConversationModel: (spaceId: string, conversationId: string, modelSourceId: string, modelId: string) => Promise<boolean>
+  setConversationReasoningEffort: (spaceId: string, conversationId: string, level: ReasoningEffortLevel) => Promise<boolean>
   attachKnowledgeBase: (spaceId: string, conversationId: string, kbId: string) => Promise<void>
   detachKnowledgeBase: (spaceId: string, conversationId: string, kbId: string) => Promise<void>
 
   // Messaging
-  sendMessage: (content: string, images?: ImageAttachment[], thinkingEnabled?: boolean) => Promise<void>
+  /**
+   * Resolves false when main refused the message before recording it; the
+   * optimistic bubble is then withdrawn so the caller can restore the draft.
+   */
+  sendMessage: (content: string, images?: ImageAttachment[], thinkingEnabled?: boolean, options?: SendMessageOptions) => Promise<boolean>
   stopGeneration: (conversationId?: string) => Promise<void>
-  injectMessage: (conversationId: string, message: string) => Promise<void>
+  /**
+   * Add to the running turn; references may carry the message alone. Resolves
+   * false when nothing went out, so the caller can restore the draft.
+   */
+  injectMessage: (conversationId: string, message: string, references?: ContentReference[]) => Promise<boolean>
+  /** Drop a message from the "queued for the running turn" list. */
+  dequeueMessage: (conversationId: string, message: string) => void
+  /** Empty a conversation's history in place (digital-human default sessions). */
+  clearConversation: (conversationId: string) => Promise<boolean>
+  /** Delete a local digital-human session and everything held for it. */
+  deleteAppChatSession: (appId: string, spaceId: string, conversationId: string) => Promise<boolean>
+  /**
+   * Read a conversation in (if it is not cached) and pick up a running turn,
+   * without changing what is selected. `warm: false` also leaves its engine
+   * session alone, for a view that only reports on the conversation.
+   */
+  openConversation: (conversationId: string, options?: { warm?: boolean }) => Promise<void>
+  /** Read the next older page of a paged conversation into the cache. */
+  loadEarlierMessages: (conversationId: string) => Promise<void>
+  /** Make sure one message (a search result) is among the loaded ones. */
+  ensureMessageLoaded: (conversationId: string, messageId: string) => Promise<void>
+  /** Re-read a conversation after events may have been missed (reconnect). */
+  refreshConversation: (conversationId: string) => Promise<void>
 
   // Tool approval
   approveTool: (conversationId: string) => Promise<void>
@@ -211,7 +272,7 @@ export interface ChatState {
   handleAgentMessage: (data: AgentEventBase & { content: string; isComplete: boolean }) => void
   handleAgentToolCall: (data: AgentEventBase & ToolCall) => void
   handleAgentToolResult: (data: AgentEventBase & { toolId: string; result: string; isError: boolean }) => void
-  handleAgentError: (data: AgentEventBase & { error: string; errorType?: AgentErrorType }) => void
+  handleAgentError: (data: AgentEventBase & { error: string; errorType?: AgentErrorType; workDirIssue?: WorkDirIssue }) => void
   handleAgentComplete: (data: AgentEventBase) => void
   handleAgentThought: (data: AgentEventBase & { thought: Thought }) => void
   handleAgentThoughtDelta: (data: AgentEventBase & {
@@ -227,6 +288,7 @@ export interface ChatState {
     taskProgress?: TaskProgress
   }) => void
   handleAgentCompact: (data: AgentEventBase & { trigger: 'manual' | 'auto'; preTokens: number }) => void
+  handleAgentApiRetry: (data: ApiRetryEvent) => void
   handleAgentSessionInfo: (data: AgentEventBase & SessionInitInfo) => void
   handleAgentTurnStart: (data: AgentEventBase & { autonomous?: boolean }) => void
 
@@ -241,6 +303,9 @@ export interface ChatState {
   cleanupPulseReadAt: () => void
   keepPulseItem: (conversationId: string) => void
   removePulseItem: (conversationId: string) => void
+  // The conversation on screen finished while the window was in the background;
+  // the user is back on it, so it is read the way opening it would read it.
+  readActiveCompletion: () => void
 
   // Cold-start hydration from the main-process task-state table (survives
   // restart — see platform/task-state). Merge-only: never overwrites an
@@ -265,6 +330,10 @@ export interface ChatState {
   // Cleanup
   reset: () => void
   resetSpace: (spaceId: string) => void
+  /** Drop every trace of one conversation (cache, live state, draft, selection). */
+  forgetConversation: (conversationId: string) => void
+  /** Critical memory pressure: keep only what is on screen or running (backend/cache.ts). */
+  shedBackgroundDetail: () => void
 }
 
 // Default empty states
@@ -274,7 +343,7 @@ export const EMPTY_SPACE_STATE: SpaceState = createEmptySpaceState()
 // ---- re-exports for slices ----
 export { api, canvasLifecycle, PULSE_READ_GRACE_PERIOD_MS }
 export type { SessionInitInfo }
-export type { Conversation, ConversationMeta, Message, ToolCall, Artifact, Thought, AgentEventBase, ImageAttachment, CompactInfo, CanvasContext, AgentErrorType, PendingQuestion, Question, TaskStatus, PulseItem, PulseReadInfo, TaskProgress }
+export type { Conversation, ConversationMeta, Message, ToolCall, Artifact, Thought, AgentEventBase, ImageAttachment, CompactInfo, ApiRetryNotice, CanvasContext, AgentErrorType, PendingQuestion, Question, TaskStatus, PulseItem, PulseReadInfo, TaskProgress }
 
 // ---- slice creator types: each slice receives the store's set/get and
 // returns its subset of ChatState; get() sees the full store for cross-slice calls.

@@ -15,9 +15,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 // ── Collaborators the sink reaches for on delivery / persistence ──
-const { pushToChat, findSession } = vi.hoisted(() => ({
+const { pushToChat, findSession, writeEvent, saveChatSessionId } = vi.hoisted(() => ({
   pushToChat: vi.fn(() => true),
   findSession: vi.fn(() => ({ instanceId: 'inst-1' })),
+  writeEvent: vi.fn(),
+  saveChatSessionId: vi.fn(),
 }))
 
 vi.mock('../../../../src/main/apps/runtime/im-session-registry', () => ({
@@ -29,19 +31,24 @@ vi.mock('../../../../src/main/apps/runtime/im-channels', () => ({
 }))
 
 vi.mock('../../../../src/main/apps/runtime/session-store', () => ({
-  openSessionWriter: () => ({ writeEvent: vi.fn(), writeTrigger: vi.fn() }),
-  saveChatSessionId: vi.fn(),
+  openSessionWriter: () => ({ writeEvent, writeTrigger: vi.fn() }),
+  saveChatSessionId,
 }))
 
 const { stopGeneration } = vi.hoisted(() => ({ stopGeneration: vi.fn(async () => {}) }))
 
 vi.mock('../../../../src/main/services/agent/control', () => ({ stopGeneration }))
+vi.mock('../../../../src/main/services/agent', () => ({ listResidentSessions: () => [] }))
 
 import {
   getAppChatSink,
   hasActiveAppChatRound,
   disposeAppChatSink,
+  onAppChatRoundChange,
+  sweepIdleAppChatSinks,
+  SINK_IDLE_RELEASE_MS,
 } from '../../../../src/main/apps/runtime/app-chat-sink'
+import { AppChatTurnInterrupted } from '../../../../src/main/apps/runtime/turn-ending'
 
 // ============================================
 // Helpers
@@ -101,6 +108,8 @@ describe('app-chat sink turn ownership', () => {
     disposeAppChatSink(IM_KEY)
     pushToChat.mockClear()
     findSession.mockClear()
+    writeEvent.mockReset()
+    saveChatSessionId.mockReset()
   })
 
   it('settles the round with the reply of the turn that follows it', async () => {
@@ -266,6 +275,42 @@ describe('app-chat sink turn ownership', () => {
     await expect(second.done).rejects.toThrow(/session ended/i)
   })
 
+  it.each(['session-id', 'checkpoint'] as const)('settles every round even when retirement cannot persist its %s', async stage => {
+    const sink = makeSink()
+    const onReply = vi.fn()
+    const first = sink.beginRound({ onReply })
+    const second = sink.beginRound({ onReply })
+    sink.onTurnStart()
+    const failure = new Error('Fixture disk write failed')
+    const writer = stage === 'session-id' ? saveChatSessionId : writeEvent
+    writer.mockImplementationOnce(() => { throw failure })
+
+    expect(() => sink.onConsumerStopped(makeResult({
+      capturedSessionId: 'partial-sdk', finalContent: 'Received partial reply',
+    }))).toThrow(failure)
+    await expect(first.done).rejects.toThrow(/session ended/i)
+    await expect(second.done).rejects.toThrow(/session ended/i)
+    expect(hasActiveAppChatRound(IM_KEY)).toBe(false)
+    expect(onReply).not.toHaveBeenCalled()
+    expect(pushToChat).not.toHaveBeenCalled()
+  })
+
+  it('rejects a failed turn even when its partial checkpoint cannot be written', async () => {
+    const sink = makeSink()
+    const onReply = vi.fn()
+    const round = sink.beginRound({ onReply })
+    sink.onTurnStart()
+    const streamError = new Error('Fixture stream failed')
+    const diskError = new Error('Fixture checkpoint write failed')
+    writeEvent.mockImplementationOnce(() => { throw diskError })
+
+    expect(() => sink.onTurnError(streamError, true, makeResult({ finalContent: 'Received partial reply' }))).toThrow(diskError)
+    await expect(round.done).rejects.toBe(streamError)
+    expect(hasActiveAppChatRound(IM_KEY)).toBe(false)
+    expect(onReply).not.toHaveBeenCalled()
+    expect(pushToChat).not.toHaveBeenCalled()
+  })
+
   it('does not push an autonomous turn for a native session', () => {
     const nativeKey = 'app-chat:app-1'
     disposeAppChatSink(nativeKey)
@@ -276,6 +321,93 @@ describe('app-chat sink turn ownership', () => {
     sink.onTurnComplete(makeResult())
 
     expect(pushToChat).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * A turn that stopped before its answer was done — the step limit, or cut off
+ * other than by the person's own stop. Whoever waits on the round must learn
+ * how it ended, and must hear back even when nothing was written: a silent
+ * resolve left an IM chat's "working on it" message open with no answer.
+ */
+describe('app-chat sink: a turn that stopped short', () => {
+  beforeEach(() => {
+    disposeAppChatSink(IM_KEY)
+    pushToChat.mockClear()
+  })
+
+  it('hands over what was written with the step limit as its ending', async () => {
+    const sink = makeSink()
+    const onReply = vi.fn()
+    const round = sink.beginRound({ onReply })
+
+    sink.onTurnStart()
+    feedText(sink, 'first half of the work')
+    sink.onTurnComplete(makeResult({ reachedMaxTurns: true, maxTurnsLimit: 3 }))
+
+    await expect(round.done).resolves.toBeUndefined()
+    expect(onReply).toHaveBeenCalledWith('first half of the work', { kind: 'max_turns', limit: 3 })
+  })
+
+  it('still answers the round when the step limit came before any text', async () => {
+    const sink = makeSink()
+    const onReply = vi.fn()
+    const round = sink.beginRound({ onReply })
+
+    sink.onTurnStart()
+    sink.onTurnComplete(makeResult({ reachedMaxTurns: true, maxTurnsLimit: 3, hasMeaningfulContent: false }))
+
+    await expect(round.done).resolves.toBeUndefined()
+    expect(onReply).toHaveBeenCalledWith('', { kind: 'max_turns', limit: 3 })
+  })
+
+  it('marks a turn cut off after writing something as interrupted', async () => {
+    const sink = makeSink()
+    const onReply = vi.fn()
+    sink.beginRound({ onReply })
+
+    sink.onTurnStart()
+    feedText(sink, 'partial')
+    sink.onTurnComplete(makeResult({ isInterrupted: true }))
+
+    expect(onReply).toHaveBeenCalledWith('partial', { kind: 'interrupted' })
+  })
+
+  it('fails a turn cut off before writing anything in a way its caller can tell apart', async () => {
+    const sink = makeSink()
+    const round = sink.beginRound({})
+
+    sink.onTurnStart()
+    sink.onTurnComplete(makeResult({ isInterrupted: true, hasMeaningfulContent: false }))
+
+    await expect(round.done).rejects.toBeInstanceOf(AppChatTurnInterrupted)
+  })
+
+  it('adds no ending to a finished answer, nor to one the person stopped', () => {
+    const sink = makeSink()
+    const onReply = vi.fn()
+    sink.beginRound({ onReply })
+    sink.onTurnStart()
+    feedText(sink, 'complete answer')
+    sink.onTurnComplete(makeResult())
+
+    sink.beginRound({ onReply })
+    sink.onTurnStart()
+    feedText(sink, 'stopped halfway')
+    sink.onTurnComplete(makeResult({ wasAborted: true, isInterrupted: true }))
+
+    expect(onReply.mock.calls).toEqual([['complete answer'], ['stopped halfway']])
+  })
+
+  it('notes the step limit on a turn the digital human started itself', () => {
+    const sink = makeSink()
+    sink.onTurnStart()
+    feedText(sink, 'background follow-up')
+    sink.onTurnComplete(makeResult({ reachedMaxTurns: true, maxTurnsLimit: 3 }))
+
+    expect(pushToChat).toHaveBeenCalledTimes(1)
+    const pushed = (pushToChat.mock.calls[0] as unknown[])[1] as string
+    expect(pushed).toBe('background follow-up\n\n（已达到单次最多 3 步的上限，回复“继续”可接着做）')
   })
 })
 
@@ -304,6 +436,44 @@ describe('app-chat sink undelivered messages', () => {
     await vi.advanceTimersByTimeAsync(90_000)
 
     await expect(round.done).rejects.toThrow(/stopped waiting/i)
+  })
+
+  it('announces every moment the conversation can stop awaiting an answer', async () => {
+    // Waiters (a person's addition, IM messages buffered behind the turn) are
+    // woken by these and nothing else: a moment left out is a wait that never ends.
+    const changes: string[] = []
+    const unsubscribe = onAppChatRoundChange((conversationId) => changes.push(conversationId))
+    const sink = makeSink()
+    const count = () => changes.length
+
+    sink.beginRound({}).cancel()
+    expect(count()).toBe(1)
+
+    const answered = sink.beginRound({})
+    sink.onTurnStart()
+    expect(count()).toBe(2)
+    sink.onTurnComplete(makeResult())
+    expect(count()).toBe(3)
+    await answered.done
+
+    const failed = sink.beginRound({})
+    sink.onTurnStart()
+    sink.onTurnError(new Error('model overloaded'))
+    expect(count()).toBe(5)
+    await expect(failed.done).rejects.toThrow('model overloaded')
+
+    const unclaimed = sink.beginRound({})
+    await vi.advanceTimersByTimeAsync(90_000)
+    expect(count()).toBe(6)
+    await expect(unclaimed.done).rejects.toThrow(/stopped waiting/i)
+
+    const dropped = sink.beginRound({})
+    sink.onConsumerStopped()
+    expect(count()).toBe(7)
+    await expect(dropped.done).rejects.toThrow(/session ended/i)
+
+    unsubscribe()
+    expect(new Set(changes)).toEqual(new Set([IM_KEY]))
   })
 
   it('leaves a message alone while a turn is running', async () => {
@@ -489,5 +659,22 @@ describe('app-chat sink escalation cut', () => {
     feedToolResult(sink, 'call-2')
 
     expect(stopGeneration).not.toHaveBeenCalled()
+  })
+})
+
+describe('idle sink release', () => {
+  it('releases only idle sinks without a round and without a resident session', () => {
+    const idle = makeSink('app-chat:app-1:wecom-bot:group:idle')
+    const resident = makeSink('app-chat:app-1:wecom-bot:group:resident')
+    const later = Date.now() + SINK_IDLE_RELEASE_MS + 1
+
+    expect(sweepIdleAppChatSinks((id) => id.endsWith(':resident'), Date.now())).toBe(0)
+    expect(sweepIdleAppChatSinks((id) => id.endsWith(':resident'), later)).toBeGreaterThanOrEqual(1)
+
+    // The resident one is kept; the idle one is rebuilt fresh on next use.
+    expect(makeSink('app-chat:app-1:wecom-bot:group:resident')).toBe(resident)
+    expect(makeSink('app-chat:app-1:wecom-bot:group:idle')).not.toBe(idle)
+    disposeAppChatSink('app-chat:app-1:wecom-bot:group:idle')
+    disposeAppChatSink('app-chat:app-1:wecom-bot:group:resident')
   })
 })

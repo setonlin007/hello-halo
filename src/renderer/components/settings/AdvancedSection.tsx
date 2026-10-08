@@ -13,6 +13,13 @@ import { CLIConfigSection } from './CLIConfigSection'
 import { Switch } from '../ui/Switch'
 import { useConfirmDialog } from '../../hooks/useConfirmDialog'
 import { DEFAULT_DISABLED_TOOLS } from '../../../shared/constants/disabled-tools'
+import { DEFAULT_MAX_TURNS } from '../../../shared/constants/agent-limits'
+import {
+  DEFAULT_MAX_RESIDENT_SESSIONS,
+  MAX_MAX_RESIDENT_SESSIONS,
+  MIN_MAX_RESIDENT_SESSIONS,
+  clampMaxResidentSessions,
+} from '../../../shared/constants/session-budget'
 import {
   TEAM_CIRCUIT_DEFAULTS,
   TEAM_DEFAULT_TURN_TIMEOUT_MS,
@@ -26,7 +33,7 @@ import {
  * render site as `t()` literals — i18next-parser only extracts literal keys,
  * so moving the copy into this table would drop the existing translations.
  */
-const ENGINE_IDS: readonly EngineId[] = ['anthropic', 'halo', 'codex']
+const ENGINE_IDS: readonly EngineId[] = ['anthropic', 'halo', 'codex', 'dsh']
 
 // ─── Built-in MCP Extensions ────────────────────────────────────────────────────
 
@@ -114,12 +121,12 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
   const { t } = useTranslation()
   const { showConfirm, DialogComponent: RestartDialogComponent } = useConfirmDialog()
 
-  const [maxTurns, setMaxTurnsState] = useState(config?.agent?.maxTurns ?? 50)
-  const [sdkEngine, setSdkEngineState] = useState<'anthropic' | 'halo' | 'codex'>(
+  const [maxTurns, setMaxTurnsState] = useState(config?.agent?.maxTurns ?? DEFAULT_MAX_TURNS)
+  const [sdkEngine, setSdkEngineState] = useState<EngineId>(
     config?.agent?.sdkEngine ?? 'anthropic'
   )
   // Track whether the SDK engine was changed from the initial value (needs restart)
-  const [sdkEngineInitial] = useState<'anthropic' | 'halo' | 'codex'>(
+  const [sdkEngineInitial] = useState<EngineId>(
     config?.agent?.sdkEngine ?? 'anthropic'
   )
   const [disabledTools, setDisabledToolsState] = useState<string[]>(
@@ -147,6 +154,9 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
   const [teamMaxConcurrentTurns, setTeamMaxConcurrentTurnsState] = useState(
     config?.agent?.teamMaxConcurrentTurns ?? TEAM_DEFAULT_MAX_CONCURRENT_TURNS
   )
+  const [maxResidentSessions, setMaxResidentSessionsState] = useState(
+    config?.agent?.maxResidentSessions ?? DEFAULT_MAX_RESIDENT_SESSIONS
+  )
   const [capsPanelOpen, setCapsPanelOpen] = useState(false)
   const [engineAvailability, setEngineAvailability] = useState<EngineAvailabilityReport | null>(null)
 
@@ -172,6 +182,30 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
     return engineAvailability.engines.find(e => e.engineId === engineId)?.available ?? false
   }
 
+  const engineUnavailableReason = (engineId: EngineId) =>
+    engineAvailability?.engines.find(e => e.engineId === engineId)?.reason
+
+  // Built inside the component so every string stays a literal `t(...)` call
+  // and reaches the extractor.
+  const ENGINE_COPY: Record<EngineId, { title: string; description: string }> = {
+    anthropic: {
+      title: t('Claude Code SDK'),
+      description: t('Powered by the official Anthropic Claude Code engine. Works with a wide range of frontier models. (Default)'),
+    },
+    halo: {
+      title: t('Halo SDK'),
+      description: t('The official Halo agent engine. Lightweight on resources, faster startup, optimized for open-source models. Experimental.'),
+    },
+    codex: {
+      title: t('Codex SDK'),
+      description: t('Powered by the official OpenAI Codex SDK. Better suited for GPT-family models. Experimental.'),
+    },
+    dsh: {
+      title: t('DeepSeek dsh'),
+      description: t('Powered by the open-source DeepSeek dsh runtime, which upstream is still changing and has not stabilized. Best used with DeepSeek models. Experimental.'),
+    },
+  }
+
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
   const isCapabilityEnabled = (group: CapabilityGroup) => {
@@ -193,7 +227,7 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
 
   // ─── Handlers ───────────────────────────────────────────────────────────────
 
-  const handleSdkEngineChange = async (engine: 'anthropic' | 'halo' | 'codex') => {
+  const handleSdkEngineChange = async (engine: EngineId) => {
     if (engine === sdkEngine) return
     setSdkEngineState(engine)
     try {
@@ -227,7 +261,7 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
       await saveAgentConfig({ maxTurns: clamped })
     } catch (error) {
       console.error('[AdvancedSection] Failed to update maxTurns:', error)
-      setMaxTurnsState(config?.agent?.maxTurns ?? 50)
+      setMaxTurnsState(config?.agent?.maxTurns ?? DEFAULT_MAX_TURNS)
     }
   }
 
@@ -269,6 +303,17 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
     } catch (error) {
       console.error('[AdvancedSection] Failed to update teamMaxConcurrentTurns:', error)
       setTeamMaxConcurrentTurnsState(config?.agent?.teamMaxConcurrentTurns ?? TEAM_DEFAULT_MAX_CONCURRENT_TURNS)
+    }
+  }
+
+  const handleMaxResidentSessionsChange = async (value: number) => {
+    const clamped = clampMaxResidentSessions(value)
+    setMaxResidentSessionsState(clamped)
+    try {
+      await saveAgentConfig({ maxResidentSessions: clamped })
+    } catch (error) {
+      console.error('[AdvancedSection] Failed to update maxResidentSessions:', error)
+      setMaxResidentSessionsState(config?.agent?.maxResidentSessions ?? DEFAULT_MAX_RESIDENT_SESSIONS)
     }
   }
 
@@ -358,7 +403,10 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
 
           <div className="space-y-2">
             {ENGINE_IDS.map(engineId => {
-              const available = isEngineAvailable(engineId)
+              const copy = ENGINE_COPY[engineId]
+              // The active engine stays selectable even if its runtime went
+              // missing, so the user is never locked out of their own setting.
+              const available = isEngineAvailable(engineId) || sdkEngine === engineId
               return (
                 <label
                   key={engineId}
@@ -375,22 +423,19 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
                     onChange={() => handleSdkEngineChange(engineId)}
                     className="mt-0.5 accent-primary"
                   />
-                  <div>
+                  <div className="min-w-0">
                     <p className="font-medium text-sm">
-                      {engineId === 'anthropic' && t('Claude Code SDK')}
-                      {engineId === 'halo' && t('Halo SDK')}
-                      {engineId === 'codex' && t('Codex SDK')}
+                      {copy.title}
                       {!available && (
                         <span className="ml-2 text-xs font-normal text-muted-foreground">
                           {t('Not included in this build')}
                         </span>
                       )}
                     </p>
-                    <p className="text-xs text-muted-foreground">
-                      {engineId === 'anthropic' && t('Powered by the official Anthropic Claude Code engine. Works with a wide range of frontier models. (Default)')}
-                      {engineId === 'halo' && t('The official Halo agent engine. Lightweight on resources, faster startup, optimized for open-source models. Experimental.')}
-                      {engineId === 'codex' && t('Powered by the official OpenAI Codex SDK. Better suited for GPT-family models. Experimental.')}
-                    </p>
+                    <p className="text-xs text-muted-foreground">{copy.description}</p>
+                    {!available && engineUnavailableReason(engineId) && (
+                      <p className="mt-1 text-xs text-muted-foreground">{engineUnavailableReason(engineId)}</p>
+                    )}
                   </div>
                 </label>
               )
@@ -640,6 +685,35 @@ export function AdvancedSection({ config, setConfig }: AdvancedSectionProps) {
               const val = parseInt(e.target.value, 10)
               if (!isNaN(val)) {
                 handleTeamMaxConcurrentTurnsChange(val)
+              }
+            }}
+            className="w-24 self-end sm:self-auto px-3 py-1.5 text-sm bg-secondary border border-border rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-primary/50"
+          />
+        </div>
+
+        {/* Resident Session Budget */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pt-4 border-t border-border">
+          <div className="flex-1">
+            <p className="font-medium">{t('Active Conversation Limit')}</p>
+            <p className="text-sm text-muted-foreground">
+              {t('Most conversations kept ready at once. Each one keeps an AI process in memory; beyond the limit the least recently used pause and resume on their next message. Halved automatically when the computer is low on memory.')}
+            </p>
+          </div>
+          <input
+            type="number"
+            min={MIN_MAX_RESIDENT_SESSIONS}
+            max={MAX_MAX_RESIDENT_SESSIONS}
+            value={maxResidentSessions}
+            onChange={(e) => {
+              const val = parseInt(e.target.value, 10)
+              if (!isNaN(val)) {
+                setMaxResidentSessionsState(val)
+              }
+            }}
+            onBlur={(e) => {
+              const val = parseInt(e.target.value, 10)
+              if (!isNaN(val)) {
+                handleMaxResidentSessionsChange(val)
               }
             }}
             className="w-24 self-end sm:self-auto px-3 py-1.5 text-sm bg-secondary border border-border rounded-lg text-right focus:outline-none focus:ring-2 focus:ring-primary/50"

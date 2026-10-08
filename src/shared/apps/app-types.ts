@@ -81,8 +81,27 @@ export interface InstalledApp {
     modelSourceId?: string
     /** Override model within the selected AI source. Used together with modelSourceId. */
     modelId?: string
+    /**
+     * How hard this digital human thinks, picked on the composer's model card.
+     * Applies to every entry: its chats in Halo, IM and over HTTP, its team
+     * turns, and its scheduled, event and manual runs. Unset, each entry keeps
+     * the model's configured effort.
+     */
+    chatReasoningEffort?: import('../constants/reasoning-effort').ReasoningEffortLevel
     /** When true, the login notice bar is permanently dismissed for this app */
     loginNoticeDismissed?: boolean
+    /**
+     * Offer this digital human its space's memory topics, read-only, in every
+     * turn. Off by default.
+     */
+    spaceMemoryAccess?: boolean
+    /** This digital human's memory: on/off, auto-consolidation, cadence. */
+    memory?: import('../types/memory').MemorySettings
+    /**
+     * MCP servers only: the tools turned off on the server's card, by the name
+     * the card lists. No session is given them, whoever it runs for.
+     */
+    disabledTools?: string[]
   }
 
   /** Permission grants and denials */
@@ -122,6 +141,28 @@ export interface InstalledApp {
 /** User-controlled per-app upgrade strategy. */
 export type UpgradeStrategy = 'auto' | 'notify' | 'manual'
 
+/**
+ * What an author's upgrade left on the user's version. `kept` names top-level
+ * spec fields; `subscriptions` stands for the run schedule as a whole.
+ */
+export interface SpecUpgradeOutcome {
+  fromVersion: string
+  toVersion: string
+  /** Fields that keep the user's value and therefore differ from the author's new version. */
+  kept: string[]
+  /**
+   * False when there was no author's original to compare with, so every
+   * difference was presumed to be the user's rather than known to be.
+   */
+  editsKnown: boolean
+}
+
+/** The activity note of an upgrade that kept fields at the user's version. */
+export interface SpecUpgradeNote extends SpecUpgradeOutcome {
+  /** Kept fields the user has since switched to the author's version from this note. */
+  adopted?: string[]
+}
+
 /** Filter criteria for listing Apps */
 export interface AppListFilter {
   /** Filter by space: string = specific space, null = global only, undefined = all */
@@ -153,7 +194,8 @@ export interface ExecutionEnvironment {
 }
 
 export interface ActivitySource {
-  kind: 'automation' | 'team' | 'chat' | 'unknown'
+  /** `upgrade`: written when an author's new version was applied, outside any run. */
+  kind: 'automation' | 'team' | 'chat' | 'upgrade' | 'unknown'
   appId: string
   runId?: string
   sessionKey?: string
@@ -201,6 +243,11 @@ export interface ActivityEntryContent {
   dataPath?: string
   /** Question for the user (escalation only) */
   question?: string
+  /**
+   * Escalation only: the number it is answered by from an IM chat
+   * (`/answer <number> …`). One past the highest any kept escalation holds.
+   */
+  number?: number
   /** Preset choices for escalation */
   choices?: string[]
   /**
@@ -212,6 +259,50 @@ export interface ActivityEntryContent {
   questions?: EscalationQuestion[]
   /** File URL for output type */
   outputUrl?: string
+  /** Set on the note an author's upgrade leaves when it kept fields at the user's version. */
+  upgrade?: SpecUpgradeNote
+  /** Scheduled times that came due while this run kept the person busy, and so were skipped. */
+  skippedSchedules?: number
+  /** Set when the run did not start because connections it declares are unusable. */
+  missingConnections?: MissingConnection[]
+  /** Tokens the model processed for the run this entry closed, cache included. */
+  tokenUsage?: RunTokenUsage
+  /** Set on the skip a working-days-only schedule leaves when the holiday calendar does not cover the day. */
+  workdayCalendarGap?: boolean
+}
+
+/** Tokens the model processed for a run, summed over its turns. */
+export interface RunTokenUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+}
+
+/** Everything the model processed: what a usage quota usually counts. */
+export function totalRunTokens(usage: RunTokenUsage): number {
+  return usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreationTokens
+}
+
+/** Two usages added together; undefined when neither exists. */
+export function addRunTokenUsage(a: RunTokenUsage | undefined, b: RunTokenUsage | undefined): RunTokenUsage | undefined {
+  if (!a) return b
+  if (!b) return a
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheCreationTokens: a.cacheCreationTokens + b.cacheCreationTokens,
+  }
+}
+
+/** A connection a digital human declares that a run could not use. */
+export interface MissingConnection {
+  /** The id its spec declares. */
+  id: string
+  /** The installed connection's name; the id when nothing is installed. */
+  name: string
+  state: 'not_installed' | 'disabled' | 'needs_login' | 'error'
 }
 
 /** One decision an escalation asks the user to make. */
@@ -276,6 +367,8 @@ export interface AutomationRun {
   tokensUsed?: number
   errorMessage?: string
   sessionId?: string
+  /** When the retention rule deleted its process transcript and engine session; it can no longer be continued. */
+  transcriptClearedAt?: number
 }
 
 /**
@@ -330,6 +423,7 @@ export interface AutomationAppState {
    */
   status: 'running' | 'queued' | 'idle' | 'paused' | 'waiting_user' | 'needs_login' | 'error'
   nextRunAtMs?: number
+  /** When the execution in progress started; a continued run counts from its continuation. */
   runningAtMs?: number
   /** Run ID of the currently executing run (only set when status === 'running') */
   runningRunId?: string
@@ -484,6 +578,22 @@ export function resolvePermission(
 }
 
 /**
+ * The switch for reading and messaging the other conversations of the app's
+ * space (`halo-conversations`) — one switch for both, like the other built-in
+ * capabilities. Off unless granted: unlike a space conversation, which the user
+ * drives in person, a digital human acts on its own, so reaching into other
+ * conversations is something the owner opts it into.
+ *
+ * The one reading of the default, shared by the runtime that mounts the tools
+ * and the settings switch that shows it.
+ */
+export const CONVERSATION_COLLAB_PERMISSION = 'conversation-collab'
+
+export function isConversationCollabEnabled(app: Pick<InstalledApp, 'permissions' | 'spec'>): boolean {
+  return resolvePermission(app, CONVERSATION_COLLAB_PERMISSION, false)
+}
+
+/**
  * Whether the app was installed by the built-in loader (bundled with the
  * application binary) rather than by the user. Built-in apps are re-synced
  * from disk on every launch and are protected from permanent deletion
@@ -510,6 +620,17 @@ export function getEscalationQuestions(content: ActivityEntryContent): Escalatio
     question: content.question || content.summary,
     ...(content.choices?.length ? { choices: content.choices } : {}),
   }]
+}
+
+/**
+ * The user's answers, one per entry of `getEscalationQuestions`.
+ *
+ * A single decision may arrive flat (`choice` / `text`) or as a one-element
+ * `answers`, whichever shape the question was asked in; both mean the same.
+ */
+export function getEscalationAnswers(response: Pick<EscalationResponse, 'choice' | 'text' | 'answers'>): EscalationAnswer[] {
+  if (response.answers?.length) return response.answers
+  return [{ choice: response.choice, text: response.text }]
 }
 
 /**

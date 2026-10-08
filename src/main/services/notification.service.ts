@@ -107,6 +107,11 @@ export function notifyTaskComplete(conversationTitle: string): void {
       }
     })
 
+    notification.once('failed', (_event, error) => {
+      console.warn('[Notification] Task notification rejected by the system; falling back to in-app toast:', error)
+      pushToast({ title: 'Halo', body: `Task complete: ${conversationTitle}` })
+    })
+
     notification.show()
   } catch (error) {
     console.error('[Notification] Failed to show notification:', error)
@@ -147,6 +152,12 @@ export function notifyAppEvent(title: string, body: string, options?: AppNotific
     appId: options?.appId, entryId: options?.entryId, teamId: options?.teamId,
     epochId: options?.epochId, runId: options?.runId,
   }
+  const toast = {
+    // One in-app toast per digital human: its newest replaces the one before,
+    // so a person running every few minutes does not pile them up.
+    ...(options?.appId ? { id: `app-notification:${options.appId}` } : {}),
+    title, body, ...target,
+  }
 
   // ── 1. System / In-App notification ──
   if (!options?.skipSystem) {
@@ -156,10 +167,10 @@ export function notifyAppEvent(title: string, body: string, options?: AppNotific
     if (focused) {
       // Window is focused — macOS suppresses OS notifications for foreground apps.
       // Send an in-app toast instead so the user always sees it.
-      pushToast({ title, body, ...target })
+      pushToast(toast)
     } else if (!Notification.isSupported()) {
       console.warn('[Notification] Notification.isSupported() = false — falling back to in-app toast')
-      pushToast({ title, body, ...target })
+      pushToast(toast)
     } else {
       try {
         const mainWindow = getMainWindow()
@@ -182,12 +193,17 @@ export function notifyAppEvent(title: string, body: string, options?: AppNotific
           }
         })
 
+        notification.once('failed', (_event, error) => {
+          console.warn('[Notification] App notification rejected by the system; falling back to in-app toast:', error)
+          pushToast(toast)
+        })
+
         notification.show()
         console.log(`[Notification] OS notification.show() called`)
       } catch (error) {
         console.error('[Notification] Failed to show app event notification:', error)
         // Fallback to in-app toast if OS notification fails
-        pushToast({ title, body, ...target })
+        pushToast(toast)
       }
     }
   }

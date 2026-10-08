@@ -21,6 +21,15 @@ sources; an enterprise build ships one (the rest are `hidden: true` via
 free** — there is no second design for the enterprise edition, and no code
 path that only enterprise takes.
 
+Only enabled sources are read. Turning a source off stops its sync but keeps
+its mirrored rows, so every catalog read of the mirror (list, search, the "All"
+preview, category counts) filters by the enabled source ids; turning it back on
+shows the rows again without a download. Single-entry lookups by slug
+(`findEntry`: details, installs, update checks) are not filtered, so apps
+installed from it keep working. The renderer caches what it read (browse list,
+discover page, category counts), so adding, removing or switching a source in
+Settings drops those and reads the catalog again (`reloadStoreCatalog`).
+
 Consequence: adding support for a new registry protocol means adding one file
 under `adapters/`, one `case` in `adapters/index.ts`, and one entry in
 `STORE_SOURCE_TYPES` (`shared/store/store-types.ts`), from which both the
@@ -162,10 +171,12 @@ baseline in for an hour.
 
 ### 3.4 Identity-bound calls target the primary source only
 
-A build mints one identity token from the one provider declared in
-`product.json.identityProvider`, so exactly one store can attribute a
-publication to this user. "My publications" therefore reads and unpublishes
-against the primary source — reads included.
+A build resolves one identity token from the provider declared in
+`product.json.identityProvider`: its selected signed-in account when current,
+otherwise its first configured signed-in account. Failed token renewal never
+substitutes another account, and forced sign-in targets that same source.
+"My publications" reads and unpublishes against the primary store source —
+reads included.
 
 Federating the read while writing to the primary would be incoherent twice
 over: the user could act on a row the write path cannot address, and the
@@ -211,7 +222,14 @@ Three consequences that read as surprises otherwise:
   in a federation (§2.1).
 
 Browsing is not installing: `query.service.ts` fetches specs for the detail view
-without an order, and must keep doing so.
+without an order, and must keep doing so. So do `recordStoreOriginals`, which
+reads the store's copy of an already-installed version to keep as the author's
+original that upgrades are compared against (`apps/manager/DESIGN.md` §2.13),
+and `previewUpgrade`, which reads the next version for the update dialog to
+name what will keep the user's version: neither installs anything. An upgrade
+itself downloads through `acquireSpec` and hands the spec to
+`AppManager.upgradeSpec`, never `updateSpec`, so the user's edits survive it;
+rescheduling and the activity note are the runtime's reaction to that call.
 
 `installs` therefore means *authorised* downloads: an order is opened before the
 transfer, so one that then fails locally still counts. A delivery receipt would

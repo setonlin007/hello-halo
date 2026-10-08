@@ -4,7 +4,7 @@
  * The main process is the single source of truth: this store reflects the
  * open/closed state per conversation and drives open/close through the API.
  * AI-initiated changes arrive via the `toolsets:changed` event and update the
- * same state, so the UI (menu switches + activation pills) always matches
+ * same state, so the UI (the composer's Capabilities switches) always matches
  * reality regardless of who flipped a toolset.
  */
 
@@ -38,15 +38,17 @@ interface ToolsetsState {
   /** conversationId -> statuses */
   byConversation: Map<string, ToolsetStatus[]>
   /** conversationId -> toolsetIds the AI asked the user to enable (highlights the
-   * matching switch in the Tools menu until the user acts). */
+   * matching switch in the composer's "+" panel until the user acts). */
   aiRequested: Map<string, Set<string>>
-  /** conversationId -> pending "open the Tools menu" one-shot (bumped on a new
-   * request, cleared by consumeRequestSignal once the menu has opened, so a
-   * remount never re-opens it). */
+  /** conversationId -> pending one-shot to open the composer's "+" panel (bumped on a
+   * new request, cleared by consumeRequestSignal once the panel has opened, so
+   * a remount never re-opens it). */
   requestSignal: Map<string, number>
   loading: boolean
 
   refresh: (spaceId: string, conversationId: string) => Promise<void>
+  /** Load a conversation's catalog once; concurrent callers share the read. */
+  ensureLoaded: (spaceId: string, conversationId: string) => Promise<void>
   open: (spaceId: string, conversationId: string, toolsetId: string) => Promise<void>
   close: (spaceId: string, conversationId: string, toolsetId: string) => Promise<void>
   getStatuses: (conversationId: string) => ToolsetStatus[]
@@ -55,6 +57,8 @@ interface ToolsetsState {
   applyChangedEvent: (e: ToolsetsChangedEvent) => void
   applyRequestedEvent: (e: ToolsetsRequestedEvent) => void
 }
+
+const loading = new Map<string, Promise<void>>()
 
 export const useToolsetsStore = create<ToolsetsState>((set, get) => ({
   byConversation: new Map(),
@@ -76,6 +80,16 @@ export const useToolsetsStore = create<ToolsetsState>((set, get) => ({
     } finally {
       set({ loading: false })
     }
+  },
+
+  ensureLoaded: async (spaceId, conversationId) => {
+    if (get().byConversation.has(conversationId)) return
+    let read = loading.get(conversationId)
+    if (!read) {
+      read = get().refresh(spaceId, conversationId).finally(() => loading.delete(conversationId))
+      loading.set(conversationId, read)
+    }
+    await read
   },
 
   open: async (spaceId, conversationId, toolsetId) => {
@@ -151,7 +165,7 @@ export const useToolsetsStore = create<ToolsetsState>((set, get) => ({
     nextSet.add(toolsetId)
     const nextReq = new Map(reqMap)
     nextReq.set(conversationId, nextSet)
-    // Bump the open signal so ToolsetControls opens the Tools menu.
+    // Bump the open signal so the composer opens its "+" panel.
     const sigMap = get().requestSignal
     const nextSig = new Map(sigMap)
     nextSig.set(conversationId, (sigMap.get(conversationId) ?? 0) + 1)

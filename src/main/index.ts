@@ -10,6 +10,7 @@
 // This replaces console.log/warn/error globally with electron-log
 // Logs are written to: ~/Library/Logs/Halo/ (macOS), %USERPROFILE%\AppData\Roaming\Halo\logs (Windows)
 import log from 'electron-log/main.js'
+import { createNumberedArchiveFn, MAIN_LOG_ARCHIVES, MAIN_LOG_MAX_BYTES } from './foundation/logging'
 
 // Initialize for renderer process support (IPC transport)
 log.initialize()
@@ -20,14 +21,20 @@ log.initialize()
 const isDev = process.env.NODE_ENV === 'development'
 log.transports.file.level = 'info'           // Always log info+ to file
 log.transports.console.level = isDev ? 'debug' : 'info'
-log.transports.file.maxSize = 5 * 1024 * 1024 // 5MB per file, auto-rotate
+// 10 MB per file plus numbered archives: forensics must reach back at least
+// 48 hours, which a single archive does not cover on a busy install.
+log.transports.file.maxSize = MAIN_LOG_MAX_BYTES
+log.transports.file.archiveLogFn = createNumberedArchiveFn(MAIN_LOG_ARCHIVES)
 // Default is sync fs.writeFileSync per line, which blocks the main process
 // event loop (and every window with it) on every log call. Async queues
 // writes instead. Must be set before the first log call: the file object
 // caches this at creation and ignores later changes.
 log.transports.file.sync = false
 
-// Catch unhandled errors and log them.
+// Catch unhandled errors and log them. The library's own dialog is off: it is
+// the synchronous dialog.showErrorBox, which freezes the whole main process —
+// every digital human and background task with it — until the user clicks.
+// Unexpected uncaught exceptions get a non-blocking notice instead.
 // Use onError callback to suppress benign/transient errors — returning false prevents
 // electron-log from showing the native error dialog. A separate process.on('uncaughtException')
 // handler does NOT work because Node.js calls ALL registered listeners; the return in one
@@ -40,7 +47,8 @@ log.transports.file.sync = false
 //     background failures the user can do nothing about. These are logged as warnings
 //     and must not crash or alert the main process.
 log.errorHandler.startCatching({
-  onError({ error }) {
+  showDialog: false,
+  onError({ error, errorName }) {
     const message = error?.message || ''
     const code = (error as NodeJS.ErrnoException | undefined)?.code || ''
     const stack = error?.stack || ''
@@ -82,6 +90,8 @@ log.errorHandler.startCatching({
       log.warn(`[Main] Ignored Node autoSelectFamily assertion: ${message}`)
       return false
     }
+
+    if (errorName === 'Unhandled') showUncaughtErrorNotice(error)
   }
 })
 
@@ -147,10 +157,18 @@ if (dataFolderName !== DEFAULT_DATA_FOLDER_NAME) {
   app.setPath('userData', joinPath(appDataPath, dataFolderName))
   console.log(`[Main] userData isolated to: ${joinPath(appDataPath, dataFolderName)}`)
 }
+// A build under test must not share browser storage with a real install of the
+// same product, and macOS resolves appData without consulting HOME.
+if (process.env.HALO_E2E_TEST && process.env.HALO_DATA_DIR) {
+  app.setPath('userData', joinPath(process.env.HALO_DATA_DIR, 'electron-user-data'))
+}
 
 // Log path isolation (per-variant / per-cluster-node) — see
 // foundation/logging/log-isolation.ts for the rules. Must run pre-ready.
 isolateLogPath(app)
+
+// Custom-scheme privileges (the HTML preview origin) are only accepted pre-ready.
+registerPrivilegedSchemes()
 
 // Single instance lock: Prevent multiple instances of the application
 // Must be called before app.whenReady()
@@ -232,18 +250,29 @@ import {
 import { isServerMode } from './foundation/runtime-mode'
 import { initializeApp } from './foundation/config.service'
 import { applyDisplayScale, currentDisplayScale, nudgeDisplayScale, setDisplayScale, DISPLAY_STEP, registerDisplayHandlers } from './services/display.service'
+import { MAC_TRAFFIC_LIGHT_POSITION } from '../shared/constants/mac-traffic-lights'
+import { TITLE_BAR_OVERLAY_HEIGHT } from '../shared/constants/app-header'
 import { flushAllPendingIndexWrites } from './services/conversation.service'
 import { shutdownRemoteAccess } from './services/remote'
 import { registerDeepLinkHandling, handleDeepLinkArgv } from './services/deep-link.service'
 import { stopOpenAICompatRouter } from './openai-compat-router'
 import { manualCheckForUpdates } from './services/updater'
 import { initAnalytics } from './services/analytics'
-import { registerProtocols } from './foundation/protocol.service'
+import { registerPrivilegedSchemes, registerProtocols } from './foundation/protocol.service'
 import { setMainWindow } from './foundation/window.service'
+import { registerBrowserHostHandlers } from './ipc/browser-host'
 import { checkAndArmSessionIntegrity, markSessionCleanExit } from './foundation/session-integrity'
-import { relaunchApp } from './services/lifecycle'
-import { initInstanceId, shutdownHealthSystem, onRendererCrash, onRendererUnresponsive } from './services/health'
-import { reconcileAllSpaces } from './services/artifact-cache.service'
+import { announceRendererHalted, decideAllWindowsClosed, remindRendererHalted, showUncaughtErrorNotice } from './services/lifecycle'
+import { getBackgroundService } from './platform/background'
+import {
+  classifyRendererGone,
+  RENDERER_HANG_GRACE_MS,
+  RendererHangWatch,
+  RendererRecoveryPolicy,
+  type RendererRecoveryDecision,
+} from './services/renderer-recovery'
+import { recordProcessGone, recordRendererHang, startPerfTelemetry, writePreCrashSnapshot } from './services/perf'
+import { initInstanceId, shutdownHealthSystem, onRendererCrash, onRendererUnresponsive, sampleResourcesNow } from './services/health'
 import { initSdk } from './services/agent/resolved-sdk'
 
 // Headless server mode: apply no-display / no-sandbox switches before the app
@@ -286,34 +315,31 @@ function announceFirstScreen(): void {
     }
   }
 }
-let recentRecoveryWindowStart = 0
-let recoveryAttempts = 0
+const rendererRecovery = new RendererRecoveryPolicy()
 
-function recoverRenderer(reason: string): void {
-  if (isAppQuitting) {
-    return
+function recoverRenderer(reason: string, kind: 'crash' | 'hang'): RendererRecoveryDecision {
+  const decision = kind === 'crash' ? rendererRecovery.record(Date.now()) : rendererRecovery.recordHang()
+  if (decision.action === 'ignore') return decision
+
+  if (decision.action === 'halt') {
+    console.error(
+      `[Main] Renderer crashed ${decision.attempt} times within a minute (${reason}). ` +
+      'Recovery halted; main process and background work keep running until the user restarts.'
+    )
+    writePreCrashSnapshot('renderer-halt')
+    announceRendererHalted(mainWindow, reason, decision.attempt)
+    return decision
   }
 
-  const now = Date.now()
-  if (now - recentRecoveryWindowStart > 60000) {
-    recentRecoveryWindowStart = now
-    recoveryAttempts = 0
-  }
-
-  recoveryAttempts += 1
-  console.warn(`[Main] Renderer issue detected (${reason}). Attempting recovery #${recoveryAttempts}`)
-
-  if (recoveryAttempts > 3) {
-    console.error('[Main] Renderer failed repeatedly. Relaunching app for a clean state.')
-    relaunchApp('renderer-recovery')
-    return
-  }
+  console.warn(`[Main] Renderer issue detected (${reason}). Reloading (crashes in window: ${decision.attempt})`)
 
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {
+      // In place: the window keeps its size, position and place behind other
+      // apps, so a renderer that failed while the user worked elsewhere does
+      // not pull the window over their work.
       mainWindow.webContents.reloadIgnoringCache()
-      mainWindow.show()
-      return
+      return decision
     } catch (error) {
       console.error('[Main] Failed to reload renderer, recreating window:', error)
       try {
@@ -326,6 +352,7 @@ function recoverRenderer(reason: string): void {
   }
 
   createWindow()
+  return decision
 }
 
 /**
@@ -457,16 +484,13 @@ function createWindow(): void {
     minHeight: 600,
     show: false,
     autoHideMenuBar: true,
+    roundedCorners: process.platform !== 'linux',
     // macOS: hiddenInset for traffic lights in content area
     // Windows/Linux: hidden + titleBarOverlay for native buttons overlay
     titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
-    // Vertically centered on the dedicated clearance strip rendered above
-    // the whole NavRail+Header row (MAC_TRAFFIC_LIGHT_CLEARANCE_PX in
-    // App.tsx). y is the top of the traffic-light button group, not its
-    // center — the true group height isn't documented/queryable, so this is
-    // tuned empirically rather than derived from a formula. That strip (not
-    // NavRail) compensates for zoom via --display-scale.
-    trafficLightPosition: isMac ? { x: 8, y: 6 } : undefined,
+    // Sits in NavRail's column above the brand mark; the renderer derives its
+    // clearance from the same shared geometry.
+    trafficLightPosition: isMac ? MAC_TRAFFIC_LIGHT_POSITION : undefined,
     // Windows/Linux: native window controls overlay in content area.
     // Matches globals.css's dark-theme `--background`/`--foreground`
     // (the default theme) exactly, for the brief window before the renderer
@@ -475,18 +499,15 @@ function createWindow(): void {
     titleBarOverlay: !isMac ? {
       color: '#0c0e12',
       symbolColor: '#e7e9ee',
-      // One pixel short of Header's actual 48px height (h-12): tall enough
-      // to vertically center the caption buttons in it, but leaves the
-      // header's own 1px bottom border un-overpainted by the overlay's
-      // opaque fill so it doesn't visually vanish under the buttons.
-      height: 47
+      height: TITLE_BAR_OVERLAY_HEIGHT
     } : undefined,
     backgroundColor: '#0c0e12',
     webPreferences: {
-      preload: join(__dirname, '../preload/index.mjs'),
-      sandbox: false,
+      preload: join(__dirname, '../preload/index.cjs'),
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      webviewTag: true,
       // Seed the persistent display scale before first paint: zoomFactor applies
       // the zoom natively, and the CLI arg lets the preload set --display-scale
       // synchronously, so chrome-inset compensation is correct on frame one.
@@ -494,6 +515,8 @@ function createWindow(): void {
       additionalArguments: [`--halo-display-scale=${currentDisplayScale()}`]
     }
   })
+
+  registerBrowserHostHandlers(mainWindow)
 
   // The window is created hidden and revealed on first paint. When the process
   // was started by something non-interactive — the installer's "run when
@@ -560,14 +583,41 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('unresponsive', () => {
-    onRendererUnresponsive()
-    recoverRenderer('unresponsive')
+  const hangWatch = new RendererHangWatch(() => {
+    if (!isAppQuitting) recoverRenderer('unresponsive', 'hang')
   })
+  mainWindow.on('unresponsive', () => {
+    if (isAppQuitting) return
+    onRendererUnresponsive()
+    recordRendererHang()
+    if (hangWatch.unresponsive()) {
+      console.warn(`[Main] Renderer unresponsive; reloading in ${RENDERER_HANG_GRACE_MS / 1000}s unless it recovers`)
+    }
+  })
+  mainWindow.on('responsive', () => {
+    if (hangWatch.cancel()) console.log('[Main] Renderer recovered by itself; no reload')
+  })
+  mainWindow.on('closed', () => hangWatch.cancel())
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
-    onRendererCrash({ reason: details.reason })
-    recoverRenderer(`render-process-gone:${details.reason}`)
+    if (isAppQuitting) return
+    hangWatch.cancel()
+    onRendererCrash({ reason: details.reason, exitCode: details.exitCode })
+    // Refresh memory pressure before the reloaded window asks for it.
+    if (classifyRendererGone(details.reason) === 'memory') void sampleResourcesNow()
+    const decision = recoverRenderer(`render-process-gone:${details.reason}`, 'crash')
+    recordProcessGone({
+      processType: 'renderer',
+      mainWindow: true,
+      reason: details.reason,
+      exitCode: details.exitCode,
+      recovery: decision.action,
+      crashesInWindow: decision.attempt,
+    })
+  })
+
+  mainWindow.on('show', () => {
+    if (rendererRecovery.isHalted()) remindRendererHalted(mainWindow)
   })
 
   // Close-to-tray: hide window instead of destroying (macOS + Windows only).
@@ -583,13 +633,6 @@ function createWindow(): void {
   mainWindow.on('closed', () => {
     setMainWindow(null)
     mainWindow = null
-  })
-
-  // Reconcile artifact caches on window focus (recover missed watcher events)
-  mainWindow.on('focus', () => {
-    reconcileAllSpaces('window-focus').catch((err) => {
-      console.error('[Main] Artifact reconciliation error on focus:', err)
-    })
   })
 
   // Notify all subscribers about the new window
@@ -707,8 +750,11 @@ app.whenReady().then(async () => {
     setImmediate(() => {
       initializeExtendedServices()
 
-      // Initialize analytics (after IPC handlers registered and window created)
-      initAnalytics().catch(err => console.warn('[Analytics] Init failed:', err))
+      // Initialize analytics (after IPC handlers registered and window created),
+      // then performance telemetry, whose next-launch report needs analytics up.
+      initAnalytics()
+        .catch(err => console.warn('[Analytics] Init failed:', err))
+        .finally(() => startPerfTelemetry())
     })
   })
 
@@ -723,41 +769,48 @@ app.whenReady().then(async () => {
   })
 })
 
-let hasShutdown = false
+let shutdownPromise: Promise<void> | null = null
+let shutdownWait: Promise<void> | null = null
+let quitResumed = false
 const SHUTDOWN_TIMEOUT_MS = 5000
-async function shutdownServices(): Promise<void> {
-  if (hasShutdown) {
-    return
-  }
-  hasShutdown = true
+function shutdownServices(): Promise<void> {
+  if (shutdownPromise) return shutdownPromise
+  shutdownPromise = (async () => {
+    // Record the initiation even if a later cleanup reaches the quit deadline.
+    markSessionCleanExit()
+    flushAllPendingIndexWrites()
+    shutdownHealthSystem()
 
-  // Record that a graceful shutdown was initiated. Done first so a normal quit is
-  // marked clean even if a later cleanup step is slow; an ungraceful death never
-  // reaches this path and so remains flagged on the next launch.
-  markSessionCleanExit()
-
-  // Flush pending conversation index writes before shutdown
-  flushAllPendingIndexWrites()
-
-  // Shutdown health system first (marks clean exit)
-  shutdownHealthSystem()
-
-  await shutdownRemoteAccess().catch(console.error)
-  await stopOpenAICompatRouter().catch(console.error)
-  await cleanupExtendedServices().catch(console.error)
+    const remoteShutdown = shutdownRemoteAccess().catch(error => console.error('[Main] Remote access shutdown failed:', error))
+    await cleanupExtendedServices().catch(error => console.error('[Main] Extended services shutdown failed:', error))
+    await stopOpenAICompatRouter().catch(error => console.error('[Main] Compatibility router shutdown failed:', error))
+    await remoteShutdown
+  })()
+  return shutdownPromise
 }
 
-async function shutdownServicesWithTimeout(timeoutMs: number): Promise<void> {
-  const shutdownPromise = shutdownServices().catch(console.error)
-  await Promise.race([
-    shutdownPromise,
+function shutdownServicesWithTimeout(timeoutMs: number): Promise<void> {
+  if (shutdownWait) return shutdownWait
+  let timer: ReturnType<typeof setTimeout> | undefined
+  shutdownWait = Promise.race([
+    shutdownServices().catch(error => console.error('[Main] Application shutdown failed:', error)),
     new Promise<void>((resolve) => {
-      setTimeout(() => {
-        console.warn(`[Main] Shutdown timeout after ${timeoutMs}ms, forcing quit`)
+      timer = setTimeout(() => {
+        console.warn(`[Main] Cleanup exceeded ${timeoutMs}ms; continuing application quit`)
         resolve()
       }, timeoutMs)
     })
-  ])
+  ]).finally(() => clearTimeout(timer))
+  return shutdownWait
+}
+
+function requestAppQuit(): void {
+  isAppQuitting = true
+  void shutdownServicesWithTimeout(SHUTDOWN_TIMEOUT_MS).then(() => {
+    if (quitResumed) return
+    quitResumed = true
+    app.quit()
+  })
 }
 
 // macOS installs an update through Electron's native updater (Squirrel), which
@@ -771,27 +824,58 @@ if (process.platform === 'darwin') {
   })
 }
 
-app.on('before-quit', () => {
+// Every other process that dies while main stays up: GPU, utility, and
+// renderers other than the main window's (browser views, previews).
+app.on('child-process-gone', (_event, details) => {
+  if (isAppQuitting || details.reason === 'clean-exit') return
+  console.warn(`[Main] Child process gone: type=${details.type} reason=${details.reason} exitCode=${details.exitCode}`)
+  recordProcessGone({
+    processType: details.type === 'GPU' ? 'gpu' : details.type === 'Utility' ? 'utility' : 'other',
+    mainWindow: false,
+    reason: details.reason,
+    exitCode: details.exitCode,
+    recovery: 'none',
+    crashesInWindow: 0,
+  })
+})
+
+app.on('render-process-gone', (_event, webContents, details) => {
+  if (isAppQuitting || details.reason === 'clean-exit') return
+  if (mainWindow && !mainWindow.isDestroyed() && webContents === mainWindow.webContents) return
+  console.warn(`[Main] Secondary renderer gone: reason=${details.reason} exitCode=${details.exitCode}`)
+  recordProcessGone({
+    processType: 'renderer',
+    mainWindow: false,
+    reason: details.reason,
+    exitCode: details.exitCode,
+    recovery: 'none',
+    crashesInWindow: 0,
+  })
+})
+
+app.on('before-quit', event => {
   isAppQuitting = true
-  shutdownServicesWithTimeout(SHUTDOWN_TIMEOUT_MS).catch(console.error)
+  if (quitResumed) return
+  event.preventDefault()
+  requestAppQuit()
 })
 
 app.on('window-all-closed', () => {
-  // Headless server mode: the only BrowserWindows are incidental hidden
-  // automation surfaces (daemon / offscreen browser). Their unexpected close
-  // (e.g. a renderer OOM in the container) must NOT quit the service — process
-  // lifetime is owned by the signal handlers instead.
-  if (isServerMode()) return
-
-  // With close-to-tray, this event only fires during actual quit
-  // (isAppQuitting=true, so the close handler did not preventDefault).
-  // On non-macOS, ensure clean shutdown before exiting.
-  // On macOS, the quit sequence continues automatically from before-quit.
-  if (process.platform !== 'darwin') {
-    shutdownServicesWithTimeout(SHUTDOWN_TIMEOUT_MS)
-      .catch(console.error)
-      .finally(() => app.quit())
+  const decision = decideAllWindowsClosed({
+    serverMode: isServerMode(),
+    platform: process.platform,
+    quitting: isAppQuitting,
+    keepAlive: getBackgroundService()?.shouldKeepAlive() ?? false,
+    windowRecreated: BrowserWindow.getAllWindows().length > 0,
+    trayAvailable: getBackgroundService()?.hasTray() ?? false,
+  })
+  if (decision === 'stay') {
+    if (!isAppQuitting && process.platform !== 'darwin' && !isServerMode()) {
+      console.log('[Main] All windows closed; staying alive for background work (reopen from tray or relaunch)')
+    }
+    return
   }
+  requestAppQuit()
 })
 
 // Export mainWindow for IPC handlers

@@ -16,6 +16,8 @@ import { Switch } from '../ui/Switch'
 import { useConfirmDialog } from '../../hooks/useConfirmDialog'
 import { useSecurityPolicy } from '../../hooks/useSecurityPolicy'
 import { BrowserAllowlistCard } from './BrowserAllowlistCard'
+import { ProxyBypassField } from './ProxyBypassField'
+import { ChildLocalConnectionRow } from './ChildLocalConnectionRow'
 
 interface SystemSectionProps {
   config: HaloConfig | null
@@ -430,6 +432,8 @@ export function SystemSection({ config, setConfig }: SystemSectionProps) {
               {t('Supports http://, https://')}
             </p>
 
+            <ProxyBypassField config={config} setConfig={setConfig} />
+
             {/* Browser proxy toggle — only visible when a proxy is configured */}
             {proxyInput.trim() && (
               <div className="flex items-center justify-between mt-3 pt-3 border-t border-border/50">
@@ -499,6 +503,23 @@ export function SystemSection({ config, setConfig }: SystemSectionProps) {
             <button
               onClick={() => api.openLogFolder()}
               className="flex items-center gap-2 px-3 py-1.5 text-sm bg-secondary hover:bg-secondary/80 rounded-lg transition-colors"
+            >
+              <FolderOpen className="w-4 h-4" />
+              {t('Open Folder')}
+            </button>
+          </div>
+
+          {/* Crash Reports */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pt-4 border-t border-border">
+            <div className="flex-1">
+              <p className="font-medium">{t('Crash Reports')}</p>
+              <p className="text-sm text-muted-foreground">
+                {t('Crash reports stay on this computer. Open the folder to send them to support when asked.')}
+              </p>
+            </div>
+            <button
+              onClick={() => api.openCrashReportsFolder()}
+              className="flex items-center gap-2 self-end sm:self-auto px-3 py-1.5 text-sm bg-secondary hover:bg-secondary/80 rounded-lg transition-colors"
             >
               <FolderOpen className="w-4 h-4" />
               {t('Open Folder')}
@@ -596,7 +617,7 @@ export function SystemSection({ config, setConfig }: SystemSectionProps) {
                           <span>{healthReport.platform} ({healthReport.arch})</span>
                         </div>
                         <div className="flex justify-between">
-                          <span className="text-muted-foreground">{t('Memory')}</span>
+                          <span className="text-muted-foreground">{t('System Memory')}</span>
                           <span>{healthReport.system.memory.free} / {healthReport.system.memory.total}</span>
                         </div>
                         <div className="flex justify-between">
@@ -744,6 +765,9 @@ export function SystemSection({ config, setConfig }: SystemSectionProps) {
                               )}
                             </div>
                           </div>
+                          {healthCheckResult.services.childLocalConnection && (
+                            <ChildLocalConnectionRow check={healthCheckResult.services.childLocalConnection} />
+                          )}
                         </div>
                       </div>
                     )}

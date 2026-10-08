@@ -5,7 +5,7 @@
  * This tool allows the AI to write activity entries to the Activity Thread,
  * enabling structured communication between the AI and the user.
  *
- * Uses the same tool() + createSdkMcpServer() pattern as platform/memory/tools.ts.
+ * Uses the same tool() + createSdkMcpServer() pattern as ./notify-tool.ts.
  */
 
 import { z } from 'zod'
@@ -262,6 +262,8 @@ export function createReportToolServer(
       // the framing, so a top-level `choices` has no question to belong to.
       if (input.choices && askedQuestions.length === 0) content.choices = input.choices
       if (askedQuestions.length > 0) content.questions = askedQuestions
+      // What an owner answers it by from an IM chat (im-escalation).
+      if (safeType === 'escalation') content.number = store.nextEscalationNumber()
 
       // ── Team-channel routing ────────────────────────────────────────────────
       // In a team turn, report_to_user keeps its ORIGINAL purpose: escalation
@@ -383,6 +385,15 @@ export function createReportToolServer(
       if (safeType === 'escalation') {
         if (onEscalation) {
           onEscalation(entryId)
+        }
+
+        // People who reach this digital human only through IM are asked there.
+        // Loaded on use, like the team layer loads the IM layer: the channel
+        // providers stay out of this tool's import graph.
+        if (persisted) {
+          void import('./im-escalation')
+            .then(({ deliverEscalationToIm }) => deliverEscalationToIm(entry, runContext.appName))
+            .catch((err) => console.warn('[Runtime] Question could not be sent to IM:', err))
         }
 
         // Broadcast escalation event for real-time UI update. Carry team context

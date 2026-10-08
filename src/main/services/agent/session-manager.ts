@@ -13,7 +13,7 @@ import os from 'os'
 import { existsSync, copyFileSync, mkdirSync } from 'fs'
 import { app } from 'electron'
 import { createSession } from './resolved-sdk'
-import { getConfig, onApiConfigChange, getCredentialsGeneration } from '../../foundation/config.service'
+import { onApiConfigChange, getCredentialsGeneration, type ApiConfigChange } from '../../foundation/config.service'
 import { getConversation } from '../conversation.service'
 import type {
   V2SDKSession,
@@ -28,19 +28,23 @@ import {
 } from './helpers'
 import { isImSessionKey } from '../../../shared/apps/im-keys'
 import { purgeStaleMcpOAuth } from './mcp-auth-state'
+import { onMcpServerRecovered } from './mcp-manager'
 import { emitAgentEvent } from './events'
 import { registerProcess, unregisterProcess, getCurrentInstanceId } from '../health'
-import { resolveCredentialsForSdk, buildBaseSdkOptions, computeCredentialsFingerprint, computeSessionInputsFingerprint } from './sdk-config'
-import { applySessionReasoningEffort } from './reasoning-effort'
+import { resolveCredentialsForSdk, buildUserSessionSdkOptions, computeCredentialsFingerprint, computeSessionInputsFingerprint, getSdkSourceId } from './sdk-config'
+import { resolveSpaceMemorySession } from './space-memory'
+import { applySessionReasoningEffort, pickReasoningEffort } from './reasoning-effort'
 import { startConsumer, type ConsumerHandle, type ConsumerContext } from './session-consumer'
 import { createConversationSink } from './conversation-sink'
 import { hasActiveTeamTasks } from './subagent-handler'
 import { setSessionInvalidator, buildCreationTimeServers } from './toolsets/broker'
 import { buildToolsetSection } from './toolsets/capability-index'
 import { dropConversationState, getOpenToolsets } from './toolsets/state'
+import { applyGoalDraft } from './goal/draft'
 import { HALO_API_TOOLSET_ID } from '../api-ref'
 import { resolveConversationKnowledgeBases, resolveConversationKnowledgeBaseIds } from './knowledge-context'
-import { buildKnowledgeSection } from './system-prompt'
+import { appendToSystemPrompt, buildKnowledgeSection } from './system-prompt'
+import { assertWorkingDirCurrent } from './working-dir'
 import type { KBReference } from '../../../shared/types/tlon'
 
 /**
@@ -60,7 +64,7 @@ function maskSecretForLog(value: string | undefined): string {
 /**
  * Active sessions map: conversationId -> SessionState
  * Tracks in-flight requests with abort controllers and accumulated thoughts.
- * Used by legacy callers (app-chat.ts, execute.ts). Consumer-based chat
+ * Used by headless callers (execute.ts). Consumer-based chat
  * conversations use the `consumers` map instead.
  */
 export const activeSessions = new Map<string, SessionState>()
@@ -111,9 +115,14 @@ function requestSessionRebuild(conversationId: string, reason = 'session rebuild
     // Session mid-creation: it is being seeded with the pre-change state, so flag
     // it for a rebuild once its consumer starts. When not under creation there is
     // genuinely no session and creation will read the current state anyway.
-    if (sessionsUnderCreation.has(conversationId)) {
+    if (sessionsUnderCreation.has(conversationId) || inFlightSessionCreations.has(conversationId)) {
       pendingConsumerRebuilds.add(conversationId)
     }
+    return
+  }
+
+  if (inFlightSessionCreations.has(conversationId)) {
+    pendingConsumerRebuilds.add(conversationId)
     return
   }
 
@@ -123,9 +132,8 @@ function requestSessionRebuild(conversationId: string, reason = 'session rebuild
     return
   }
 
-  // A user turn is dispatched but CC has not yet emitted system:init — the
-  // consumer looks idle, but cleanup now would destroy the in-flight message.
-  if (turnsAwaitingInit.has(conversationId)) {
+  // Preparation and dispatch precede system:init, so the consumer still looks idle.
+  if (sessionLeases.has(conversationId) || turnsAwaitingInit.has(conversationId)) {
     pendingConsumerRebuilds.add(conversationId)
     return
   }
@@ -138,10 +146,8 @@ function requestSessionRebuild(conversationId: string, reason = 'session rebuild
     return
   }
 
-  // Consumer idle between turns but the CC subprocess still has team agents
-  // running — cleanup now would kill them all. Defer: the consumer only
-  // consumes the pending flag once no team tasks remain (see consumeLoop).
-  if (consumer?.isRunning && hasActiveTeamTasks(consumer.getTeamLifecycleThoughts())) {
+  // Background results arrive through this same consumer as later turns.
+  if (consumer?.isRunning && (consumer.hasRunningTasks() || hasActiveTeamTasks(consumer.getTeamLifecycleThoughts()))) {
     pendingConsumerRebuilds.add(conversationId)
     return
   }
@@ -197,7 +203,125 @@ const sessionsUnderCreation = new Set<string>()
  */
 const turnsAwaitingInit = new Set<string>()
 
-/** Called by send-message right before dispatching a user turn to the REPL. */
+interface ManagedSessionLease extends V2SessionLease {
+  readonly awaitingInit: boolean
+  acknowledge(): boolean
+  failBeforeInit(error: Error): boolean
+}
+
+const sessionLeases = new Map<string, Set<V2SessionLease>>()
+const pendingSessionTurns = new WeakMap<V2SDKSession, Set<ManagedSessionLease>>()
+
+/** Holds the acquired instance through preparation; dispatch transfers protection to the consumer. */
+export interface V2SessionLease {
+  readonly session: V2SDKSession
+  /** Instance ownership, independent of whether dispatch released its reservation. */
+  readonly isCurrent: boolean
+  /** Reports a rejection synchronously before cleanup, only while this instance is current. */
+  send(message: Parameters<V2SDKSession['send']>[0], onFailure?: (error: unknown) => void): Promise<void>
+  release(): void
+  close(): void
+}
+
+function leaseSession(
+  conversationId: string,
+  session: V2SDKSession,
+  onFailureBeforeInit?: (error: Error) => void
+): V2SessionLease {
+  if (v2Sessions.get(conversationId)?.session !== session) {
+    console.warn(`[Agent][${conversationId}] Session acquisition discarded: the instance was closed or replaced`)
+    throw new Error('The acquired session is no longer available')
+  }
+  const holders = sessionLeases.get(conversationId) ?? new Set<V2SessionLease>()
+  // Reservations end at SDK acceptance; failure ownership lasts until system:init.
+  const pending = pendingSessionTurns.get(session) ?? new Set<ManagedSessionLease>()
+  let dispatched = false
+  let acknowledged = false
+  let failed = false
+  const lease: ManagedSessionLease = {
+    session,
+    get isCurrent() {
+      return !failed && v2Sessions.get(conversationId)?.session === session
+    },
+    get awaitingInit() { return dispatched && !acknowledged },
+    acknowledge() {
+      if (!dispatched) return false
+      acknowledged = true
+      pending.delete(lease)
+      return true
+    },
+    failBeforeInit(error) {
+      if (!pending.delete(lease)) return false
+      failed = true
+      try {
+        onFailureBeforeInit?.(error)
+      } catch (reportError) {
+        console.error(`[Agent][${conversationId}] Pre-init failure reporting failed:`, reportError)
+      }
+      return Boolean(onFailureBeforeInit)
+    },
+    async send(message, onFailure) {
+      if (failed || !holders.has(lease) || v2Sessions.get(conversationId)?.session !== session) {
+        console.warn(`[Agent][${conversationId}] Turn dispatch refused: its session lease is no longer current`)
+        throw new Error('The acquired session is no longer available')
+      }
+      dispatched = true
+      pending.delete(lease)
+      pending.add(lease)
+      markTurnDispatched(conversationId)
+      try {
+        await session.send(message)
+      } catch (error) {
+        pending.delete(lease)
+        if (!failed && lease.isCurrent) {
+          try {
+            onFailure?.(error)
+          } catch (reportError) {
+            console.error(`[Agent][${conversationId}] Dispatch failure reporting failed:`, reportError)
+          }
+        } else {
+          console.warn(`[Agent][${conversationId}] Discarded retired session's dispatch failure; original caller still receives the rejection`)
+        }
+        lease.close()
+        throw error
+      } finally {
+        lease.release()
+      }
+    },
+    release() {
+      if (!dispatched || acknowledged) pending.delete(lease)
+      if (sessionLeases.get(conversationId) !== holders || !holders.delete(lease)) return
+      if (holders.size === 0) sessionLeases.delete(conversationId)
+      if (v2Sessions.get(conversationId)?.session === session &&
+        hasConsumablePendingRebuild(conversationId) && !inFlightSessionCreations.has(conversationId)) {
+        requestSessionRebuild(conversationId, 'pending rebuild after session lease release')
+      }
+    },
+    close() {
+      if (sessionLeases.get(conversationId) === holders && holders.has(lease) &&
+        v2Sessions.get(conversationId)?.session === session) {
+        closeV2SessionForRebuild(conversationId, 'leased session cleanup')
+      }
+    },
+  }
+  holders.add(lease)
+  sessionLeases.set(conversationId, holders)
+  pending.add(lease)
+  pendingSessionTurns.set(session, pending)
+  return lease
+}
+
+/** Settles this instance's unacknowledged callers before any successor can be published. */
+export function failPendingSessionTurns(conversationId: string, error: Error): boolean {
+  const session = v2Sessions.get(conversationId)?.session
+  const pending = session && pendingSessionTurns.get(session)
+  if (!pending) return false
+  let reported = false
+  for (const lease of [...pending]) reported = lease.failBeforeInit(error) || reported
+  return reported
+}
+
+/** Called right before dispatching a user turn to the REPL. */
 export function markTurnDispatched(conversationId: string): void {
   turnsAwaitingInit.add(conversationId)
 }
@@ -205,15 +329,26 @@ export function markTurnDispatched(conversationId: string): void {
 /** Called by the session consumer when CC acknowledges the turn (system:init). */
 export function markTurnInitReceived(conversationId: string): void {
   turnsAwaitingInit.delete(conversationId)
+  const session = v2Sessions.get(conversationId)?.session
+  if (!session) return
+  const pending = pendingSessionTurns.get(session)
+  if (!pending) return
+  // SDK turns are correlated by dispatch order, not by a request id.
+  for (const lease of pending) {
+    if (lease.acknowledge()) break
+  }
+  if ([...pending].some(lease => lease.awaitingInit)) turnsAwaitingInit.add(conversationId)
 }
 
 /**
  * Check if a session is busy (has an in-flight request).
- * Covers both legacy activeSessions (app-chat/execute) and
- * consumer-based chat conversations.
+ * Covers caller-held leases, headless activeSessions and
+ * consumer-based chat conversations. A consumer idle between turns whose team
+ * agents are still working counts as busy: tearing it down would lose their
+ * results.
  */
-function isSessionBusy(conversationId: string): boolean {
-  if (activeSessions.has(conversationId)) return true
+export function isSessionBusy(conversationId: string): boolean {
+  if (sessionLeases.has(conversationId) || activeSessions.has(conversationId)) return true
   const consumer = consumers.get(conversationId)
   if (!consumer?.isRunning) return false
   // Actively processing a turn — definitely busy.
@@ -236,11 +371,11 @@ function isSessionBusy(conversationId: string): boolean {
  *
  * @param conversationId - Conversation ID to clean up
  * @param reason - Reason for cleanup (for logging)
- * @param skipMapCheck - If true, skip checking if session exists in map (for batch operations)
+ * @param failure - Unexpected termination to settle pending messages before replacement
  */
-function cleanupSession(conversationId: string, reason: string, skipMapCheck = false): void {
+function cleanupSession(conversationId: string, reason: string, failure?: Error): void {
   const info = v2Sessions.get(conversationId)
-  if (!info && !skipMapCheck) return
+  if (!info) return
 
   console.log(`[Agent][${conversationId}] Cleaning up session: ${reason}`)
 
@@ -251,7 +386,11 @@ function cleanupSession(conversationId: string, reason: string, skipMapCheck = f
     consumers.delete(conversationId)
     console.log(`[Agent][${conversationId}] Consumer stopped during cleanup`)
   }
+  if (failure) failPendingSessionTurns(conversationId, failure)
+  pendingSessionTurns.delete(info.session)
   pendingConsumerRebuilds.delete(conversationId)
+  pendingInvalidations.delete(conversationId)
+  if (!mcpRebuildRequested.delete(conversationId)) mcpRebuildsSpent.delete(conversationId)
 
   if (info) {
     // Detach the exit listener first: session.close() never reaches
@@ -271,6 +410,7 @@ function cleanupSession(conversationId: string, reason: string, skipMapCheck = f
 
   unregisterProcess(conversationId, 'v2-session')
   v2Sessions.delete(conversationId)
+  sessionLeases.delete(conversationId)
   turnsAwaitingInit.delete(conversationId)
 
   // Drop the in-memory toolset open-set. Persisted toolset selection on the
@@ -378,12 +518,12 @@ function registerProcessExitListener(
         // EOF; the process lingers up to seconds). Without this check the
         // predecessor's exit tears down the brand-new session and its consumer.
         const current = v2Sessions.get(conversationId)
-        if (current && current.session !== session) {
-          console.log(`[Agent][${conversationId}] Ignoring exit of a replaced session's process`)
+        if (current?.session !== session) {
+          console.warn(`[Agent][${conversationId}] Ignoring exit of a closed or replaced session's process`)
           return
         }
         const errorMsg = error ? `: ${error.message}` : ''
-        cleanupSession(conversationId, `process exited${errorMsg}`)
+        cleanupSession(conversationId, `process exited${errorMsg}`, error ?? new Error('Chat session ended before the message was processed.'))
         console.log(`[Agent][${conversationId}] Remaining sessions: ${v2Sessions.size}`)
       })
 
@@ -426,7 +566,7 @@ function startSessionCleanup(): void {
     for (const [convId, info] of Array.from(v2Sessions.entries())) {
       // Check 1: Clean up sessions with dead processes (killed by OS, crashed, etc.)
       if (!isSessionTransportReady(info.session)) {
-        cleanupSession(convId, 'process not ready (polling fallback)')
+        cleanupSession(convId, 'process not ready (polling fallback)', new Error('Chat session ended before the message was processed.'))
         continue
       }
 
@@ -442,6 +582,107 @@ function startSessionCleanup(): void {
       }
     }
   }, 60 * 1000) // Check every minute
+}
+
+// ============================================
+// Resident Session Limit
+// ============================================
+
+/**
+ * Upper bound on resident sessions (one engine process each), set by the owner
+ * of the budget policy (apps/runtime). null = unlimited.
+ */
+let residentSessionLimit: number | null = null
+let overLimitWarned = false
+let evictionCount = 0
+
+export interface ResidentSessionInfo {
+  conversationId: string
+  spaceId: string
+  lastUsedAt: number
+  /** Mid-turn, awaiting init, holding team agents or background tasks, or being created — never evicted. */
+  busy: boolean
+}
+
+/**
+ * A task CC started in the background (a shell, agent or workflow) reports back
+ * as a later turn of this session; evicting it would kill the task. The idle
+ * sweep does not consult this, so a task whose completion never arrives cannot
+ * pin the process forever.
+ */
+function hasRunningTasks(conversationId: string): boolean {
+  const consumer = consumers.get(conversationId)
+  return !!consumer?.isRunning && consumer.hasRunningTasks()
+}
+
+function isEvictionUnsafe(conversationId: string): boolean {
+  return isSessionBusy(conversationId)
+    || hasRunningTasks(conversationId)
+    || turnsAwaitingInit.has(conversationId)
+    || sessionsUnderCreation.has(conversationId)
+    || inFlightSessionCreations.has(conversationId)
+}
+
+export function listResidentSessions(): ResidentSessionInfo[] {
+  return Array.from(v2Sessions.values()).map((info) => ({
+    conversationId: info.conversationId,
+    spaceId: info.spaceId,
+    lastUsedAt: info.lastUsedAt,
+    busy: isEvictionUnsafe(info.conversationId),
+  }))
+}
+
+/**
+ * Close an idle resident session to free its engine process. Refuses busy or
+ * in-creation sessions. The conversation resumes from its stored session id on
+ * its next turn, exactly as after the idle-timeout sweep.
+ */
+export function evictIdleSession(conversationId: string, reason: string): boolean {
+  if (!v2Sessions.has(conversationId) || isEvictionUnsafe(conversationId)) return false
+  cleanupSession(conversationId, `evicted: ${reason}`)
+  evictionCount += 1
+  return true
+}
+
+/** The resident limit in force (null = unlimited), for performance reporting. */
+export function getResidentSessionLimit(): number | null {
+  return residentSessionLimit
+}
+
+/** Idle sessions evicted since process start (for performance reporting). */
+export function getSessionEvictionCount(): number {
+  return evictionCount
+}
+
+export function setResidentSessionLimit(limit: number | null): void {
+  residentSessionLimit = limit === null ? null : Math.max(1, Math.floor(limit))
+  overLimitWarned = false
+}
+
+/**
+ * Before a new session is created, evict least-recently-used idle sessions
+ * until one more fits under the limit. When every resident session is busy the
+ * new one is created over the limit (never refused); warned once per crossing.
+ */
+function enforceResidentSessionLimit(creatingConversationId: string): void {
+  const limit = residentSessionLimit
+  if (limit === null) return
+  const candidates = Array.from(v2Sessions.values())
+    .filter((info) => info.conversationId !== creatingConversationId)
+    .sort((a, b) => a.lastUsedAt - b.lastUsedAt)
+  let resident = candidates.length
+  for (const info of candidates) {
+    if (resident < limit) break
+    if (evictIdleSession(info.conversationId, `resident session limit ${limit}`)) resident -= 1
+  }
+  if (resident >= limit) {
+    if (!overLimitWarned) {
+      overLimitWarned = true
+      console.warn(`[Agent] Resident sessions over limit: ${resident + 1}/${limit}, all others busy`)
+    }
+  } else {
+    overLimitWarned = false
+  }
 }
 
 /**
@@ -552,7 +793,7 @@ function migrateSessionIfNeeded(workDir: string, sessionId: string): boolean {
  * 3. The abort signal also fires SIGTERM via the spawn signal option
  * Both ensure the old process exits promptly before the new one starts.
  */
-function closeV2SessionForRebuild(conversationId: string, reason = 'rebuild required'): void {
+function closeV2SessionForRebuild(conversationId: string, reason = 'rebuild required', failure?: Error): void {
   const info = v2Sessions.get(conversationId)
   if (info) {
     try {
@@ -564,21 +805,22 @@ function closeV2SessionForRebuild(conversationId: string, reason = 'rebuild requ
       // AbortController may not be accessible — proceed with cleanup
     }
   }
-  cleanupSession(conversationId, reason)
+  cleanupSession(conversationId, reason, failure)
 }
 
 /**
  * True when a deferred rebuild is flagged for this conversation AND the session
  * is safely idle (no dispatched-but-unacknowledged turn, no active turn, no
- * running team agents) — i.e. the flag can be applied right now instead of
+ * running background or team tasks) — i.e. the flag can be applied right now instead of
  * waiting for the consumer's next turn boundary.
  */
 function hasConsumablePendingRebuild(conversationId: string): boolean {
   if (!pendingConsumerRebuilds.has(conversationId)) return false
+  if (sessionLeases.has(conversationId) || activeSessions.has(conversationId)) return false
   if (turnsAwaitingInit.has(conversationId)) return false
   const consumer = consumers.get(conversationId)
   if (consumer?.isRunning && consumer.getActiveSessionState()) return false
-  if (consumer?.isRunning && hasActiveTeamTasks(consumer.getTeamLifecycleThoughts())) return false
+  if (consumer?.isRunning && (consumer.hasRunningTasks() || hasActiveTeamTasks(consumer.getTeamLifecycleThoughts()))) return false
   return true
 }
 
@@ -644,7 +886,7 @@ function assertMcpInstancesUnbound(
  * @param gates - Conditions the returned session must actually meet. See
  *   {@link SessionGates}.
  */
-export async function getOrCreateV2Session(
+export function getOrCreateV2Session(
   spaceId: string,
   conversationId: string,
   sdkOptions: Record<string, any>,
@@ -656,6 +898,55 @@ export async function getOrCreateV2Session(
   resolveKnowledgeBases?: () => KBReference[],
   gates?: SessionGates
 ): Promise<V2SessionInfo['session']> {
+  return getOrCreateSessionResult(
+    spaceId, conversationId, sdkOptions, sessionId, workDir,
+    consumer, resolvedKbIds, buildMcpServers, resolveKnowledgeBases, gates
+  )
+}
+
+/** Acquires protection before handoff. Pre-init failure settles before replacement; always release in finally. */
+export async function acquireV2Session(
+  spaceId: string,
+  conversationId: string,
+  sdkOptions: Record<string, any>,
+  sessionId?: string,
+  workDir?: string,
+  consumer?: SessionConsumerOptions,
+  resolvedKbIds?: string[],
+  buildMcpServers?: () => Record<string, unknown> | null,
+  resolveKnowledgeBases?: () => KBReference[],
+  gates?: SessionGates,
+  onFailureBeforeInit?: (error: Error) => void
+): Promise<V2SessionLease> {
+  const request: SessionLeaseRequest = { onFailureBeforeInit }
+  await getOrCreateSessionResult(
+    spaceId, conversationId, sdkOptions, sessionId, workDir,
+    consumer, resolvedKbIds, buildMcpServers, resolveKnowledgeBases, gates, request
+  )
+  return request.lease!
+}
+
+interface SessionLeaseRequest {
+  lease?: V2SessionLease
+  onFailureBeforeInit?: (error: Error) => void
+}
+
+async function getOrCreateSessionResult(
+  spaceId: string,
+  conversationId: string,
+  sdkOptions: Record<string, any>,
+  sessionId?: string,
+  workDir?: string,
+  consumer?: SessionConsumerOptions,
+  resolvedKbIds?: string[],
+  buildMcpServers?: () => Record<string, unknown> | null,
+  resolveKnowledgeBases?: () => KBReference[],
+  gates?: SessionGates,
+  leaseRequest?: SessionLeaseRequest
+): Promise<V2SessionInfo['session']> {
+  assertWorkingDirCurrent(spaceId, workDir ?? sdkOptions.cwd)
+  sessionAcquisitions.set(spaceId, (sessionAcquisitions.get(spaceId) ?? 0) + 1)
+
   // Concurrent calls for the same conversation (a fire-and-forget
   // ensureSessionWarm racing the first sendMessage) must not both reach
   // createSession: the loser's v2Sessions.set/registerProcess would overwrite
@@ -664,7 +955,8 @@ export async function getOrCreateV2Session(
   // result; if their inputs differ (credentials/KB changed mid-flight), the
   // fingerprint check on the next call reconciles with a rebuild.
   //
-  // EXCEPT when the latecomer's options are a restriction (requireFreshInputs):
+  // Account switches never share; a request must not inherit another source.
+  // Also, when the latecomer's options are a restriction (requireFreshInputs):
   // "reconciles on the next call" is exactly the deferral that gate exists to
   // refuse — the shared session would run this request with whatever the
   // creation in flight was built with. Share only on a matching inputs
@@ -672,17 +964,23 @@ export async function getOrCreateV2Session(
   // finished session, where the existing stale check applies.
   const inFlight = inFlightSessionCreations.get(conversationId)
   if (inFlight) {
-    const shareable =
+    const sameSource = inFlight.sourceId === getSdkSourceId(sdkOptions)
+    const shareable = sameSource && (
       !gates?.requireFreshInputs ||
       (inFlight.inputsFingerprint !== undefined &&
         inFlight.inputsFingerprint === computeSessionInputsFingerprint(sdkOptions))
+    )
     if (shareable) {
+      if (leaseRequest) {
+        if (inFlight.session) leaseRequest.lease = leaseSession(conversationId, inFlight.session, leaseRequest.onFailureBeforeInit)
+        else inFlight.leaseRequests.add(leaseRequest)
+      }
       console.log(`[Agent][${conversationId}] Session creation already in flight, sharing result`)
       return inFlight.promise
     }
     console.warn(
-      `[Agent][${conversationId}] Session creation in flight was built on different inputs; ` +
-      `waiting it out instead of sharing (requireFreshInputs)`
+      `[Agent][${conversationId}] Session creation in flight was built on a different source or restricted inputs; ` +
+      `waiting it out instead of sharing`
     )
     await inFlight.promise.catch(() => undefined)
     // The creator's own finally may not have run yet; clear the settled entry
@@ -690,21 +988,29 @@ export async function getOrCreateV2Session(
     if (inFlightSessionCreations.get(conversationId) === inFlight) {
       inFlightSessionCreations.delete(conversationId)
     }
-    return getOrCreateV2Session(
+    return getOrCreateSessionResult(
       spaceId, conversationId, sdkOptions, sessionId, workDir,
-      consumer, resolvedKbIds, buildMcpServers, resolveKnowledgeBases, gates
+      consumer, resolvedKbIds, buildMcpServers, resolveKnowledgeBases, gates, leaseRequest
     )
   }
 
+  const leaseRequests = new Set<SessionLeaseRequest>(leaseRequest ? [leaseRequest] : [])
   const promise = getOrCreateV2SessionInner(
     spaceId, conversationId, sdkOptions, sessionId, workDir,
     consumer, resolvedKbIds, buildMcpServers, resolveKnowledgeBases, gates
-  )
+  ).then(session => {
+    record.session = session
+    for (const request of leaseRequests) request.lease = leaseSession(conversationId, session, request.onFailureBeforeInit)
+    return session
+  })
   const record: InFlightSessionCreation = {
+    spaceId,
     promise,
+    leaseRequests,
     // Same opt-out as the fingerprint stored on the session: a lazy-MCP caller
     // (main chat) has no eager inputs to hash, and no gated caller either.
     inputsFingerprint: buildMcpServers ? undefined : computeSessionInputsFingerprint(sdkOptions),
+    sourceId: getSdkSourceId(sdkOptions),
   }
   inFlightSessionCreations.set(conversationId, record)
   try {
@@ -719,13 +1025,29 @@ export async function getOrCreateV2Session(
 }
 
 interface InFlightSessionCreation {
+  spaceId: string
   promise: Promise<V2SessionInfo['session']>
+  leaseRequests: Set<SessionLeaseRequest>
+  session?: V2SDKSession
+  sourceId?: string
   /** Inputs the creation was invoked with; undefined for lazy-MCP callers. */
   inputsFingerprint: string | undefined
 }
 
 /** conversationId -> in-flight getOrCreateV2Session creation. */
 const inFlightSessionCreations = new Map<string, InFlightSessionCreation>()
+
+/** spaceId -> how many times a session of the space has been asked for. */
+const sessionAcquisitions = new Map<string, number>()
+
+/**
+ * How many times a session of the space has been asked for so far. Every turn,
+ * run and warm-up asks first, so two equal readings mean none started in
+ * between — even one that has finished again by the second.
+ */
+export function countSessionAcquisitions(spaceId: string): number {
+  return sessionAcquisitions.get(spaceId) ?? 0
+}
 
 /**
  * Consumer wiring for a newly created session. Grouped rather than passed as
@@ -738,7 +1060,8 @@ export type SessionConsumerOptions = Omit<ConsumerContext, 'spaceId' | 'conversa
 /** Conditions a caller needs the returned session to actually meet. */
 export interface SessionGates {
   /**
-   * Refuse rather than hand back a live session built on different options.
+   * Refuse rather than hand back a busy session built on different inputs
+   * (system prompt, MCP set, permission rules — computeSessionInputsFingerprint).
    *
    * Reuse normally defers a rebuild while the session is busy and returns the
    * existing one — right for a model or knowledge change, where one more turn
@@ -747,46 +1070,60 @@ export interface SessionGates {
    * request with the permissions of whoever used the session last.
    */
   requireFreshInputs?: boolean
+  /**
+   * Creation-time context outside the knowledge set that decides what the
+   * session was built with (for space chat: whether the space's memory was on).
+   * A different value rebuilds the session like a knowledge change does, so a
+   * session warmed before a setting flipped never serves a turn built after it.
+   */
+  creationContext?: string
 }
 
 /**
- * Thrown when {@link SessionGates.requireFreshInputs} cannot be honoured right
- * now. The work is not lost — the caller reports it and the request can be sent
- * again once the session is free.
+ * Thrown when a busy session cannot serve the request: its gated inputs
+ * changed ({@link SessionGates.requireFreshInputs}) or it runs on another
+ * account. Nothing was sent; the request can be sent again once the session
+ * is free.
  */
 export class SessionOptionsStaleError extends Error {
-  constructor(conversationId: string) {
-    super(
-      `The digital human is still busy with earlier work, so this request was not started. ` +
-      `Try again once it finishes (conversation ${conversationId}).`
-    )
+  constructor(conversationId: string, reason: 'restricted-inputs' | 'source-switch') {
+    super(reason === 'source-switch'
+      ? 'This conversation is still busy on its previous account (a reply or background task is running), ' +
+        'so this message was not sent. Send it again when that finishes, stop the running task, ' +
+        'or start a new conversation to use the new account now.'
+      : `The digital human is still busy with earlier work, so this request was not started. ` +
+        `Try again once it finishes (conversation ${conversationId}).`)
     this.name = 'SessionOptionsStaleError'
   }
 }
 
 /**
  * The conditions under which a needed rebuild is deferred instead of performed,
- * one per guard in getOrCreateV2SessionInner. requireFreshInputs refuses
- * exactly when any of them holds — computed here as the single source so a new
+ * one per guard in getOrCreateV2SessionInner. requireFreshInputs refuses changed
+ * inputs exactly when any of them holds — computed here as the single source so a new
  * or changed guard cannot leave the refusal behind, which would silently run a
  * gated request on the previous caller's options (DESIGN.md hard rule 9).
  */
 function assessRebuildDeferral(
   conversationId: string,
   consumer: ConsumerHandle | undefined
-): { awaitingInit: boolean; activeTurn: boolean; idleWithTeamTasks: boolean; any: boolean } {
+): { leased: boolean; awaitingInit: boolean; activeTurn: boolean; idleWithTeamTasks: boolean; backgroundTasks: boolean; any: boolean } {
+  const leased = sessionLeases.has(conversationId)
   const awaitingInit = turnsAwaitingInit.has(conversationId)
-  const activeTurn = Boolean(consumer?.isRunning && consumer.getActiveSessionState() !== null)
+  const activeTurn = activeSessions.has(conversationId) || Boolean(consumer?.isRunning && consumer.getActiveSessionState() !== null)
   const idleWithTeamTasks = Boolean(
     consumer?.isRunning &&
       !consumer.getActiveSessionState() &&
       hasActiveTeamTasks(consumer.getTeamLifecycleThoughts())
   )
+  const backgroundTasks = Boolean(consumer?.isRunning && consumer.hasRunningTasks())
   return {
+    leased,
     awaitingInit,
     activeTurn,
     idleWithTeamTasks,
-    any: awaitingInit || activeTurn || idleWithTeamTasks,
+    backgroundTasks,
+    any: leased || awaitingInit || activeTurn || idleWithTeamTasks || backgroundTasks,
   }
 }
 
@@ -802,15 +1139,16 @@ async function getOrCreateV2SessionInner(
   resolveKnowledgeBases?: () => KBReference[],
   gates?: SessionGates
 ): Promise<V2SessionInfo['session']> {
-  // Per-conversation credential/model fingerprint — used to rebuild this
-  // conversation's session when its own model pin changes (the global
-  // credentialsGeneration only tracks the current source's model).
+  const sourceId = getSdkSourceId(sdkOptions)
+  // Capture before any async creation work; never stamp a newer epoch on old options.
+  const creationCredentialsGeneration = sdkOptions.credentialsGeneration ?? getCredentialsGeneration(sourceId)
   const currentFingerprint = computeCredentialsFingerprint(sdkOptions)
   // Knowledge context baked into the system prompt at creation. Not part of the
   // credentials fingerprint, so tracked separately to rebuild a session whose
   // resolved KB set or working directory has diverged (attach/detach, indexing
   // completed after creation, or a KB-chat/normal turn switch).
-  const currentKnowledgeFingerprint = computeKnowledgeFingerprint(resolvedKbIds, workDir)
+  const currentKnowledgeFingerprint =
+    computeKnowledgeFingerprint(resolvedKbIds, workDir) + (gates?.creationContext ? `::${gates.creationContext}` : '')
   // Tool set + system prompt baked in eagerly by app chat / automation runs.
   // Main chat builds MCP servers lazily (buildMcpServers) and drives toolset
   // changes via requestSessionRebuild, so it opts out to avoid double-handling.
@@ -826,8 +1164,8 @@ async function getOrCreateV2SessionInner(
     // but our v2Sessions Map still holds a reference to the dead session.
     // We must check SDK's transport state (Single Source of Truth) before reusing.
     if (!isSessionTransportReady(existing.session)) {
-      console.log(`[Agent][${conversationId}] Session transport not ready (process dead), recreating...`)
-      closeV2SessionForRebuild(conversationId)
+      console.warn(`[Agent][${conversationId}] Session transport not ready (process dead), recreating...`)
+      closeV2SessionForRebuild(conversationId, 'process not ready on acquisition', new Error('Chat session ended before the message was processed.'))
       // Fall through to create new session
     } else if (consumers.get(conversationId)?.isRunning === false) {
       // Consumer exited (e.g., race between session recreation and invalidateAllSessions
@@ -848,8 +1186,9 @@ async function getOrCreateV2SessionInner(
       // Check if credentials have changed since session was created
       // This catches race conditions where session was created with stale credentials
       // (e.g., warm-up started before config save completed)
-      const currentGen = getCredentialsGeneration()
+      const currentGen = getCredentialsGeneration(existing.sourceId)
       const needsCredentialRebuild =
+        existing.sourceId !== sourceId ||
         existing.credentialsGeneration !== currentGen ||
         existing.credentialsFingerprint !== currentFingerprint ||
         existing.knowledgeFingerprint !== currentKnowledgeFingerprint ||
@@ -861,16 +1200,29 @@ async function getOrCreateV2SessionInner(
 
         // The guards below trade correctness-now for not destroying work in
         // flight, and hand back the session as it stands. A caller whose options
-        // ARE a restriction cannot take that trade — running one more turn on
-        // the old settings is exactly the thing being prevented — so it is told
-        // the session is not available instead.
-        if (gates?.requireFreshInputs && deferral.any) {
+        // ARE a restriction cannot take that trade for those options — running
+        // one more turn on the old ones is exactly the thing being prevented — so
+        // it is told the session is not available instead. A credential or model
+        // change on the same source still defers. A source switch fails closed.
+        const restrictedInputsChanged = gates?.requireFreshInputs === true &&
+          existing.inputsFingerprint !== currentInputsFingerprint
+        if ((restrictedInputsChanged || existing.sourceId !== sourceId) && deferral.any) {
           pendingConsumerRebuilds.add(conversationId)
           console.warn(
-            `[Agent][${conversationId}] Refusing to reuse a session built on different permissions ` +
-            `while it is busy; the request was not started.`
+            `[Agent][${conversationId}] Refusing to reuse a busy session: ` +
+            `${restrictedInputsChanged ? 'restricted inputs changed' : `source changed ${existing.sourceId ?? 'legacy'}→${sourceId ?? 'legacy'}`}; ` +
+            `the request was not started.`
           )
-          throw new SessionOptionsStaleError(conversationId)
+          throw new SessionOptionsStaleError(conversationId, restrictedInputsChanged ? 'restricted-inputs' : 'source-switch')
+        }
+
+        if (deferral.leased) {
+          if (!pendingConsumerRebuilds.has(conversationId)) {
+            console.warn(`[Agent][${conversationId}] Session rebuild deferred: source=${sourceId ?? 'legacy'} preparation lease still held; retaining the acquired instance`)
+          }
+          pendingConsumerRebuilds.add(conversationId)
+          existing.lastUsedAt = Date.now()
+          return existing.session
         }
 
         // Guard 0: A user turn is dispatched but not yet acknowledged by
@@ -901,22 +1253,18 @@ async function getOrCreateV2SessionInner(
           return existing.session
         }
 
-        // Guard 2: Consumer is idle between turns but CC subprocess has active team agents.
-        // Their results arrive as a future autonomous turn. Killing the session now would
-        // abort all in-flight agent tasks.
-        if (deferral.idleWithTeamTasks) {
-          // A pending rebuild flag (credential or toolset change) is safe to keep:
-          // the consumer only consumes it once no team tasks remain (consumeLoop),
-          // so it cannot break the loop mid-team while messages are queued.
+        // Idle background work still needs this receiver for its autonomous completion turns.
+        if (deferral.idleWithTeamTasks || deferral.backgroundTasks) {
           console.log(
-            `[Agent][${conversationId}] Session rebuild deferred — active team agents detected ` +
-            `(gen ${existing.credentialsGeneration}→${currentGen}). Will rebuild after team tasks complete.`
+            `[Agent][${conversationId}] Session rebuild deferred — background or team work still needs its receiver ` +
+            `(gen ${existing.credentialsGeneration}→${currentGen}). Will rebuild after tasks complete.`
           )
+          pendingConsumerRebuilds.add(conversationId)
           existing.lastUsedAt = Date.now()
           return existing.session
         }
 
-        // No active processing and no team agents — safe to rebuild now.
+        // No active processing or outstanding tasks — safe to rebuild now.
         console.log(`[Agent][${conversationId}] Session inputs changed (gen ${existing.credentialsGeneration}→${currentGen}, fp ${existing.credentialsFingerprint}→${currentFingerprint}, kb ${existing.knowledgeFingerprint}→${currentKnowledgeFingerprint}, tools ${existing.inputsFingerprint ?? '∅'}→${currentInputsFingerprint ?? '∅'}), recreating session`)
         closeV2SessionForRebuild(conversationId)
         // Fall through to create new session
@@ -932,6 +1280,7 @@ async function getOrCreateV2SessionInner(
   // Create new session
   // If sessionId exists, pass resume to let CC restore history from disk
   // After first message, the process stays alive and maintains context in memory
+  enforceResidentSessionLimit(conversationId)
   console.log(`[Agent][${conversationId}] Creating new V2 session...`)
 
   if (buildMcpServers) {
@@ -951,8 +1300,8 @@ async function getOrCreateV2SessionInner(
   // sdkOptions directly; both have converged by this point.
   await purgeStaleMcpOAuth(sdkOptions.mcpServers, `session:${conversationId}`)
 
-  if (resolveKnowledgeBases && typeof sdkOptions.systemPrompt === 'string') {
-    sdkOptions.systemPrompt += buildKnowledgeSection(resolveKnowledgeBases())
+  if (resolveKnowledgeBases && sdkOptions.systemPrompt != null) {
+    sdkOptions.systemPrompt = appendToSystemPrompt(sdkOptions.systemPrompt, buildKnowledgeSection(resolveKnowledgeBases()))
   }
 
   console.debug(`[Agent][${conversationId}] SDK options: model=${sdkOptions.model}, maxTurns=${sdkOptions.maxTurns}, mcpServers=[${Object.keys(sdkOptions.mcpServers || {}).join(', ')}], resume=${!!sessionId}`)
@@ -978,6 +1327,11 @@ async function getOrCreateV2SessionInner(
   // Native SDK V2 Session doesn't support resume parameter
   if (effectiveSessionId) {
     sdkOptions.resume = effectiveSessionId
+  }
+  // Keyed on the recorded id, not effectiveSessionId: a resumable conversation
+  // keeps its goal with the engine, even when its transcript went missing.
+  if (!sessionId) {
+    applyGoalDraft(sdkOptions, conversationId)
   }
   // resolved-sdk handles sdkEngine switch (Halo SDK vs CC SDK) transparently.
   // Mark the creation window so a toolset toggle arriving during this await is
@@ -1010,24 +1364,30 @@ async function getOrCreateV2SessionInner(
     })
   }
 
-  // Register process exit listener for immediate cleanup
-  // This is event-driven (better than polling) - when process dies, we clean up immediately
-  const exitUnsubscribe = registerProcessExitListener(session, conversationId)
-
-  // Store session with current credentials generation
-  // Generation is used to detect stale credentials on session reuse
+  // Keep the credential snapshot's version, even if config changed during creation.
   v2Sessions.set(conversationId, {
     session,
     spaceId,
     conversationId,
     createdAt: Date.now(),
     lastUsedAt: Date.now(),
-    credentialsGeneration: getCredentialsGeneration(),
+    sourceId,
+    credentialsGeneration: creationCredentialsGeneration,
     credentialsFingerprint: currentFingerprint,
     knowledgeFingerprint: currentKnowledgeFingerprint,
     inputsFingerprint: currentInputsFingerprint,
-    exitUnsubscribe
   })
+  const exitUnsubscribe = registerProcessExitListener(session, conversationId)
+  const registered = v2Sessions.get(conversationId)
+  if (registered?.session !== session) {
+    exitUnsubscribe?.()
+    throw new Error('The engine session ended during initialization')
+  }
+  registered.exitUnsubscribe = exitUnsubscribe
+  if (!isSessionTransportReady(session)) {
+    cleanupSession(conversationId, 'process ended during initialization')
+    throw new Error('The engine session ended during initialization')
+  }
 
   // Start cleanup if not already running
   startSessionCleanup()
@@ -1066,21 +1426,21 @@ export async function ensureSessionWarm(
   conversationId: string
 ): Promise<void> {
 
-  const config = getConfig()
   const workDir = getWorkingDir(spaceId)
-  const digitalHumansEnabled = config.agent?.enableDigitalHumans !== false
   const conversation = getConversation(spaceId, conversationId)
   const sessionId = conversation?.sessionId
   const electronPath = getHeadlessElectronPath()
 
-  // Get API credentials (per-conversation pin, falling back to global) and resolve for SDK use.
+  // The conversation's pinned account, or the global selection when it has no pin.
   // Must match sendMessage's resolution exactly so the warmed session isn't
   // immediately rebuilt on the first message (fingerprint mismatch).
-  const credentials = await getApiCredentialsForConversation(config, conversation)
+  const credentials = await getApiCredentialsForConversation(conversation)
   console.log(`[Agent] Session warm using: ${credentials.provider}, model: ${credentials.model}`)
 
-  // Resolve credentials for SDK (handles OpenAI compat router for non-Anthropic providers)
-  const resolvedCredentials = await resolveCredentialsForSdk(credentials)
+  // Resolve credentials for SDK (handles OpenAI compat router for non-Anthropic providers).
+  // The conversation's own level, as the first send will resolve it.
+  const pickedEffort = pickReasoningEffort(conversation?.reasoningEffort)
+  const resolvedCredentials = await resolveCredentialsForSdk(credentials, pickedEffort)
 
   // Creation-time MCP servers: assembled lazily at actual session creation
   // (must match sendMessage exactly to avoid a session rebuild on the first message).
@@ -1098,9 +1458,10 @@ export async function ensureSessionWarm(
   // content is read only if a session is actually created.
   const resolvedKbIds = resolveConversationKnowledgeBaseIds(conversation)
   const resolveKnowledgeBases = (): KBReference[] => resolveConversationKnowledgeBases(conversation)
+  const spaceMemory = resolveSpaceMemorySession(spaceId, conversationId)
 
   // Build SDK options using shared configuration
-  const sdkOptions = await buildBaseSdkOptions({
+  const sdkOptions = await buildUserSessionSdkOptions({
     // Must match send-message.ts: a warmed session is reused for the first
     // turn, so deriving this differently there would hand that turn a process
     // whose credentials disagree with its tools.
@@ -1113,17 +1474,13 @@ export async function ensureSessionWarm(
     stderrHandler: (data: string) => {
       console.error(`[Agent][${conversationId}] CLI stderr (warm):`, data)
     },
-    maxTurns: config.agent?.maxTurns,
-    promptProfile: config.agent?.promptProfile,
-    configDirMode: config.agent?.configDirMode,
-    customConfigDir: config.agent?.customConfigDir,
-    enableTeams: config.agent?.enableTeams,
-    disabledTools: config.agent?.disabledTools,
-    digitalHumansEnabled,
     toolsetIndex: buildToolsetSection(spaceId, conversationId),
+    // Must match send-message.ts, whose first turn reuses this session.
+    memoryInstructions: spaceMemory?.instructions,
+    memoryGuard: spaceMemory?.guard,
   })
 
-  applySessionReasoningEffort(sdkOptions, resolvedCredentials.capabilities)
+  applySessionReasoningEffort(sdkOptions, resolvedCredentials.capabilities, pickedEffort)
 
   try {
     const session = await getOrCreateV2Session(
@@ -1135,7 +1492,8 @@ export async function ensureSessionWarm(
       },
       resolvedKbIds,
       buildMcpServers,
-      resolveKnowledgeBases
+      resolveKnowledgeBases,
+      { creationContext: spaceMemory?.contextKey }
     )
 
     // Ensure consumer's displayModel is up-to-date (same as sendMessage)
@@ -1175,6 +1533,7 @@ export async function ensureSessionWarm(
  * Close V2 session for a conversation
  */
 export function closeV2Session(conversationId: string): void {
+  mcpRebuildRequested.delete(conversationId)
   cleanupSession(conversationId, 'explicit close')
 }
 
@@ -1224,6 +1583,10 @@ export function updateConsumerDisplayModel(
  * @returns true if the session had a pending rebuild (flag is consumed)
  */
 export function consumePendingRebuild(conversationId: string): boolean {
+  if (sessionLeases.has(conversationId) || turnsAwaitingInit.has(conversationId) ||
+    inFlightSessionCreations.has(conversationId)) return false
+  const consumer = consumers.get(conversationId)
+  if (consumer?.isRunning && (consumer.hasRunningTasks() || hasActiveTeamTasks(consumer.getTeamLifecycleThoughts()))) return false
   if (pendingConsumerRebuilds.has(conversationId)) {
     pendingConsumerRebuilds.delete(conversationId)
     return true
@@ -1259,9 +1622,12 @@ export function getRunningConsumerIds(): string[] {
  * New sessions will be created with updated config on next message.
  */
 export function invalidateAllSessions(): void {
+  for (const conversationId of inFlightSessionCreations.keys()) {
+    requestSessionRebuild(conversationId, 'API config change')
+  }
   const count = v2Sessions.size
   if (count === 0) {
-    console.log('[Agent] No active sessions to invalidate')
+    console.log('[Agent] No resident sessions to invalidate; in-flight creations marked for rebuild')
     return
   }
 
@@ -1272,6 +1638,11 @@ export function invalidateAllSessions(): void {
     if (activeSessions.has(convId)) {
       pendingInvalidations.add(convId)
       console.log(`[Agent] Deferring session close until legacy turn idle: ${convId}`)
+      continue
+    }
+
+    if (sessionLeases.has(convId) || turnsAwaitingInit.has(convId)) {
+      pendingConsumerRebuilds.add(convId)
       continue
     }
 
@@ -1292,16 +1663,18 @@ export function invalidateAllSessions(): void {
 }
 
 /**
- * Invalidate sessions belonging to a specific space.
- * Called when an MCP is installed/uninstalled/paused/resumed in a space.
+ * Invalidate sessions belonging to a specific space: an MCP installed,
+ * uninstalled, paused or resumed in it, or its working directory changed.
  *
  * Global MCP changes (spaceId=null) affect all spaces → use invalidateAllSessions() instead.
  * Space-scoped MCP changes only affect that space's sessions.
  *
  * Active (in-flight) sessions are deferred via pendingInvalidations,
  * consistent with invalidateAllSessions() behavior.
+ *
+ * @param reason - What changed, for the log
  */
-export function invalidateSessionsForSpace(spaceId: string): void {
+export function invalidateSessionsForSpace(spaceId: string, reason = 'MCP change'): void {
   let count = 0
   for (const [convId, info] of Array.from(v2Sessions.entries())) {
     if (info.spaceId !== spaceId) continue
@@ -1309,7 +1682,13 @@ export function invalidateSessionsForSpace(spaceId: string): void {
     // Legacy path (app-chat/execute): defer closing until unregisterActiveSession
     if (activeSessions.has(convId)) {
       pendingInvalidations.add(convId)
-      console.log(`[Agent][${convId}] MCP changed, deferring session close until legacy turn idle`)
+      console.log(`[Agent][${convId}] ${reason}: deferring session close until legacy turn idle`)
+      count++
+      continue
+    }
+
+    if (sessionLeases.has(convId) || turnsAwaitingInit.has(convId)) {
+      pendingConsumerRebuilds.add(convId)
       count++
       continue
     }
@@ -1318,18 +1697,40 @@ export function invalidateSessionsForSpace(spaceId: string): void {
     const consumer = consumers.get(convId)
     if (consumer && consumer.isRunning) {
       pendingConsumerRebuilds.add(convId)
-      console.log(`[Agent][${convId}] MCP changed, marking consumer session for rebuild`)
+      console.log(`[Agent][${convId}] ${reason}: marking consumer session for rebuild`)
       count++
       continue
     }
 
-    cleanupSession(convId, 'MCP config change')
+    cleanupSession(convId, reason)
     count++
   }
 
   if (count > 0) {
-    console.log(`[Agent] Invalidated ${count} session(s) in space ${spaceId} due to MCP change`)
+    console.log(`[Agent] Invalidated ${count} session(s) in space ${spaceId} due to ${reason}`)
   }
+}
+
+/**
+ * Whether anything in the space is running or about to: a turn being created,
+ * prepared, dispatched or answered, or background work whose results come back
+ * as later turns. Synchronous, so a caller can act on a "no" before anything
+ * else starts.
+ */
+export function isSpaceBusy(spaceId: string): boolean {
+  for (const state of activeSessions.values()) {
+    if (state.spaceId === spaceId) return true
+  }
+  for (const creation of inFlightSessionCreations.values()) {
+    if (creation.spaceId === spaceId) return true
+  }
+  for (const [conversationId, info] of v2Sessions) {
+    if (info.spaceId !== spaceId) continue
+    if (isSessionBusy(conversationId) || turnsAwaitingInit.has(conversationId)) return true
+    const consumer = consumers.get(conversationId)
+    if (consumer?.isRunning && consumer.hasRunningTasks()) return true
+  }
+  return false
 }
 
 /**
@@ -1348,6 +1749,12 @@ export function invalidateImSessions(): void {
     if (activeSessions.has(convId)) {
       pendingInvalidations.add(convId)
       console.log(`[Agent][${convId}] IM config changed, deferring session close until idle`)
+      count++
+      continue
+    }
+
+    if (sessionLeases.has(convId) || turnsAwaitingInit.has(convId)) {
+      pendingConsumerRebuilds.add(convId)
       count++
       continue
     }
@@ -1416,13 +1823,201 @@ export function getActiveSession(conversationId: string): SessionState | undefin
 }
 
 // ============================================
+// MCP Connection Retries
+// ============================================
+
+interface McpRebuildSpent {
+  stage: 'retried' | 'recovered'
+  /** The session built for this stage reported the server failed again (logged once). */
+  capped: boolean
+  /** Set when a tool call found the server gone: the engine had reported it connected. */
+  callFailedAt?: number
+}
+
+/**
+ * Rebuilds already spent on a failing MCP server, per conversation: 'retried'
+ * once its session reported the server failed, 'recovered' once the server was
+ * seen connecting again after that. Kept across the rebuild it asked for and
+ * dropped by any other teardown of the conversation's session, when the
+ * session connects the server (for a failure a tool call found, only once
+ * MCP_CALL_FAILURE_WINDOW_MS has passed), and on any MCP configuration change.
+ * The cap matters for a server that passes Halo's probe but never connects in
+ * the engine (a proxy or PATH only the engine sees): it would otherwise rebuild
+ * the session at every recovery report.
+ */
+const mcpRebuildsSpent = new Map<string, Map<string, McpRebuildSpent>>()
+
+/**
+ * The result of a tool call whose MCP server dropped mid-session and was not
+ * reconnected. Claude Code CLI 2.1.89 then fails every later call to that server
+ * while its status reports still say connected; the halo engine returns the
+ * same text, with a final period, while it reconnects in the background.
+ */
+const MCP_NOT_CONNECTED_RESULT = /^MCP server "(.+)" is not connected\.?$/
+
+/**
+ * A call that finds the server gone this soon after an earlier call failure
+ * counts as the same failure, so a server that connects but cannot serve calls
+ * rebuilds a conversation's session at most once in this time.
+ */
+const MCP_CALL_FAILURE_WINDOW_MS = 5 * 60_000
+
+/** Conversations whose next session teardown is a rebuild asked for by an MCP failure. */
+const mcpRebuildRequested = new Set<string>()
+
+function requestMcpRebuild(conversationId: string, reason: string): void {
+  mcpRebuildRequested.add(conversationId)
+  requestSessionRebuild(conversationId, reason)
+}
+
+/**
+ * Engines connect MCP servers when a session starts and do not retry one that
+ * failed; the session goes on without its tools. A server that drops
+ * mid-session can stay unusable the same way. Called with every SDK message a
+ * chat consumer reads, it acts only on the per-turn status report
+ * (`mcp_servers`) and on tool results saying a server is not connected: it
+ * records the failed servers and rebuilds the session the way an MCP toggle
+ * does — deferred past a running turn — so the next message starts with a
+ * fresh connection attempt.
+ */
+export function noteSessionMcpStatus(conversationId: string, session: V2SDKSession, sdkMessage: unknown): void {
+  const msg = sdkMessage as { type?: unknown; mcp_servers?: unknown; message?: { content?: unknown } } | null
+  if (msg?.type === 'user') {
+    const gone = serversFoundGoneByCalls(msg.message?.content)
+    if (gone && v2Sessions.get(conversationId)?.session === session) {
+      spendMcpRebuilds(conversationId, gone, true)
+    }
+    return
+  }
+  if (msg?.type !== 'system' || !Array.isArray(msg.mcp_servers)) return
+  const info = v2Sessions.get(conversationId)
+  if (info?.session !== session) return
+
+  const now = Date.now()
+  const spent = mcpRebuildsSpent.get(conversationId)
+  const failed: string[] = []
+  for (const server of msg.mcp_servers as Array<{ name?: unknown; status?: unknown }>) {
+    if (typeof server?.name !== 'string') continue
+    if (server.status === 'failed') failed.push(server.name)
+    else if (server.status === 'connected') {
+      const entry = spent?.get(server.name)
+      if (entry && !isRecentCallFailure(entry, now)) spent?.delete(server.name)
+    }
+  }
+  if (spent?.size === 0) mcpRebuildsSpent.delete(conversationId)
+  info.failedMcpServers = failed.length > 0 ? failed : undefined
+  spendMcpRebuilds(conversationId, failed, false, now)
+}
+
+function isRecentCallFailure(entry: McpRebuildSpent, now: number): boolean {
+  return entry.callFailedAt !== undefined && now - entry.callFailedAt < MCP_CALL_FAILURE_WINDOW_MS
+}
+
+/** Servers that a tool result frame says are not connected. */
+function serversFoundGoneByCalls(content: unknown): string[] | undefined {
+  if (!Array.isArray(content)) return undefined
+  let names: string[] | undefined
+  for (const block of content as Array<{ type?: unknown; is_error?: unknown; content?: unknown }>) {
+    if (block?.type !== 'tool_result' || block.is_error !== true) continue
+    const parts = block.content
+    const text = typeof parts === 'string'
+      ? parts
+      : Array.isArray(parts) && parts.length === 1 ? (parts[0] as { text?: unknown } | null)?.text : undefined
+    const name = typeof text === 'string' ? MCP_NOT_CONNECTED_RESULT.exec(text)?.[1] : undefined
+    if (name && !names?.includes(name)) (names ??= []).push(name)
+  }
+  return names
+}
+
+/**
+ * Spends the rebuild budget on servers the current session found failed —
+ * at its start, or in a tool call — and asks for one rebuild if any had budget left.
+ */
+function spendMcpRebuilds(conversationId: string, failed: string[], byCall: boolean, now = Date.now()): void {
+  if (failed.length === 0) return
+  const spent = mcpRebuildsSpent.get(conversationId) ?? new Map<string, McpRebuildSpent>()
+  const retry: string[] = []
+  const capped: string[] = []
+  for (const name of failed) {
+    const entry = spent.get(name)
+    if (!entry || (entry.callFailedAt !== undefined && !isRecentCallFailure(entry, now))) {
+      spent.set(name, byCall ? { stage: 'retried', capped: false, callFailedAt: now } : { stage: 'retried', capped: false })
+      retry.push(name)
+      continue
+    }
+    // Failing at the start again makes a later 'connected' report proof that it works.
+    if (!byCall) delete entry.callFailedAt
+    if (!entry.capped && !isRebuildPending(conversationId)) {
+      entry.capped = true
+      const next = entry.callFailedAt !== undefined
+        ? `rebuilds on a call failure after ${MCP_CALL_FAILURE_WINDOW_MS / 60_000} min`
+        : entry.stage === 'retried' ? 'rebuilds once more when seen connecting' : 'no further automatic rebuilds'
+      capped.push(`${name} (${next})`)
+    }
+  }
+  mcpRebuildsSpent.set(conversationId, spent)
+
+  if (capped.length > 0) {
+    console.log(`[Agent][${conversationId}] MCP server(s) still failing after a rebuild: ${capped.join(', ')}`)
+  }
+  if (retry.length === 0) return
+
+  const failure = byCall ? 'not connected in a tool call' : 'failed to connect'
+  console.log(`[Agent][${conversationId}] MCP server(s) ${failure}: ${retry.join(', ')} — rebuilding the session for the next message`)
+  requestMcpRebuild(conversationId, `MCP server ${failure}: ${retry.join(', ')}`)
+}
+
+/** A rebuild is already flagged for this session, or its consumer stopped for one. */
+function isRebuildPending(conversationId: string): boolean {
+  return pendingConsumerRebuilds.has(conversationId) ||
+    pendingInvalidations.has(conversationId) ||
+    consumers.get(conversationId)?.isRunning === false
+}
+
+// A server that some sessions could not use connects again (probe, connection
+// test, another session): rebuild each of them once more.
+onMcpServerRecovered((name) => {
+  for (const [conversationId, info] of Array.from(v2Sessions)) {
+    if (!info.failedMcpServers?.includes(name) || isRebuildPending(conversationId)) continue
+    const spent = mcpRebuildsSpent.get(conversationId) ?? new Map<string, McpRebuildSpent>()
+    if (spent.get(name)?.stage === 'recovered') continue
+    spent.set(name, { stage: 'recovered', capped: false })
+    mcpRebuildsSpent.set(conversationId, spent)
+    console.log(`[Agent][${conversationId}] MCP server ${name} is reachable again — rebuilding the session that could not use it`)
+    requestMcpRebuild(conversationId, `MCP server reachable again: ${name}`)
+  }
+})
+
+// ============================================
 // Config Change Handler Registration
 // ============================================
 
 // Register for API config change notifications
 // This is called once when the module loads
-onApiConfigChange(() => {
-  invalidateAllSessions()
+onApiConfigChange((change?: ApiConfigChange) => {
+  if (!change) {
+    invalidateAllSessions()
+    return
+  }
+
+  const sourceIds = new Set(change.sourceIds ?? [])
+  let affected = 0
+  for (const [conversationId, creation] of inFlightSessionCreations) {
+    if (creation.sourceId ? sourceIds.has(creation.sourceId) : change.selectionChanged) {
+      requestSessionRebuild(conversationId, 'AI source config change during creation')
+      affected++
+    }
+  }
+  for (const [conversationId, info] of v2Sessions) {
+    if (inFlightSessionCreations.has(conversationId)) continue
+    if (info.sourceId ? sourceIds.has(info.sourceId) : change.selectionChanged) {
+      requestSessionRebuild(conversationId, 'AI source config change')
+      affected++
+    }
+  }
+  if (affected > 0) {
+    console.log(`[Agent] Source config change: ${affected} session(s) closed or queued for safe rebuild`)
+  }
 })
 
 /**
@@ -1435,6 +2030,8 @@ onApiConfigChange(() => {
  * direction inverted.
  */
 export function handleMcpAppsChange(spaceId: string | null): void {
+  mcpRebuildsSpent.clear()
+  mcpRebuildRequested.clear()
   if (spaceId === null) {
     invalidateAllSessions()
   } else {

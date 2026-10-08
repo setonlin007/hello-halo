@@ -10,12 +10,30 @@
  * profile without needing a real `app` object, which `ELECTRON_RUN_AS_NODE=1`
  * replaces with the electron binary path string.
  *
- * Contract: argv[2] is a JSON-encoded { testConfigDir, options }; the seeded
- * { conversationId, testConfigDir } is printed to stdout as the last line.
+ * argv[2] carries { testConfigDir, options }; fd3 carries the complete result.
+ * stdout/stderr remain available for service logs, including debounced writes.
  */
 
 import { createConversation, addMessage } from '../../../src/main/services/conversation.service'
+import { writeFileSync } from 'node:fs'
 import type { SeedConversationOptions, SeededConversation } from './seed-conversation'
+
+/** A reply whose height depends on `n`: from one line to several screens. */
+function mixedReply(n: number): string {
+  const head = `Seeded answer #${n}.`
+  switch (n % 5) {
+    case 0:
+      return `${head} Short one.`
+    case 1:
+      return `${head}\n\n` + Array.from({ length: 8 }, (_, k) => `- Point ${k + 1} about item ${n}, with a little detail`).join('\n')
+    case 2:
+      return `${head}\n\n\`\`\`ts\n` + Array.from({ length: 30 }, (_, k) => `const value${k} = compute(${n}, ${k}) // line ${k + 1}`).join('\n') + '\n```'
+    case 3:
+      return `${head}\n\n| Key | Value | Note |\n|---|---|---|\n` + Array.from({ length: 12 }, (_, k) => `| k${k} | ${n * k} | row ${k + 1} |`).join('\n')
+    default:
+      return `${head} ` + 'This paragraph is intentionally long so the reply wraps across many lines at any window width. '.repeat(25)
+  }
+}
 
 function main(): void {
   const raw = process.argv[2]
@@ -25,23 +43,24 @@ function main(): void {
   const conversation = createConversation('halo-temp', options.title ?? 'S3 seeded conversation')
 
   const messageCount = options.messageCount ?? 120
+  const messageIds: string[] = []
   for (let i = 0; i < messageCount; i++) {
     const role = i % 2 === 0 ? 'user' : 'assistant'
     const content = role === 'user'
       ? `Seeded question #${i + 1} — what is the status of item ${i + 1}?`
-      : `Seeded answer #${i + 1}. This is a longer assistant reply that spans a couple of sentences ` +
-        'so each row has a realistic amount of rendered text, matching a typical real conversation ' +
-        'turn rather than a single short line.'
-    addMessage('halo-temp', conversation.id, { role, content })
+      : options.variety === 'mixed'
+        ? mixedReply(i + 1)
+        : `Seeded answer #${i + 1}. This is a longer assistant reply that spans a couple of sentences ` +
+          'so each row has a realistic amount of rendered text, matching a typical real conversation ' +
+          'turn rather than a single short line.'
+    const tokenUsage = role === 'assistant' && options.tokenUsage
+      ? { inputTokens: 0, outputTokens: 100, cacheReadTokens: (600 + i + 1) * 1000, cacheCreationTokens: 0, totalCostUsd: (i + 1) / 100, contextWindow: 1_000_000 }
+      : undefined
+    messageIds.push(addMessage('halo-temp', conversation.id, { role, content, ...(tokenUsage && { tokenUsage }) }).id)
   }
 
-  const result: SeededConversation = { conversationId: conversation.id }
-  // Last stdout line only. conversation.service.ts schedules its index
-  // rebuild on a debounce timer (see "[Conversation] Index rebuilt
-  // asynchronously" in its own logs) — without a hard exit here, those
-  // trailing log lines land after this JSON line and break the
-  // last-line-only contract the caller relies on.
-  process.stdout.write(JSON.stringify(result) + '\n')
+  const result: SeededConversation = { conversationId: conversation.id, messageIds }
+  writeFileSync(3, JSON.stringify(result), 'utf8')
   process.exit(0)
 }
 

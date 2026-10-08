@@ -4,10 +4,11 @@
 
 import { useEffect, useRef, useState, useCallback, Suspense, lazy } from 'react'
 import { useAppStore } from './stores/app.store'
-import { useChatStore } from './stores/chat.store'
+import { useChatStore, initChatMemoryPressureListener } from './stores/chat.store'
 import { useOnboardingStore } from './stores/onboarding.store'
 import { initAIBrowserStoreListeners } from './stores/ai-browser.store'
 import { initTerminalStoreListeners } from './stores/terminal.store'
+import { initGoalStoreListeners } from './stores/goal.store'
 import { initPerfStoreListeners } from './stores/perf.store'
 import { useSpaceStore } from './stores/space.store'
 import { useSearchStore } from './stores/search.store'
@@ -30,8 +31,10 @@ import { OnboardingOverlay } from './components/onboarding'
 import { UpdateNotification } from './components/updater/UpdateNotification'
 import { NotificationToast } from './components/notification/NotificationToast'
 import { CredentialAlertBanner } from './components/settings/CredentialAlertBanner'
+import { ConfigUnreadableBanner } from './components/settings/ConfigUnreadableBanner'
 import { NavRail } from './components/layout/NavRail'
 import { HeaderShell, usePlatform } from './components/layout/Header'
+import { MAC_TRAFFIC_LIGHT_BOTTOM, MAC_TRAFFIC_LIGHT_POSITION } from '../shared/constants/mac-traffic-lights'
 import { TaskPanel } from './components/layout/TaskPanel'
 import { useTaskPanelStore } from './stores/taskPanel.store'
 import { useNotificationStore } from './stores/notification.store'
@@ -41,14 +44,17 @@ import { isCapacitor, isElectron, onEvent } from './api/transport'
 import { useTelemetry } from './hooks/useTelemetry'
 import type { WsConnectionState } from './api/transport'
 import { useTranslation } from './i18n'
-import type { AgentEventBase, Thought, ToolCall, HaloConfig, AgentErrorType, Question, McpServerStatus, AppView } from './types'
+import type { AgentEventBase, Thought, ToolCall, AgentErrorType, WorkDirIssue, Question, McpServerStatus, AppView } from './types'
 import type { SessionInitInfo } from './types/slash-command'
 import type { IngestProgressEvent } from '../shared/types/tlon'
 import type { ToastPayload } from '../shared/types/notification'
-import { hasAnyAISource } from './types'
+import type { ApiRetryState } from '../shared/types/api-retry'
 import { openWorkNotification, type WorkNavigationTarget } from './utils/people-navigation'
+import { openSearchResultConversation } from './utils/conversation-navigation'
 import { useTeamStore } from './stores/team.store'
 import { canvasLifecycle } from './services/canvas-lifecycle'
+import { mountBrowserHost } from './browser-host'
+import { trackNavigate } from './services/home-telemetry'
 import type { TeamUpdatedEvent, TeamBlackboardEvent, TeamMessageEvent, TeamPresenceEvent, TeamOfficeStatusEvent } from '../shared/apps/team-types'
 
 // Lazy load heavy page components for better initial load performance
@@ -125,17 +131,23 @@ function applyTheme(theme: 'light' | 'dark' | 'system') {
   })
 }
 
-// The traffic-light button group's real height isn't documented or
-// queryable — 28px turned out too tight to fit it with any breathing room
-// top and bottom (see main/index.ts trafficLightPosition), so this is a
-// looser, empirically-adjusted value rather than a tightly computed one.
-const MAC_TRAFFIC_LIGHT_CLEARANCE_PX = 30
+// Draggable strip holding the macOS traffic lights on views without the rail,
+// with the same margin below the lights as above them.
+const MAC_WINDOW_CONTROLS_BAND_PX = MAC_TRAFFIC_LIGHT_BOTTOM + MAC_TRAFFIC_LIGHT_POSITION.y
 
 export default function App() {
+  const browserHostRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!window.halo?.browserHostReady || !browserHostRef.current) return
+    const host = mountBrowserHost(browserHostRef.current, window.halo)
+    return () => host.dispose()
+  }, [])
+
   const { t } = useTranslation()
-  const { view, config, initialize, setMcpStatus, navigate, enterApp, setConfig, completeDeferredGitBashCheck } = useAppStore()
+  const { view, config, initialize, setMcpStatus, navigate, completeDeferredGitBashCheck, completeGitBashSetup } = useAppStore()
   const isTaskPanelOpen = useTaskPanelStore(s => s.isOpen)
   const platform = usePlatform()
+  const isMacElectron = isElectron() && platform.isMac
   // Per-field subscriptions, not the whole store: this is the app root, and the
   // chat store commits once per streaming token for every conversation in the
   // app (digital humans and team members included). A whole-store subscription
@@ -148,15 +160,14 @@ export default function App() {
   const handleAgentThought = useChatStore(s => s.handleAgentThought)
   const handleAgentThoughtDelta = useChatStore(s => s.handleAgentThoughtDelta)
   const handleAgentCompact = useChatStore(s => s.handleAgentCompact)
+  const handleAgentApiRetry = useChatStore(s => s.handleAgentApiRetry)
   const handleAgentSessionInfo = useChatStore(s => s.handleAgentSessionInfo)
   const handleAgentTurnStart = useChatStore(s => s.handleAgentTurnStart)
   const handleAskQuestion = useChatStore(s => s.handleAskQuestion)
   const currentSpaceId = useChatStore(s => s.currentSpaceId)
   const setChatCurrentSpace = useChatStore(s => s.setCurrentSpace)
-  const loadConversations = useChatStore(s => s.loadConversations)
-  const selectConversation = useChatStore(s => s.selectConversation)
   const { initialize: initializeOnboarding } = useOnboardingStore()
-  const { isSearchOpen, closeSearch, isHighlightBarVisible, hideHighlightBar, goToPreviousResult, goToNextResult, openSearch } = useSearchStore()
+  const { isSearchOpen, closeSearch } = useSearchStore()
 
   // Telemetry: session lifecycle + page views (fire-and-forget)
   useTelemetry(view)
@@ -419,12 +430,16 @@ export default function App() {
       for (const [conversationId, session] of sessions) {
         if (!session.isGenerating) continue
 
-        // Find spaceId for this conversation (virtual IDs like "app-chat:*" won't match)
-        let spaceId: string | null = null
-        for (const [sid, ss] of chatState.spaceStates) {
-          if (ss.conversations.some(c => c.id === conversationId)) {
-            spaceId = sid
-            break
+        // Find spaceId for this conversation: the space's index for a regular
+        // one, the cached conversation for a digital human. Other session keys
+        // (IM, team) have no conversation to reload and match neither.
+        let spaceId: string | null = chatState.conversationCache.get(conversationId)?.spaceId ?? null
+        if (!spaceId) {
+          for (const [sid, ss] of chatState.spaceStates) {
+            if (ss.conversations.some(c => c.id === conversationId)) {
+              spaceId = sid
+              break
+            }
           }
         }
 
@@ -434,17 +449,20 @@ export default function App() {
             const backendState = res.data as {
               isActive: boolean
               pendingQuestion?: { id: string; questions: Question[] }
+              apiRetry?: ApiRetryState
             }
             if (!backendState.isActive) {
               console.log(`[App] Session ${conversationId} completed while backgrounded — recovering`)
 
               if (spaceId) {
-                // Normal conversation — full reload via handleAgentComplete
+                // Space or digital-human conversation — re-read and settle
+                // through handleAgentComplete
                 chatState.handleAgentComplete({ spaceId, conversationId } as AgentEventBase)
               } else {
-                // Virtual conversationId (app-chat:*, im-session, etc.) — no space conversation
-                // to reload. Clear session state directly to unblock the UI; the owning component
-                // (AppChatView / ImChatView) will reload messages via its own isGenerating effect.
+                // Other session keys (IM, team member) — no cached conversation
+                // to reload. Clear session state directly to unblock the UI; the
+                // owning component (ImChatView) reloads messages via its own
+                // isGenerating effect.
                 chatState.resetSession(conversationId)
               }
             } else if (backendState.pendingQuestion) {
@@ -457,6 +475,10 @@ export default function App() {
                 console.log(`[App] Re-hydrating pending question for ${conversationId} after resume`)
                 chatState.handleAskQuestion({ spaceId: spaceId ?? '', conversationId, id: pq.id, questions: pq.questions })
               }
+            }
+            // Retry notices pushed while suspended were lost; the backend's is current.
+            if (backendState.isActive) {
+              chatState.handleAgentApiRetry({ spaceId: spaceId ?? '', conversationId, retry: backendState.apiRetry ?? null })
             }
           }
         }).catch(err => {
@@ -566,9 +588,13 @@ export default function App() {
     initPerfStoreListeners()
     const cleanupBrowser = initAIBrowserStoreListeners()
     const cleanupTerminal = initTerminalStoreListeners()
+    const cleanupGoal = initGoalStoreListeners()
+    const cleanupChatMemory = initChatMemoryPressureListener()
     return () => {
       cleanupBrowser()
       cleanupTerminal()
+      cleanupGoal()
+      cleanupChatMemory()
     }
   }, [])
 
@@ -600,15 +626,10 @@ export default function App() {
 
     // Message events (with session IDs)
     const unsubMessage = api.onAgentMessage((data) => {
-      const _m = data as AgentEventBase & { content?: string; delta?: string; isComplete?: boolean; isNewTextBlock?: boolean }
-      if (_m.isComplete || _m.isNewTextBlock) {
-        console.log(`[App][+${Date.now() % 100000}ms] agent:message: isComplete=${_m.isComplete} isNewTextBlock=${_m.isNewTextBlock} contentLen=${(_m.content ?? '').length}`)
-      }
       handleAgentMessage(data as AgentEventBase & { content: string; isComplete: boolean })
     })
 
     const unsubToolCall = api.onAgentToolCall((data) => {
-      console.log('[App] Received agent:tool-call event:', data)
       const toolCall = data as AgentEventBase & ToolCall
       // The Team view never opens itself — the collaboration card and team
       // messages offer it, and the user decides (same rule as the AI browser).
@@ -616,29 +637,29 @@ export default function App() {
     })
 
     const unsubToolResult = api.onAgentToolResult((data) => {
-      console.log('[App] Received agent:tool-result event:', data)
       const toolResult = data as AgentEventBase & { toolId: string; result: string; isError: boolean }
       handleAgentToolResult(toolResult)
     })
 
     const unsubError = api.onAgentError((data) => {
-      console.log('[App] Received agent:error event:', data)
-      handleAgentError(data as AgentEventBase & { error: string; errorType?: AgentErrorType })
+      handleAgentError(data as AgentEventBase & { error: string; errorType?: AgentErrorType; workDirIssue?: WorkDirIssue })
     })
 
     const unsubComplete = api.onAgentComplete((data) => {
-      console.log(`[App][+${Date.now() % 100000}ms] Received agent:complete event:`, data)
       handleAgentComplete(data as AgentEventBase)
     })
 
     const unsubCompact = api.onAgentCompact((data) => {
-      console.log('[App] Received agent:compact event:', data)
       handleAgentCompact(data as AgentEventBase & { trigger: 'manual' | 'auto'; preTokens: number })
+    })
+
+    // Engine is waiting to resend a failed model request (or requests flow again)
+    const unsubApiRetry = api.onAgentApiRetry((data) => {
+      handleAgentApiRetry(data)
     })
 
     // AskUserQuestion - AI needs user input to continue
     const unsubAskQuestion = api.onAgentAskQuestion((data) => {
-      console.log('[App] Received agent:ask-question event:', data)
       handleAskQuestion(data as AgentEventBase & { id: string; questions: Question[] })
     })
 
@@ -649,13 +670,11 @@ export default function App() {
 
     // Autonomous turn start — CC produced output without user send (e.g., Agent Team)
     const unsubTurnStart = api.onAgentTurnStart((data) => {
-      console.log('[App] Received agent:turn-start event:', data)
       handleAgentTurnStart(data as AgentEventBase & { autonomous?: boolean })
     })
 
     // MCP status updates (global - not per-conversation)
     const unsubMcpStatus = api.onAgentMcpStatus((data) => {
-      console.log('[App] Received agent:mcp-status event:', data)
       const event = data as { servers: McpServerStatus[]; timestamp: number }
       if (event.servers) {
         setMcpStatus(event.servers, event.timestamp)
@@ -668,7 +687,7 @@ export default function App() {
       useToolsetsStore.getState().applyChangedEvent(data as ToolsetsChangedEvent)
     })
 
-    // AI asked the user to enable a toolset — pop the Tools menu + highlight it.
+    // AI asked the user to enable a toolset — open the composer's "+" panel + highlight it.
     const unsubToolsetReq = api.onToolsetsRequested((data) => {
       useToolsetsStore.getState().applyRequestedEvent(data as ToolsetsRequestedEvent)
     })
@@ -682,6 +701,7 @@ export default function App() {
       unsubError()
       unsubComplete()
       unsubCompact()
+      unsubApiRetry()
       unsubAskQuestion()
       unsubSessionInfo()
       unsubTurnStart()
@@ -698,6 +718,7 @@ export default function App() {
     handleAgentThought,
     handleAgentThoughtDelta,
     handleAgentCompact,
+    handleAgentApiRetry,
     handleAgentSessionInfo,
     handleAgentTurnStart,
     handleAskQuestion,
@@ -737,7 +758,9 @@ export default function App() {
     // announced — which may be a team's, not this digital human's own.
     const unsubNavigate = api.onAppNavigate((data) => {
       const target = data as WorkNavigationTarget
-      if (target.appId) void openWorkNotification(target)
+      if (!target.appId) return
+      trackNavigate('apps', 'notification', 'notification')
+      void openWorkNotification(target)
     })
 
     return () => {
@@ -847,6 +870,7 @@ export default function App() {
           ? {
             label: t('View'),
             onClick: () => {
+              trackNavigate('apps', 'notification', 'notification')
               setInitialAppId(appId)
               navigate('apps')
             },
@@ -866,79 +890,6 @@ export default function App() {
     return () => { unsub() }
   }, [showToast, setInitialAppId, navigate, t])
 
-  // Handle search keyboard shortcuts with debouncing for navigation
-  // Use ref to maintain debounce timer across renders
-  const navigationDebounceTimerRef = useRef<NodeJS.Timeout | null>(null)
-  const pendingNavigationRef = useRef<(() => void) | null>(null)
-
-  const debouncedNavigate = (callback: () => void) => {
-    // Clear previous timeout
-    if (navigationDebounceTimerRef.current) {
-      clearTimeout(navigationDebounceTimerRef.current)
-    }
-
-    // Store the pending navigation
-    pendingNavigationRef.current = callback
-
-    // Set new timeout - debounce for 300ms
-    navigationDebounceTimerRef.current = setTimeout(() => {
-      console.log('[App] Executing debounced keyboard navigation')
-      pendingNavigationRef.current?.()
-      pendingNavigationRef.current = null
-      navigationDebounceTimerRef.current = null
-    }, 300)
-  }
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Only handle when highlight bar is visible
-      if (!isHighlightBarVisible) return
-
-      const isMac = typeof navigator !== 'undefined' &&
-        navigator.platform.toUpperCase().indexOf('MAC') >= 0
-
-      // Esc - Close highlight bar (no debounce needed)
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        hideHighlightBar()
-        return
-      }
-
-      // Arrow up - Navigate to earlier result (with debounce)
-      // Note: In time-sorted results (newest first), earlier = higher index
-      if (e.key === 'ArrowUp') {
-        e.preventDefault()
-        debouncedNavigate(() => {
-          console.log('[App] Keyboard: navigating to earlier result')
-          goToNextResult() // goToNextResult increases index = earlier in time
-        })
-        return
-      }
-
-      // Arrow down - Navigate to more recent result (with debounce)
-      // Note: In time-sorted results (newest first), more recent = lower index
-      if (e.key === 'ArrowDown') {
-        e.preventDefault()
-        debouncedNavigate(() => {
-          console.log('[App] Keyboard: navigating to more recent result')
-          goToPreviousResult() // goToPreviousResult decreases index = more recent in time
-        })
-        return
-      }
-
-      // Ctrl+K / Cmd+K - Open search to edit (no debounce needed)
-      const metaKey = isMac ? e.metaKey : e.ctrlKey
-      if (metaKey && e.key === 'k' && !e.shiftKey) {
-        e.preventDefault()
-        openSearch()
-        return
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isHighlightBarVisible, hideHighlightBar, goToPreviousResult, goToNextResult, openSearch])
-
   // Handle search result navigation from highlight bar
   // This handles the complete navigation flow when user clicks [↑][↓] or uses arrow keys
   useEffect(() => {
@@ -949,14 +900,16 @@ export default function App() {
         conversationId: string
         query: string
         resultIndex: number
+        kind?: 'chat' | 'digital-human'
+        appId?: string
       }>
 
-      const { messageId, spaceId, conversationId, query } = customEvent.detail
+      const { messageId, spaceId, conversationId, query, kind, appId } = customEvent.detail
 
       console.log(`[App] search:navigate-to-result event - space=${spaceId}, conv=${conversationId}, msg=${messageId}`)
 
       try {
-        // Step 1: If switching spaces, update both stores
+        // Switching spaces: update both stores
         if (spaceId !== currentSpaceId) {
           console.log(`[App] Switching to space: ${spaceId}`)
 
@@ -985,17 +938,15 @@ export default function App() {
           await new Promise(resolve => setTimeout(resolve, 50))
         }
 
-        // Step 2: Load conversations if needed
-        console.log(`[App] Loading conversations for space: ${spaceId}`)
-        await loadConversations(spaceId)
+        // Open the conversation (space conversation or digital human)
+        // with the result's message loaded
+        console.log(`[App] Opening conversation: ${conversationId}`)
+        await openSearchResultConversation({ spaceId, conversationId, messageId, kind, appId })
 
-        // Step 3: Select conversation
-        console.log(`[App] Selecting conversation: ${conversationId}`)
-        await selectConversation(conversationId)
-
-        // Step 4: Dispatch navigation event for ChatView to handle
-        // ChatView uses Virtuoso scrollToIndex to bring the message into viewport,
-        // then applies DOM highlighting — no need to pre-check DOM existence here.
+        // Dispatch navigation event for ChatView to handle
+        // ChatView asks MessageList to bring the message into view (mounting older
+        // history if needed), then applies DOM highlighting — no need to pre-check
+        // DOM existence here.
         // Small delay to let conversation data load and MessageList mount.
         setTimeout(() => {
           console.log(`[App] Dispatching navigate-to-message for: ${messageId}`)
@@ -1014,42 +965,7 @@ export default function App() {
 
     window.addEventListener('search:navigate-to-result', handleNavigateToResult)
     return () => window.removeEventListener('search:navigate-to-result', handleNavigateToResult)
-  }, [currentSpaceId, spaces, haloSpace, setSpaceStoreCurrentSpace, refreshCurrentSpace, setChatCurrentSpace, loadConversations, selectConversation])
-
-  // Handle Git Bash setup completion
-  const handleGitBashSetupComplete = async (installed: boolean) => {
-    console.log('[App] Git Bash setup completed, installed:', installed)
-
-    // Save skip preference if not installed
-    if (!installed) {
-      await api.setConfig({ gitBash: { skipped: true, installed: false, path: null } })
-    }
-
-    // Continue with normal initialization - sync config to store
-    const response = await api.getConfig()
-    if (response.success && response.data) {
-      const loadedConfig = response.data as HaloConfig
-      setConfig(loadedConfig)  // Sync config to store (was missing, causing empty apiKey in settings)
-      // Show setup if first launch or no AI source configured
-      // (modelConfigSkipped honors an explicit deferral from the first-run wizard)
-      if (loadedConfig.isFirstLaunch || (!hasAnyAISource(loadedConfig.aiSources) && !loadedConfig.modelConfigSkipped)) {
-        navigate('setup')
-      } else {
-        await enterApp()
-      }
-    } else {
-      navigate('setup')
-    }
-  }
-
-  // macOS traffic lights (trafficLightPosition in main/index.ts) sit above
-  // whatever renders at the window's top-left corner. Rather than widening
-  // NavRail itself to clear them (which shifts where the Header begins and
-  // stops the rail from matching the prototype's plain 56px width), a single
-  // full-width strip pinned above the whole NavRail+Header row reserves just
-  // enough height for the lights, in normal flow — NavRail and Header both
-  // start immediately below it, so nothing needs its own per-column clearance.
-  const isMacElectron = isElectron() && platform.isMac
+  }, [currentSpaceId, spaces, haloSpace, setSpaceStoreCurrentSpace, refreshCurrentSpace, setChatCurrentSpace])
 
   // Show reconnection banner for remote/Capacitor modes
   const showReconnectBanner = (api.isRemoteMode() || api.isCapacitorMode())
@@ -1065,7 +981,7 @@ export default function App() {
       case 'splash':
         return <SplashPage />
       case 'gitBashSetup':
-        return <GitBashSetupPage onComplete={handleGitBashSetupComplete} />
+        return <GitBashSetupPage onComplete={completeGitBashSetup} />
       case 'setup':
         return <SetupPage />
       case 'serverConnect':
@@ -1124,21 +1040,8 @@ export default function App() {
   }
 
   return (
-    <div className="h-full w-full overflow-hidden bg-background flex flex-col shadow-[inset_0_0_0_1px_var(--border)]">
-      {/* Own visible edge, independent of the OS compositor's window shadow —
-          some remote-desktop/VDI protocols suppress that shadow entirely,
-          leaving the window looking borderless. */}
-      {/* macOS traffic-light clearance — a single full-width strip above the
-          whole NavRail+Header row, instead of widening NavRail itself (which
-          would shift where Header begins and stop the rail matching the
-          prototype's plain 56px width). NavRail's own top spacer no longer
-          needs any platform-specific sizing because of this. */}
-      {isMacElectron && (
-        <div
-          className="w-full flex-shrink-0 border-b border-border drag-region"
-          style={{ height: `calc(${MAC_TRAFFIC_LIGHT_CLEARANCE_PX}px / var(--display-scale, 1))` }}
-        />
-      )}
+    <div className="h-full w-full overflow-hidden bg-background flex flex-col">
+      <div ref={browserHostRef} className="contents" />
       {/* WebSocket reconnection banner */}
       {showReconnectBanner && (
         <div className="fixed top-0 inset-x-0 z-50 flex items-center justify-center gap-2 py-1.5 bg-halo-warning/90 text-sm font-medium animate-slide-down safe-area-top"
@@ -1165,8 +1068,18 @@ export default function App() {
             </div>
           </>
         ) : (
-          <div className="flex-1 min-w-0 h-full overflow-hidden">
-            {renderView()}
+          <div className="flex-1 min-w-0 h-full overflow-hidden flex flex-col">
+            {/* No NavRail/Header here to hold the macOS traffic lights or to
+                drag the window by, so this band does both. */}
+            {isMacElectron && (
+              <div
+                className="flex-shrink-0 drag-region"
+                style={{ height: `calc(${MAC_WINDOW_CONTROLS_BAND_PX}px / var(--display-scale, 1))` }}
+              />
+            )}
+            <div className="flex-1 min-h-0 overflow-hidden">
+              {renderView()}
+            </div>
           </div>
         )}
       </div>
@@ -1183,6 +1096,9 @@ export default function App() {
       {/* At-rest credential decode failure alert (enterprise builds only).
           Offset below the reconnection bar when it is showing so they stack. */}
       <CredentialAlertBanner topOffset={showReconnectBanner ? 32 : 0} />
+      {/* Config file present but unreadable: saving is paused. Rendered last so
+          it stays on top in the rare case both alerts are up. */}
+      <ConfigUnreadableBanner topOffset={showReconnectBanner ? 32 : 0} />
     </div>
   )
 }

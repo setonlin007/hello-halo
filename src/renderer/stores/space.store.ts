@@ -2,27 +2,20 @@
  * Space Store - Workspace state management
  */
 
+import { useCallback } from 'react'
 import { create } from 'zustand'
 import { api } from '../api'
 import { useChatStore } from './chat.store'
-import type { Space, CreateSpaceInput, SpacePreferences, SpaceSummary, ArtifactRailTab } from '../types'
+import type { Space, CreateSpaceInput, SpacePreferences, ArtifactRailTab } from '../types'
 
 /** A summary is a filesystem scan per workspace; the selector dropdown asks
  * for one every time it opens, so repeat opens reuse the last result. */
-const SUMMARY_TTL_MS = 30_000
-let lastSummariesLoad = 0
 
 interface SpaceState {
   // Spaces data
   haloSpace: Space | null
   spaces: Space[]
   currentSpace: Space | null
-
-  // Asset counts per workspace, keyed by spaceId. Loaded on demand by the
-  // surfaces that show them (management cards, selector dropdown) — building
-  // them costs a filesystem scan per workspace.
-  summaries: Record<string, SpaceSummary>
-  summariesLoading: boolean
 
   /** One-shot: a workspace card's asset chip asked to land on a specific
    * rail tab. SpacePage consumes and clears this after switching space. */
@@ -51,16 +44,17 @@ interface SpaceState {
   selectDefaultSpace: () => Promise<Space | null>
   createSpace: (input: CreateSpaceInput) => Promise<Space | null>
   updateSpace: (spaceId: string, updates: { name?: string; icon?: string; color?: string }) => Promise<Space | null>
+  /** Point the space at another folder; resolves to the reason it could not, or null. */
+  setSpaceWorkingDir: (spaceId: string, workingDir: string) => Promise<string | null>
   deleteSpace: (spaceId: string) => Promise<boolean>
   /** Remove an unreachable space's registry entry — does not touch disk. */
   forgetSpace: (spaceId: string) => Promise<boolean>
   openSpaceFolder: (spaceId: string) => Promise<void>
   refreshCurrentSpace: () => Promise<void>
-  /** Reuses the last result within SUMMARY_TTL_MS unless `force`. */
-  loadSpaceSummaries: (force?: boolean) => Promise<void>
 
   // Preferences actions
-  updateSpacePreferences: (spaceId: string, preferences: Partial<SpacePreferences>) => Promise<void>
+  /** Resolves to whether the preferences were saved. */
+  updateSpacePreferences: (spaceId: string, preferences: Partial<SpacePreferences>) => Promise<boolean>
   getSpacePreferences: (spaceId: string) => SpacePreferences | undefined
 
   // Reorder actions
@@ -72,8 +66,6 @@ export const useSpaceStore = create<SpaceState>((set, get) => ({
   haloSpace: null,
   spaces: [],
   currentSpace: null,
-  summaries: {},
-  summariesLoading: false,
   pendingArtifactRailTab: null,
   setPendingArtifactRailTab: (tab) => set({ pendingArtifactRailTab: tab }),
   isLoading: false,
@@ -195,6 +187,22 @@ export const useSpaceStore = create<SpaceState>((set, get) => ({
     }
   },
 
+  setSpaceWorkingDir: async (spaceId, workingDir) => {
+    try {
+      const response = await api.setSpaceWorkingDir(spaceId, workingDir)
+      if (!response.success || !response.data) return response.error || 'Failed to update space'
+      const updatedSpace = response.data as Space
+      set((state) => ({
+        spaces: state.spaces.map((s) => s.id === spaceId ? updatedSpace : s),
+        currentSpace: state.currentSpace?.id === spaceId ? updatedSpace : state.currentSpace,
+      }))
+      return null
+    } catch (error) {
+      console.error('Failed to change the working directory:', error)
+      return (error as Error).message || 'Failed to update space'
+    }
+  },
+
   // Delete space
   deleteSpace: async (spaceId) => {
     try {
@@ -292,29 +300,33 @@ export const useSpaceStore = create<SpaceState>((set, get) => ({
   updateSpacePreferences: async (spaceId, preferences) => {
     try {
       const response = await api.updateSpacePreferences(spaceId, preferences)
-
-      if (response.success && response.data) {
-        const updatedSpace = response.data as Space
-
-        // Update in current space if it matches
-        const currentSpace = get().currentSpace
-        if (currentSpace?.id === spaceId) {
-          set({ currentSpace: updatedSpace })
-        }
-
-        // Update in spaces list or halo space
-        if (updatedSpace.isTemp) {
-          set({ haloSpace: updatedSpace })
-        } else {
-          set((state) => ({
-            spaces: state.spaces.map((s) =>
-              s.id === spaceId ? updatedSpace : s
-            )
-          }))
-        }
+      if (!response.success || !response.data) {
+        console.error('Failed to update space preferences:', response.error)
+        return false
       }
+
+      const updatedSpace = response.data as Space
+
+      // Update in current space if it matches
+      const currentSpace = get().currentSpace
+      if (currentSpace?.id === spaceId) {
+        set({ currentSpace: updatedSpace })
+      }
+
+      // Update in spaces list or halo space
+      if (updatedSpace.isTemp) {
+        set({ haloSpace: updatedSpace })
+      } else {
+        set((state) => ({
+          spaces: state.spaces.map((s) =>
+            s.id === spaceId ? updatedSpace : s
+          )
+        }))
+      }
+      return true
     } catch (error) {
       console.error('Failed to update space preferences:', error)
+      return false
     }
   },
 
@@ -367,25 +379,15 @@ export const useSpaceStore = create<SpaceState>((set, get) => ({
       set({ spaces: prevSpaces, error: 'Failed to reorder spaces' })
     }
   },
-
-  loadSpaceSummaries: async (force = false) => {
-    const now = Date.now()
-    if (!force && now - lastSummariesLoad < SUMMARY_TTL_MS) return
-    lastSummariesLoad = now
-    try {
-      set({ summariesLoading: true })
-      const response = await api.listSpaceSummaries()
-      if (response.success && Array.isArray(response.data)) {
-        const summaries: Record<string, SpaceSummary> = {}
-        for (const summary of response.data as SpaceSummary[]) {
-          summaries[summary.spaceId] = summary
-        }
-        set({ summaries })
-      }
-    } catch (error) {
-      console.error('[SpaceStore] loadSpaceSummaries error:', error)
-    } finally {
-      set({ summariesLoading: false })
-    }
-  }
 }))
+
+/** Display name for a space id; falls back to the id while spaces are still loading. */
+export function useSpaceNameResolver(): (spaceId: string) => string {
+  const haloSpace = useSpaceStore(state => state.haloSpace)
+  const spaces = useSpaceStore(state => state.spaces)
+  return useCallback((spaceId: string) => {
+    const space = haloSpace?.id === spaceId ? haloSpace : spaces.find(s => s.id === spaceId)
+    if (!space) return spaceId
+    return space.isTemp ? 'Halo' : space.name
+  }, [haloSpace, spaces])
+}

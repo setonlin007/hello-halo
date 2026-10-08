@@ -11,44 +11,12 @@ import {
 import type {
   ApiResponse,
 } from './_shared'
+import type { Goal, GoalInput } from '../../shared/types/goal'
+import type { AgentInjectRequest, AgentSendRequest } from '../../shared/types/agent-send'
 
 export const agentApi = {
   // ===== Agent =====
-  sendMessage: async (request: {
-    spaceId: string
-    conversationId: string
-    message: string
-    resumeSessionId?: string
-    images?: Array<{
-      id: string
-      type: 'image'
-      mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
-      data: string
-      name?: string
-      size?: number
-    }>
-    thinkingEnabled?: boolean  // Enable extended thinking mode
-    knowledgeBaseId?: string  // Chat-with-knowledge-base turn
-    canvasContext?: {  // Canvas context for AI awareness
-      isOpen: boolean
-      tabCount: number
-      activeTab: {
-        type: string
-        title: string
-        url?: string
-        path?: string
-        terminalSessionId?: string
-      } | null
-      tabs: Array<{
-        type: string
-        title: string
-        url?: string
-        path?: string
-        terminalSessionId?: string
-        isActive: boolean
-      }>
-    }
-  }): Promise<ApiResponse> => {
+  sendMessage: async (request: AgentSendRequest): Promise<ApiResponse> => {
     // Subscribe to conversation events before sending
     if (!isElectron()) {
       subscribeToConversation(request.conversationId)
@@ -57,7 +25,7 @@ export const agentApi = {
     if (isElectron()) {
       return window.halo.sendMessage(request)
     }
-    return httpRequest('POST', '/api/agent/message', request)
+    return httpRequest('POST', '/api/agent/message', { ...request })
   },
 
   stopGeneration: async (conversationId?: string): Promise<ApiResponse> => {
@@ -117,11 +85,11 @@ export const agentApi = {
   },
 
   // Inject a mid-turn message into an active session (Agent Team mode)
-  injectMessage: async (data: { conversationId: string; message: string }): Promise<ApiResponse> => {
+  injectMessage: async (data: AgentInjectRequest): Promise<ApiResponse> => {
     if (isElectron()) {
       return window.halo.injectMessage(data)
     }
-    return httpRequest('POST', '/api/agent/inject-message', data)
+    return httpRequest('POST', '/api/agent/inject-message', { ...data })
   },
 
   // Test MCP server connections
@@ -181,6 +149,23 @@ export const agentApi = {
       return window.halo.closeToolset({ spaceId, conversationId, toolsetId })
     }
     return httpRequest('POST', '/api/agent/toolsets/close', { spaceId, conversationId, toolsetId })
+  },
+
+  // ===== Conversation goal (engines with features.goal) =====
+  // data: the goal, or null when the conversation has none
+  getGoal: async (spaceId: string, conversationId: string): Promise<ApiResponse<Goal | null>> => {
+    if (isElectron()) {
+      return window.halo.getGoal({ spaceId, conversationId }) as Promise<ApiResponse<Goal | null>>
+    }
+    return httpRequest<Goal | null>('POST', '/api/agent/goal/get', { spaceId, conversationId })
+  },
+
+  // Set, replace, or clear (goal: null) on the user's behalf. Starts no turn.
+  setGoal: async (spaceId: string, conversationId: string, goal: GoalInput | null): Promise<ApiResponse<Goal | null>> => {
+    if (isElectron()) {
+      return window.halo.setGoal({ spaceId, conversationId, goal }) as Promise<ApiResponse<Goal | null>>
+    }
+    return httpRequest<Goal | null>('POST', '/api/agent/goal/set', { spaceId, conversationId, goal })
   },
 
   // ===== Terminal (user-facing viewer operations) =====

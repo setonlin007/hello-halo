@@ -13,13 +13,11 @@
  */
 
 import type { AutomationSpec } from '../spec'
-import type { MemorySnapshot } from '../../platform/memory/snapshot'
+import { renderMemorySection, MEMORY_SECTION_LIMITS, type MemorySnapshot, type TopicsTree } from '../../platform/memory'
 import type { EscalationResponse, EscalationQuestion } from './types'
 import { formatEscalationAnswer } from '../../../shared/apps/app-types'
 import type { ImSessionRecord } from '../../../shared/types/im-channel'
-import type { LiveInstance } from './live-instances'
 import { getImSessionDisplayName } from '../../../shared/types/im-channel'
-import { describeInstanceKind, formatInstanceTag } from './live-instances'
 import { buildSystemPrompt, buildSystemPromptWithAIBrowser } from '../../services/agent/system-prompt'
 import { AI_BROWSER_SYSTEM_PROMPT } from '../../services/ai-browser'
 import { AI_TERMINAL_SYSTEM_PROMPT } from '../../services/ai-terminal'
@@ -254,7 +252,8 @@ export interface AppPromptOptions {
  * Build the complete system prompt for an automation App session.
  *
  * Structure:
- * 1. Full main Agent system prompt (identity, tools, coding guidelines, env)
+ * 1. Host system prompt: the full main-Agent prompt, or on the halo engine only
+ *    the Halo context appended to the engine's own default prompt
  * 2. Automation context overlay (headless mode, report_to_user, escalation)
  * 3. App-specific system_prompt (from spec)
  * 4. Memory instructions (from memory service)
@@ -271,6 +270,10 @@ export function buildAppSystemPrompt(options: AppPromptOptions): string {
     workDir: options.workDir,
     modelInfo: options.modelInfo,
     knowledgeBases: getKBReferencesForApp(options.appId),
+    // A run mounts no digital-human management tools, so it must not be told it can.
+    digitalHumansEnabled: false,
+    // Who it is comes from its App Instructions, not Halo's introduction.
+    ownIdentity: !!options.appSpec.system_prompt,
   }
   let basePrompt = options.usesAIBrowser
     ? buildSystemPromptWithAIBrowser(promptCtx, AI_BROWSER_SYSTEM_PROMPT)
@@ -352,9 +355,10 @@ export function buildInitialMessage(options: {
   triggerContext: string
   userConfig?: Record<string, unknown>
   appName: string
-  memorySnapshot: MemorySnapshot
-  selfInstance: LiveInstance
-  liveInstances: LiveInstance[]
+  /** null when this digital human's memory is turned off */
+  memorySnapshot: MemorySnapshot | null
+  /** The space's topics, offered read-only; null when not offered */
+  spaceTopics?: TopicsTree | null
 }): string {
   const parts: string[] = []
 
@@ -362,8 +366,7 @@ export function buildInitialMessage(options: {
   parts.push(`## Trigger\n\nWhat initiated this run.\n\n${options.triggerContext}`)
 
   // ── Memory ─────────────────────────────────────────────────────────────
-  parts.push(buildMemorySection(options.memorySnapshot))
-  parts.push(buildLiveInstancesSection(options.selfInstance, options.liveInstances))
+  if (options.memorySnapshot) parts.push(buildMemorySection(options.memorySnapshot, options.spaceTopics))
 
   // ── User Configuration ─────────────────────────────────────────────────
   if (options.userConfig && Object.keys(options.userConfig).length > 0) {
@@ -371,12 +374,17 @@ export function buildInitialMessage(options: {
   }
 
   // ── Instructions ───────────────────────────────────────────────────────
+  const steps = options.memorySnapshot
+    ? [
+        'Update memory (`# now`, `# History`, and topics where knowledge settled) — internal housekeeping, do not mention this in your report',
+        'Report results via `mcp__halo-report__report_to_user`',
+      ]
+    : ['Report results via `mcp__halo-report__report_to_user`']
   parts.push(
     `## Instructions\n\n` +
     `Strictly follow the "${options.appName}" task requirements defined in your App Instructions (system prompt).\n` +
     `Complete this run based on the trigger above, then:\n` +
-    `1. Update memory (\`# now\` and \`# History\`) — internal housekeeping, do not mention this in your report\n` +
-    `2. Report results via \`mcp__halo-report__report_to_user\``
+    steps.map((step, i) => `${i + 1}. ${step}`).join('\n')
   )
 
   return parts.join('\n\n')
@@ -427,148 +435,38 @@ export function buildEscalationResumeMessage(escalation: {
  * concurrent executions, one first-person file: without this, a line another
  * instance wrote about itself reads as a description of the reader.
  */
-const MEMORY_AUTHORSHIP_FRAMING = `
-This is the shared working state of the digital human (the AI agent you are
-running as), written over time by many
-instances — including ones that are running right now. It is written in the
-first person, but "I" is the digital human, not you. A line here that claims
-a role, an assignment, or work in progress was written by whoever was doing
-it, and may be from another instance, another conversation, or another day.
+const MEMORY_AUTHORSHIP_FRAMING =
+  'Shared by this digital human’s executions. The memory’s "I" is the digital human, ' +
+  'not this execution. Claims of a role, an assignment or work in progress belong to ' +
+  'the execution that wrote them; verify those at their live source before acting.'
 
-Do not act on such a line as if it described you. If it matters for what you
-are about to do, verify it at its live source first — the team board, the
-files, the user in front of you — and if it turns out to be stale, correct
-the line.
+/**
+ * Offered below the digital human's own topics when its owner let it consult
+ * the space's memory. Called memory, never knowledge: a knowledge base is a
+ * separate thing the agent may also be given in the same turn.
+ */
+const SPACE_TOPICS_TITLE = "Space memory topics (read-only) — generated from the space's topic files"
+const SPACE_TOPICS_NOTE = `
+Topics from this space's shared memory, written by its conversations. Read them
+when their description fits; they are not yours to edit. Refer to them by path
+when you need them again — do not copy them into your own memory. If sources
+disagree, verify the current facts rather than choosing by memory ownership.
 `.trim()
 
-/**
- * Who this execution is, and who else is executing at the same moment. Rendered
- * directly below the memory block so the reader meets the roster in the same
- * breath as the file it explains.
- *
- * Never persisted: it is true only at the moment the message was built.
- */
-export function buildLiveInstancesSection(self: LiveInstance, others: LiveInstance[]): string {
-  const asOf = formatClockTime(Date.now())
-  const lines: string[] = [
-    `You are \`${formatInstanceTag(self)}\` — this ${describeInstanceKind(self)}. ` +
-    `Anything in memory not written by you was written by another instance.`,
-    '',
-  ]
-
-  if (others.length === 0) {
-    lines.push(`No other instance of this digital human is running right now (as of ${asOf}).`)
-    return lines.join('\n')
-  }
-
-  lines.push(`### Running right now (as of ${asOf})`)
-  lines.push('')
-  for (const other of others) {
-    const started = other.startedAt ? `, started ${formatClockTime(other.startedAt)}` : ''
-    lines.push(`- ${formatInstanceTag(other)} — ${describeInstanceKind(other)}${started}`)
-  }
-  lines.push('')
-  lines.push(
-    'This was true when this message was built and may already be out of date;\n' +
-    'one of them may have finished by now. It tells you whose work you might be\n' +
-    'reading in memory. It is not a queue, a lock, or a way to reach them.'
-  )
-  return lines.join('\n')
-}
-
-function formatClockTime(epochMs: number): string {
-  const d = new Date(epochMs)
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
 
 /**
- * Build the ## Memory section for the initial message.
+ * The `## Memory` block for a run or a session.
  *
- * Three variants based on memory state:
- * - No file: guidance to create one
- * - Small file (≤30 lines): full content inline
- * - Large file (>30 lines): first section + structural outline
- *
- * Exported for app-chat, which injects the same section at the start of a team
+ * Exported for app-chat, which injects the same section at the start of a
  * session — the digital human is the same one either way, so it must meet its
  * memory in the same shape whether the turn came from a schedule or a teammate.
  */
-export function buildMemorySection(snapshot: MemorySnapshot): string {
-  const lines: string[] = []
-  lines.push('## Memory')
-  lines.push('')
-  lines.push('Your persistent memory from previous work. Read it to maintain continuity and avoid repeating work.')
-  lines.push('')
-
-  // Only where there is content to misread: a digital human with no memory yet
-  // has no first-person line to mistake for its own.
-  if (snapshot.exists) {
-    lines.push(MEMORY_AUTHORSHIP_FRAMING)
-    lines.push('')
-  }
-
-  if (!snapshot.exists) {
-    // ── No memory file ─────────────────────────────────────────────────
-    lines.push(`**File**: \`${snapshot.memoryFilePath}\``)
-    lines.push('')
-    lines.push('No memory file exists yet. Create it with Write using the `# now` / `# History` structure.')
-    lines.push('Put your most important state under `# now` — it will be auto-loaded next run.')
-  } else if (snapshot.fullContent !== null) {
-    // ── Small memory: inject full content ──────────────────────────────
-    const sizeKB = (snapshot.sizeBytes / 1024).toFixed(1)
-    lines.push(`**File**: \`${snapshot.memoryFilePath}\``)
-    lines.push(`**Size**: ${snapshot.totalLines} lines, ${sizeKB}KB`)
-    lines.push('')
-    lines.push('### Content (full):')
-    lines.push('')
-    lines.push(snapshot.fullContent)
-  } else {
-    // ── Large memory: first section + outline ──────────────────────────
-    const sizeKB = (snapshot.sizeBytes / 1024).toFixed(1)
-    lines.push(`**File**: \`${snapshot.memoryFilePath}\``)
-    lines.push(`**Size**: ${snapshot.totalLines} lines, ${sizeKB}KB`)
-
-    if (snapshot.firstSection) {
-      lines.push('')
-      lines.push('### Working Memory (# now, auto-loaded):')
-      lines.push('')
-      lines.push(snapshot.firstSection)
-    }
-
-    if (snapshot.headers.length > 0) {
-      lines.push('')
-      lines.push('### Structure:')
-      for (const h of snapshot.headers) {
-        const loadedTag = h === snapshot.headers[0] && snapshot.firstSection
-          ? ' ← loaded above'
-          : ''
-        lines.push(`  L${h.line}: ${h.heading} (${h.lineCount} lines)${loadedTag}`)
-      }
-    }
-
-    lines.push('')
-    lines.push(`Use \`Read("${snapshot.memoryFilePath}")\` to see full content or specific sections.`)
-  }
-
-  // ── Archive info ─────────────────────────────────────────────────────
-  if (snapshot.archiveTotalCount > 0 || snapshot.compactionArchiveCount > 0) {
-    lines.push('')
-
-    if (snapshot.archiveTotalCount > 0) {
-      lines.push(`**Run History** (\`${snapshot.memoryArchiveDir}\`, ${snapshot.archiveTotalCount} files):`)
-      for (const f of snapshot.archiveFiles) {
-        lines.push(`  - ${f}`)
-      }
-      if (snapshot.archiveTotalCount > snapshot.archiveFiles.length) {
-        lines.push(`  ... and ${snapshot.archiveTotalCount - snapshot.archiveFiles.length} more`)
-      }
-    }
-
-    if (snapshot.compactionArchiveCount > 0) {
-      const compactDir = snapshot.memoryArchiveDir.replace(/\/run$/, '')
-      lines.push(`**Compaction Archives** (\`${compactDir}\`, ${snapshot.compactionArchiveCount} files)`)
-    }
-  }
-
-  return lines.join('\n')
+export function buildMemorySection(snapshot: MemorySnapshot, spaceTopics?: TopicsTree | null): string {
+  return renderMemorySection(snapshot, {
+    ...MEMORY_SECTION_LIMITS['digital-human'],
+    framing: MEMORY_AUTHORSHIP_FRAMING,
+    readOnlyTopics: spaceTopics
+      ? { title: SPACE_TOPICS_TITLE, note: SPACE_TOPICS_NOTE, tree: spaceTopics }
+      : undefined,
+  })
 }

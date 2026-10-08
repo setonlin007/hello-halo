@@ -20,6 +20,7 @@ import { logAuthEvent } from './audit'
 import { notifyLockout } from './alert'
 import { parseCredentialType, verifyOfficeCredential, type OfficeCredential } from './office-credential'
 import { matchOfficeScope } from './route-scope'
+import { isDownloadTicketPath } from './download-ticket'
 
 // Augment Express's Request so the office credential attached by authMiddleware
 // is typed end-to-end instead of cast through `any`. express-serve-static-core is
@@ -54,8 +55,10 @@ const STATIC_SUFFIXES = [
 function isPublicPath(path: string): boolean {
   if (PUBLIC_PATHS.has(path)) return true
   // /api/* is the authenticated surface. Never let a suffix-based rule
-  // grant access here — only the explicit PUBLIC_PATHS allowlist applies.
-  if (path.startsWith('/api/')) return false
+  // grant access here — only the explicit PUBLIC_PATHS allowlist and ticket
+  // links apply. Express matches the /api mount regardless of case.
+  const lower = path.toLowerCase()
+  if (lower === '/api' || lower.startsWith('/api/')) return isDownloadTicketPath(path)
   if (path === '/' || path === '/index.html' || path === '/favicon.ico') return true
   if (path.startsWith('/assets')) return true
   if (path.includes('@vite') || path.includes('node_modules')) return true
@@ -88,12 +91,15 @@ function clientIp(req: Request): string {
 }
 
 /**
- * `/api/*` gate. Public paths and static-looking paths are passed
- * through so the renderer can boot before login. Everything else must
- * present a valid token.
+ * `/api/*` gate. The public endpoints and download ticket links pass
+ * without a token; everything else must present a valid token, and an
+ * office-member token only reaches the routes of its scope.
  */
 export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
-  if (isPublicPath(req.path)) {
+  // Mounted at /api, where Express strips the mount point from req.path;
+  // every rule here is written against the full path.
+  const path = `${req.baseUrl ?? ''}${req.path}`
+  if (isPublicPath(path)) {
     return next()
   }
 
@@ -111,7 +117,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
       res.status(401).json({ success: false, error: 'Invalid token' })
       return
     }
-    if (!matchOfficeScope(req.method, req.path)) {
+    if (!matchOfficeScope(req.method, path)) {
       res.status(403).json({ success: false, error: 'Forbidden' })
       return
     }

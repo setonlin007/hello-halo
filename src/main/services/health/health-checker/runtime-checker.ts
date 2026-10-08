@@ -7,13 +7,14 @@
  * Key feature: PPID scanning for accurate subprocess detection.
  */
 
-import type { HealthStatus, ImmediateCheckResult, ProcessCheckStatus, ServiceCheckStatus } from '../types'
+import type { HealthStatus, ImmediateCheckOptions, ImmediateCheckResult, ProcessCheckStatus, ServiceCheckStatus } from '../types'
 import { checkOpenAIRouter, checkHttpServer } from './probes/service-probe'
 import { getCurrentProcesses, unregisterProcess, getRegistryStats } from '../process-guardian'
 import { getPlatformOps } from '../process-guardian/platform'
 import { getRouterInfo } from '../../../openai-compat-router'
 import { getServerInfo } from '../../../http'
 import { getRecentEvents, getTotalErrorCount } from './event-listener'
+import { formatResourceSample, getLatestResourceSample } from '../resource-sampler'
 
 // Memory threshold for warning (500MB)
 const MEMORY_WARNING_THRESHOLD_MB = 500
@@ -134,10 +135,11 @@ async function performFallbackCheck(): Promise<void> {
     // ========================================
     // Step 4: Read Memory Usage (passive, no I/O)
     // ========================================
-    const memUsage = process.memoryUsage()
-    const heapUsedMB = memUsage.heapUsed / (1024 * 1024)
-    const heapTotalMB = memUsage.heapTotal / (1024 * 1024)
-    const rssMB = memUsage.rss / (1024 * 1024)
+    const sample = getLatestResourceSample()
+    const memUsage = sample ? null : process.memoryUsage()
+    const heapUsedMB = sample ? sample.main.heapUsedMb : memUsage!.heapUsed / (1024 * 1024)
+    const heapTotalMB = sample ? sample.main.heapTotalMb : memUsage!.heapTotal / (1024 * 1024)
+    const rssMB = sample ? sample.main.rssMb : memUsage!.rss / (1024 * 1024)
     if (heapUsedMB > MEMORY_CRITICAL_THRESHOLD_MB) {
       issues.push(`Critical memory usage: ${heapUsedMB.toFixed(0)}MB`)
     } else if (heapUsedMB > MEMORY_WARNING_THRESHOLD_MB) {
@@ -170,7 +172,8 @@ async function performFallbackCheck(): Promise<void> {
     // Always log memory numbers (heap used/total, rss) so the trajectory toward an
     // OOM is visible across cycles, and the reasons behind a non-healthy status —
     // otherwise a status that stays 'degraded' for hours is logged without any cause.
-    const memInfo = `heap=${heapUsedMB.toFixed(0)}/${heapTotalMB.toFixed(0)}MB rss=${rssMB.toFixed(0)}MB procs=${registryStats.currentProcesses}`
+    const memInfo = `heap=${heapUsedMB.toFixed(0)}/${heapTotalMB.toFixed(0)}MB rss=${rssMB.toFixed(0)}MB procs=${registryStats.currentProcesses}` +
+      (sample ? ` ${formatResourceSample(sample)}` : '')
     const reasonInfo = issues.length > 0 ? `; reasons: ${issues.join('; ')}` : ''
     console.log(`[Health][Runtime] Passive check complete: ${newStatus} (${memInfo}${reasonInfo})`)
   } catch (error) {
@@ -190,7 +193,7 @@ async function performFallbackCheck(): Promise<void> {
  *
  * Includes debouncing to prevent rapid consecutive calls.
  */
-export async function runImmediateCheck(): Promise<ImmediateCheckResult> {
+export async function runImmediateCheck(options: ImmediateCheckOptions = {}): Promise<ImmediateCheckResult> {
   // Debounce: if check was run recently, return the last result
   const now = Date.now()
   if (lastCheckTime && (now - lastCheckTime) < MIN_CHECK_INTERVAL_MS && lastCheckPromise) {
@@ -205,14 +208,14 @@ export async function runImmediateCheck(): Promise<ImmediateCheckResult> {
   }
 
   // Start the actual check
-  lastCheckPromise = doImmediateCheck()
+  lastCheckPromise = doImmediateCheck(options)
   return lastCheckPromise
 }
 
 /**
  * Internal implementation of immediate health check
  */
-async function doImmediateCheck(): Promise<ImmediateCheckResult> {
+async function doImmediateCheck(options: ImmediateCheckOptions): Promise<ImmediateCheckResult> {
   isCheckRunning = true
   const timestamp = Date.now()
   lastCheckTime = timestamp
@@ -321,6 +324,8 @@ async function doImmediateCheck(): Promise<ImmediateCheckResult> {
       responsive: false
     }
 
+    let childLocalConnection: ImmediateCheckResult['services']['childLocalConnection']
+
     // Check OpenAI Router
     const routerInfo = getRouterInfo()
     if (routerInfo) {
@@ -337,6 +342,17 @@ async function doImmediateCheck(): Promise<ImmediateCheckResult> {
       } catch (error) {
         routerStatus.error = (error as Error).message
         issues.push(`OpenAI Router check failed: ${routerStatus.error}`)
+      }
+
+      // Security software can refuse the engine's process while this one gets through.
+      if (options.checkChildLocalConnection) {
+        childLocalConnection = await options.checkChildLocalConnection(routerInfo.port)
+        if (!childLocalConnection.reachable) {
+          issues.push(
+            `Child process cannot connect to 127.0.0.1:${routerInfo.port} (${childLocalConnection.error ?? 'unknown'})` +
+            (childLocalConnection.blocked ? ` — blocked by the system for ${childLocalConnection.program}` : '')
+          )
+        }
       }
     }
 
@@ -368,8 +384,7 @@ async function doImmediateCheck(): Promise<ImmediateCheckResult> {
     // ========================================
     // Step 6: Memory Check
     // ========================================
-    const memUsage = process.memoryUsage()
-    const heapUsedMB = memUsage.heapUsed / (1024 * 1024)
+    const heapUsedMB = getLatestResourceSample()?.main.heapUsedMb ?? process.memoryUsage().heapUsed / (1024 * 1024)
     if (heapUsedMB > MEMORY_WARNING_THRESHOLD_MB) {
       issues.push(`High memory usage: ${heapUsedMB.toFixed(0)}MB`)
     }
@@ -399,7 +414,8 @@ async function doImmediateCheck(): Promise<ImmediateCheckResult> {
 
     // Overall health: no critical issues and services are responsive (if running)
     const hasServiceIssues = (routerInfo && !routerStatus.responsive) ||
-                             (serverInfo.running && !httpServerStatus.responsive)
+                             (serverInfo.running && !httpServerStatus.responsive) ||
+                             childLocalConnection?.reachable === false
     const healthy = issues.length === 0 || (registryRemoved > 0 && issues.length === 1 && !hasServiceIssues)
 
     return {
@@ -410,7 +426,8 @@ async function doImmediateCheck(): Promise<ImmediateCheckResult> {
       },
       services: {
         openaiRouter: routerStatus,
-        httpServer: httpServerStatus
+        httpServer: httpServerStatus,
+        ...(childLocalConnection ? { childLocalConnection } : {})
       },
       issues,
       healthy,

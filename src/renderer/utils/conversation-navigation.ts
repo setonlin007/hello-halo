@@ -15,8 +15,6 @@ import { api } from '../api'
 import { useAppStore } from '../stores/app.store'
 import { useChatStore } from '../stores/chat.store'
 import { useSpaceStore } from '../stores/space.store'
-import { buildLocalSessionKey, getAppChatConversationId } from '../../shared/apps/im-keys'
-import type { ImSessionRecord } from '../../shared/types/im-channel'
 
 export function navigateToConversation(spaceId: string, conversationId: string) {
   const chatStore = useChatStore.getState()
@@ -48,53 +46,25 @@ export function navigateToConversation(spaceId: string, conversationId: string) 
  * exactly like navigateToConversation above, but landing on the app-chat
  * link (selectAppChatConversation) instead of a regular conversation.
  *
- * @param appSpaceId - The digital human's home space, or null for a global
- *   app — a global app has no space to switch to, so it opens in whichever
- *   space is currently active instead of forcing a jump.
+ * @param appSpaceId - The digital human's home space.
  */
-export function navigateToAppChat(appSpaceId: string | null, appId: string, conversationId: string) {
+export function navigateToAppChat(appSpaceId: string, appId: string, conversationId: string) {
   const chatStore = useChatStore.getState()
   useAppStore.getState().navigate('space')
 
-  const targetSpaceId = appSpaceId ?? chatStore.currentSpaceId
-  if (!targetSpaceId) return
-
-  if (chatStore.currentSpaceId === targetSpaceId) {
-    chatStore.selectAppChatConversation(targetSpaceId, appId, conversationId)
+  if (chatStore.currentSpaceId === appSpaceId) {
+    chatStore.selectAppChatConversation(appSpaceId, appId, conversationId)
     return
   }
 
   const spaceStore = useSpaceStore.getState()
-  const targetSpace = spaceStore.haloSpace?.id === targetSpaceId
+  const targetSpace = spaceStore.haloSpace?.id === appSpaceId
     ? spaceStore.haloSpace
-    : spaceStore.spaces.find(s => s.id === targetSpaceId)
+    : spaceStore.spaces.find(s => s.id === appSpaceId)
   if (!targetSpace) return
 
   useChatStore.setState({ pendingAppChatNavigation: { appId, conversationId } })
   spaceStore.setCurrentSpace(targetSpace)
-}
-
-/**
- * The desktop conversation to reopen for one digital human: the most recently
- * active of the sessions the main board's list shows for it. IM/HTTP sessions
- * are excluded — they are channel conversations read in the app's own session
- * browser, not places the main board can type into.
- */
-async function latestDigitalHumanConversationId(appId: string): Promise<string | null> {
-  try {
-    const result = await api.imSessionsList(appId)
-    if (!result.success || !Array.isArray(result.data)) return null
-    const latest = (result.data as ImSessionRecord[])
-      .filter(record => record.source === 'native' || record.source === 'local')
-      .sort((a, b) => (b.lastActiveAt ?? 0) - (a.lastActiveAt ?? 0))[0]
-    if (!latest) return null
-    return latest.source === 'native'
-      ? getAppChatConversationId(appId)
-      : buildLocalSessionKey(appId, latest.chatId)
-  } catch (error) {
-    console.warn('[ConversationNavigation] Conversation lookup failed', { appId, error })
-    return null
-  }
 }
 
 /**
@@ -103,9 +73,11 @@ async function latestDigitalHumanConversationId(appId: string): Promise<string |
  * caller reports a failure the same way).
  *
  * The single place the renderer creates a digital-human session: the input's
- * recipient picker, its "@" mention path, the resource rail's chat action and
- * the "open the last conversation" action above all mean "start talking now"
- * and must not each evolve their own request.
+ * recipient picker, its "@" mention path, the resource rail's chat action, and
+ * every "Chat"/"talk to it now" button all mean the same thing and must not
+ * each evolve their own request — including not silently reopening whatever
+ * conversation happened to be most recent, which reads as "nothing happened"
+ * when the user expected a new one.
  */
 export async function startDigitalHumanConversation(appId: string): Promise<string | null> {
   try {
@@ -118,19 +90,52 @@ export async function startDigitalHumanConversation(appId: string): Promise<stri
   return null
 }
 
+const openingChats = new Map<string, Promise<boolean>>()
+
 /**
- * Talk to one digital human on the main conversation board: reopen their most
- * recent conversation, or start one when they have none — "talk to this person
- * now" has to land somewhere, and a person nobody has spoken to yet is the
- * normal case, not an error.
+ * "Talk to this digital human now": start a fresh conversation and open it on
+ * the main board. Repeat calls for the same digital human while one is still
+ * being created share it, so a double-click doesn't leave an extra empty
+ * session behind.
  *
- * Returns false when neither the lookup nor the creation produced a
- * conversation, so the caller can surface that nothing opened.
+ * Returns false when no conversation could be created.
  */
-export async function openDigitalHumanChat(appId: string, appSpaceId: string | null): Promise<boolean> {
-  const conversationId = await latestDigitalHumanConversationId(appId)
-    ?? await startDigitalHumanConversation(appId)
-  if (!conversationId) return false
-  navigateToAppChat(appSpaceId, appId, conversationId)
-  return true
+export function openDigitalHumanChat(appId: string, appSpaceId: string): Promise<boolean> {
+  const pending = openingChats.get(appId)
+  if (pending) return pending
+  const opening = (async () => {
+    const conversationId = await startDigitalHumanConversation(appId)
+    if (!conversationId) return false
+    navigateToAppChat(appSpaceId, appId, conversationId)
+    return true
+  })().finally(() => openingChats.delete(appId))
+  openingChats.set(appId, opening)
+  return opening
+}
+
+/** The parts of a global-search hit that decide which conversation it lands in. */
+export interface SearchResultTarget {
+  spaceId: string
+  conversationId: string
+  messageId: string
+  kind?: 'chat' | 'digital-human'
+  appId?: string
+}
+
+/**
+ * Open the conversation a search hit lives in, with the hit's message loaded.
+ * The caller has already switched to the hit's space. A space conversation is
+ * selected whole; a digital human's is opened on the main board and, being
+ * paged, widened back to the hit — however far back it is.
+ */
+export async function openSearchResultConversation(result: SearchResultTarget): Promise<void> {
+  const chat = useChatStore.getState()
+  await chat.loadConversations(result.spaceId)
+
+  if (result.kind === 'digital-human' && result.appId) {
+    chat.selectAppChatConversation(result.spaceId, result.appId, result.conversationId)
+    await chat.ensureMessageLoaded(result.conversationId, result.messageId)
+    return
+  }
+  await chat.selectConversation(result.conversationId)
 }

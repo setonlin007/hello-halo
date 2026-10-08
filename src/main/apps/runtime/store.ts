@@ -24,6 +24,8 @@ import type {
 } from './types'
 import type { AppStatus } from '../manager'
 import { BLOCKED_STATUSES, blockedReason } from './app-state'
+import type { EscalationAnswer, RunTokenUsage } from '../../../shared/apps/app-types'
+import { addRunTokenUsage, getEscalationAnswers, getEscalationQuestions } from '../../../shared/apps/app-types'
 
 // ============================================
 // Internal Row Types (flat DB shape)
@@ -43,6 +45,7 @@ interface RunRow {
   error_message: string | null
   session_id: string | null
   environment_json: string | null
+  transcript_cleared_at: number | null
 }
 
 interface RunRowWithSummary extends RunRow {
@@ -88,6 +91,7 @@ function rowToRun(row: RunRow): AutomationRun {
     errorMessage: row.error_message ?? undefined,
     sessionId: row.session_id ?? undefined,
     environment: row.environment_json ? JSON.parse(row.environment_json) : undefined,
+    transcriptClearedAt: row.transcript_cleared_at ?? undefined,
   }
 }
 
@@ -123,6 +127,9 @@ function rowToEntry(row: EntryRow): ActivityEntry {
 
 /** Default retention period: 1 year in milliseconds */
 const DEFAULT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000
+
+/** Rows whose pinned environment belongs to the space bound as `@spaceId`. */
+const PINNED_IN_SPACE = `json_extract(environment_json, '$.spaceId') = @spaceId`
 
 /**
  * SQLite store for automation runs and activity entries.
@@ -477,6 +484,24 @@ export class ActivityStore {
     return row ? this.withContinuation(rowToEntry(row)) : null
   }
 
+  /**
+   * The number the next escalation is answered by from an IM chat: one past
+   * the highest any escalation holds, so a late answer to an earlier question
+   * can never land on a newer one.
+   */
+  nextEscalationNumber(): number {
+    const row = this.db.prepare(`SELECT MAX(CAST(json_extract(content_json, '$.number') AS INTEGER)) AS top
+      FROM activity_entries WHERE type = 'escalation'`).get() as { top: number | null }
+    return (row.top ?? 0) + 1
+  }
+
+  /** The escalation answered by this number, answered or not. */
+  getEscalationByNumber(number: number): ActivityEntry | null {
+    const row = this.db.prepare(`SELECT * FROM activity_entries WHERE type = 'escalation'
+      AND CAST(json_extract(content_json, '$.number') AS INTEGER) = ? LIMIT 1`).get(number) as EntryRow | undefined
+    return row ? this.withContinuation(rowToEntry(row)) : null
+  }
+
   /** Get entries for an App with optional filtering */
   getEntriesForApp(appId: string, options?: ActivityQueryOptions): ActivityEntry[] {
     const limit = Math.min(500, Math.max(1, Math.floor(options?.limit || 50)))
@@ -503,6 +528,72 @@ export class ActivityStore {
   /** Update an entry with a user response (for escalation) */
   updateEntryResponse(entryId: string, response: EscalationResponse): void {
     this.stmtUpdateEntryResponse.run(JSON.stringify(response), entryId)
+  }
+
+  /** Record on an upgrade note the kept fields the user switched to the author's version. */
+  markUpgradeAdopted(entryId: string, fields: readonly string[]): ActivityEntry | null {
+    const entry = this.getEntry(entryId)
+    if (!entry?.content.upgrade) return null
+    entry.content.upgrade.adopted = [...new Set([...(entry.content.upgrade.adopted ?? []), ...fields])]
+    this.db.prepare('UPDATE activity_entries SET content_json = ? WHERE id = ?').run(JSON.stringify(entry.content), entryId)
+    return entry
+  }
+
+  /**
+   * Runs of an app beyond its newest `keep` that still have their process
+   * transcript, at most `limit`. Skipped runs never had one and do not count.
+   * A run still going, waiting on a question or holding a pending
+   * continuation is never returned.
+   */
+  listRunsPastTranscriptRetention(appId: string, keep: number, limit: number): AutomationRun[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT * FROM automation_runs
+        WHERE app_id = ? AND transcript_cleared_at IS NULL AND status != 'skipped'
+        ORDER BY started_at DESC LIMIT -1 OFFSET ?
+      ) AS r
+      WHERE r.status NOT IN ('running', 'waiting_user')
+        AND NOT EXISTS (SELECT 1 FROM activity_entries e WHERE e.run_id = r.run_id AND e.type = 'escalation'
+          AND e.user_response_json IS NULL AND json_extract(e.content_json, '$.resolution') IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM decision_continuations c JOIN activity_entries e ON e.id = c.entry_id
+          WHERE e.run_id = r.run_id AND c.status IN ('queued', 'running', 'failed'))
+      LIMIT ?
+    `).all(appId, keep, limit) as RunRow[]
+    return rows.map(rowToRun)
+  }
+
+  /**
+   * Record that a run's transcript and engine session are gone. Nothing is left
+   * to continue it from, so its session id goes and its failure entries stop
+   * offering to continue; the entries themselves stay on the timeline.
+   */
+  markTranscriptCleared(runId: string): void {
+    this.db.transaction(() => {
+      this.db.prepare('UPDATE automation_runs SET transcript_cleared_at = ?, session_id = NULL WHERE run_id = ?')
+        .run(Date.now(), runId)
+      this.db.prepare(`
+        UPDATE activity_entries SET content_json = json_remove(content_json, '$.resumeAvailable')
+        WHERE run_id = ? AND type = 'run_error' AND json_extract(content_json, '$.resumeAvailable') IS NOT NULL
+      `).run(runId)
+    })()
+  }
+
+  /** Add to the token usage an entry shows for the run it closed. */
+  addTokenUsage(entryId: string, usage: RunTokenUsage): ActivityEntry | null {
+    const entry = this.getEntry(entryId)
+    if (!entry) return null
+    entry.content.tokenUsage = addRunTokenUsage(entry.content.tokenUsage, usage)
+    this.db.prepare('UPDATE activity_entries SET content_json = ? WHERE id = ?').run(JSON.stringify(entry.content), entryId)
+    return entry
+  }
+
+  /** Add to the scheduled times an entry says were skipped while its run went on. */
+  addSkippedSchedules(entryId: string, count: number): ActivityEntry | null {
+    const entry = this.getEntry(entryId)
+    if (!entry) return null
+    entry.content.skippedSchedules = (entry.content.skippedSchedules ?? 0) + count
+    this.db.prepare('UPDATE activity_entries SET content_json = ? WHERE id = ?').run(JSON.stringify(entry.content), entryId)
+    return entry
   }
 
   /** Get a pending (unanswered) escalation entry */
@@ -613,19 +704,18 @@ export class ActivityStore {
     return this.db.transaction(() => {
       const entry = this.getEntry(entryId)
       if (!entry || entry.appId !== appId || entry.type !== 'escalation') throw new Error('Decision not found')
+      const answers = getEscalationAnswers(response)
       if (entry.userResponse) {
-        const answer = (value: EscalationResponse) => JSON.stringify({ choice: value.choice, text: value.text, answers: value.answers })
-        if (answer(entry.userResponse) !== answer(response)) throw new Error('This decision has already been answered differently')
+        const same = (value: EscalationAnswer[]) => JSON.stringify(value.map(({ choice, text }) => ({ choice, text })))
+        if (same(getEscalationAnswers(entry.userResponse)) !== same(answers)) throw new Error('This decision has already been answered differently')
         return entry
       }
       if (entry.content.resolution || this.isRunClosed(entry.runId)) throw new Error('This decision is closed')
       if (entry.content.deadlineReviewRequired) throw new Error('Confirm the historical deadline before answering')
       if (entry.content.deadlineAt !== undefined && entry.content.deadlineAt <= Date.now()) throw new Error('This decision has expired')
-      const questions = entry.content.questions
-      if (questions?.length && (response.answers?.length !== questions.length || response.answers.some(answer => !answer.choice?.trim() && !answer.text?.trim()))) {
+      if (answers.length !== getEscalationQuestions(entry.content).length || answers.some(answer => !answer.choice?.trim() && !answer.text?.trim())) {
         throw new Error('Answer every question before submitting')
       }
-      if (!questions?.length && !response.choice?.trim() && !response.text?.trim()) throw new Error('An answer is required')
       const now = Date.now()
       this.stmtUpdateEntryResponse.run(JSON.stringify({ ...response, ts: now }), entryId)
       this.db.prepare(`INSERT INTO decision_continuations(entry_id, app_id, status, updated_at) VALUES (?, ?, 'queued', ?)`).run(entryId, appId, now)
@@ -834,6 +924,30 @@ export class ActivityStore {
     const rows = this.db.prepare('SELECT session_key, environment_json FROM app_session_environments WHERE app_id = ?')
       .all(appId) as Array<{ session_key: string; environment_json: string }>
     return rows.map(row => ({ sessionKey: row.session_key, environment: JSON.parse(row.environment_json) }))
+  }
+
+  /** The working directories named by environments pinned in this space (chat sessions, team seats, runs). */
+  listSpaceWorkDirs(spaceId: string): string[] {
+    const rows = this.db.prepare(`
+      SELECT json_extract(environment_json, '$.workDir') AS work_dir FROM app_session_environments WHERE ${PINNED_IN_SPACE}
+      UNION SELECT json_extract(environment_json, '$.workDir') FROM automation_runs WHERE environment_json IS NOT NULL AND ${PINNED_IN_SPACE}
+    `).all({ spaceId }) as Array<{ work_dir: string | null }>
+    return rows.map(row => row.work_dir).filter((dir): dir is string => !!dir)
+  }
+
+  /**
+   * The space's working directory was changed: every environment pinned in it —
+   * chat sessions, team seats and runs a person may continue — names the new
+   * folder from now on. Its storage and memory paths are Halo's and stay.
+   *
+   * @returns how many environments were re-pointed
+   */
+  repointSpaceWorkDir(spaceId: string, workDir: string): number {
+    const moved = `environment_json = json_set(environment_json, '$.workDir', @workDir)`
+    return this.db.transaction(() =>
+      this.db.prepare(`UPDATE app_session_environments SET ${moved} WHERE ${PINNED_IN_SPACE}`).run({ spaceId, workDir }).changes
+      + this.db.prepare(`UPDATE automation_runs SET ${moved} WHERE environment_json IS NOT NULL AND ${PINNED_IN_SPACE}`).run({ spaceId, workDir }).changes
+    )()
   }
 
   // ── Data Lifecycle ──────────────────────────

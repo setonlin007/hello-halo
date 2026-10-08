@@ -11,12 +11,16 @@
  * do what.
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { MessageSquare } from 'lucide-react'
 import { useTranslation } from '../../i18n'
+import { api } from '../../api'
 import type { ImChannelInstanceConfig } from '../../../shared/types/im-channel'
+import type { AvailableSkill } from '../../../shared/apps/app-types'
 import { CapabilityPolicyFields } from '../capability/CapabilityPolicyFields'
 import { Switch } from '../ui/Switch'
+import { HelpHint } from '../ui/HelpHint'
+import { withGuestAccess } from '../../../shared/apps/capability-policy'
 
 /** Product-level permission defaults (from IPC). Mirrors auth-loader.ImChannelsPermissionDefaults. */
 export interface ImPermissionDefaults {
@@ -54,6 +58,19 @@ export function ImInstancePermissionSection({
 
   const ownersDisplay = ownersDraft ?? owners.join(', ')
 
+  // The skills the bound digital human can load, for the guest skill switches.
+  // Unknown until loaded (or when loading fails): the group stays hidden rather
+  // than claim the digital human has none.
+  const [skills, setSkills] = useState<AvailableSkill[] | undefined>(undefined)
+  useEffect(() => {
+    if (!guestAccessEnabled || !instance.appId) return
+    let cancelled = false
+    api.appListAvailableSkills(instance.appId)
+      .then(res => { if (!cancelled && res.success && Array.isArray(res.data)) setSkills(res.data) })
+      .catch(() => { /* the group stays hidden */ })
+    return () => { cancelled = true }
+  }, [guestAccessEnabled, instance.appId])
+
   // ── Handlers ──
 
   const handlePermissionToggle = () => {
@@ -77,11 +94,7 @@ export function ImInstancePermissionSection({
   }
 
   const handleGuestAccessToggle = () => {
-    if (guestAccessEnabled) {
-      onChange({ ...instance, guestPolicy: undefined })
-    } else {
-      onChange({ ...instance, guestPolicy: { allowedTools: [] } })
-    }
+    onChange(withGuestAccess(instance, !guestAccessEnabled, permissionDefaults?.defaultGuestPolicy))
   }
 
   // ── Render ──
@@ -91,7 +104,13 @@ export function ImInstancePermissionSection({
       {/* Master toggle */}
       <div className="flex items-center justify-between">
         <div className="space-y-0.5">
-          <p className="text-sm text-muted-foreground">{t('Permission Control')}</p>
+          <div className="flex items-center gap-1">
+            <p className="text-sm text-muted-foreground">{t('Permission Control')}</p>
+            <HelpHint
+              label={t('About this setting')}
+              text={t('On: owners can use everything, and guests — everyone who is not an owner — can use only what you allow below. Off: everyone is treated as an owner. Owners are the IDs in the owner list; while the list is empty, the first person to message the bot directly becomes its owner.')}
+            />
+          </div>
           <p className="text-xs text-muted-foreground/70">
             {permissionEnabled
               ? t('Restrict access by owner/guest roles')
@@ -150,7 +169,7 @@ export function ImInstancePermissionSection({
             <div className="flex items-center gap-2 rounded-lg bg-amber-500/10 border border-amber-500/30 px-3 py-2">
               <MessageSquare className="w-4 h-4 text-amber-600 dark:text-amber-500 shrink-0" />
               <p className="text-xs text-amber-600 dark:text-amber-500">
-                {t('No owner set. The first user to direct-message this bot is bound as the owner — enter your own ID above to claim it first. Until then, everyone is a guest with no tool access.')}
+                {t('No owner set. The first user to direct-message this bot is bound as the owner — enter your own ID above to claim it first. Until then, everyone is a guest who can only chat and use memory.')}
               </p>
             </div>
           )}
@@ -175,7 +194,7 @@ export function ImInstancePermissionSection({
                   <p className="text-xs text-muted-foreground/70">
                     {guestAccessEnabled
                       ? t('Guests have limited access to selected tools below')
-                      : t('Guests have no tool access — chat only')}
+                      : t('Guests can only chat and use memory')}
                   </p>
                 </div>
                 <Switch checked={guestAccessEnabled} onCheckedChange={handleGuestAccessToggle} />
@@ -189,12 +208,8 @@ export function ImInstancePermissionSection({
                   <CapabilityPolicyFields
                     policy={guestPolicy}
                     mode="strict"
-                    groupLabels={{
-                      file: t('File Read'),
-                      network: t('Network'),
-                      other: t('Other'),
-                      advanced: t('Advanced'),
-                    }}
+                    audience="guest"
+                    skills={skills?.map(s => ({ dirName: s.dirName, name: s.name, description: s.description }))}
                     onChange={(next) => onChange({ ...instance, guestPolicy: next })}
                   />
                 </div>

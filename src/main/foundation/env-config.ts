@@ -23,8 +23,6 @@
  *                          product.json default
  *   HALO_NO_PROXY          comma-separated host patterns always reached directly;
  *                          falls back to NO_PROXY
- *   HALO_ENABLE_TEAMS      Agent Teams (multi-agent collaboration). Unlike the rest,
- *                          a seed rather than an override — see below.
  */
 import { v4 as uuidv4 } from 'uuid'
 import type { AISource, ProviderId } from '../../shared/types'
@@ -40,12 +38,6 @@ function env(...names: string[]): string | undefined {
     if (v != null && v.trim() !== '') return v.trim()
   }
   return undefined
-}
-
-function envBool(...names: string[]): boolean | undefined {
-  const raw = env(...names)
-  if (raw === undefined) return undefined
-  return raw === '1' || raw.toLowerCase() === 'true'
 }
 
 function envList(...names: string[]): string[] | undefined {
@@ -113,19 +105,12 @@ export function applyEnvConfig(): void {
   if (proxy) network.proxy = proxy
   const proxyOnly = envList('HALO_PROXY_ONLY')
   if (proxyOnly) network.proxyOnly = proxyOnly.includes('*') ? [] : proxyOnly
+  // `network.noProxy` is a NO_PROXY-style string (proxy-policy parses it), so
+  // the env list goes back to the comma form it arrived in.
   const noProxy = envList('HALO_NO_PROXY', 'NO_PROXY', 'no_proxy')
-  if (noProxy) network.noProxy = noProxy
+  if (noProxy) network.noProxy = noProxy.join(',')
   if (Object.keys(network).length > 0) {
     overrides.network = { ...cfg.network, ...network }
-  }
-
-  // --- Agent Teams ---
-  // Seeded, not forced: the toggle in Settings -> Advanced is reachable in
-  // server mode, so a value chosen there has to survive the next boot. The env
-  // var only decides what a deployment starts out with.
-  const teams = envBool('HALO_ENABLE_TEAMS')
-  if (teams !== undefined && cfg.agent?.enableTeams === undefined) {
-    overrides.agent = { ...cfg.agent, enableTeams: teams }
   }
 
   if (Object.keys(overrides).length > 0) {

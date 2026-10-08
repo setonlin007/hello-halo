@@ -23,6 +23,7 @@ import {
 } from '../../../shared/apps/capability-policy'
 import type { CapabilityMode, CapabilityPolicy } from '../../../shared/apps/capability-policy'
 import type { TeamTriggerContext } from '../../../shared/apps/team-types'
+import { FILE_TOOLS } from './turn-file-access'
 
 export { computeDisallowedBuiltins }
 
@@ -36,14 +37,19 @@ export { computeDisallowedBuiltins }
  * the session, and the office credential that reaches the cross-machine 1:1
  * endpoint is denied that local path (`http/auth/route-scope`).
  *
- * IM-backed turns are deliberately left out — the team's IM front desk is a
- * separate scenario with its own hardening decision.
+ * In a chat a member fronts over IM, the person's own message answers to that
+ * channel's owner/guest rules instead. A turn woken there to continue work
+ * that entered from outside is borrowed like any other: who spoke last in the
+ * chat says nothing about who set the work in motion.
  */
 export function isBorrowedTeamTurn(
   teamTurnKind: TeamTriggerContext['kind'] | undefined,
-  overImChannel: boolean
+  overImChannel: boolean,
+  external: boolean
 ): boolean {
-  return !!teamTurnKind && !overImChannel
+  if (!teamTurnKind) return false
+  if (!overImChannel) return true
+  return teamTurnKind !== 'human_message' && external
 }
 
 /**
@@ -123,6 +129,13 @@ export interface ApplyCapabilityPolicyInput {
   dbMcpServers: Record<string, unknown> | null
   /** Servers that are the turn's channel rather than a capability. */
   alwaysKeep?: ReadonlySet<string>
+  /**
+   * Keep the file tools in the pool even when the policy withholds them. The
+   * turn's file boundary (turn-file-access) then admits a withheld tool only
+   * on memory and on files handed to the turn: a digital human cannot work
+   * without its memory, whoever it is working for.
+   */
+  keepFileTools?: boolean
 }
 
 export interface AppliedCapabilityPolicy {
@@ -143,6 +156,9 @@ export interface AppliedCapabilityPolicy {
  * refuses. That last layer is what command rules ride on, and why the engine
  * rather than Halo evaluates them.
  *
+ * A policy only ever adds to `disallowedTools`: a tool the user disabled
+ * globally is out of the model's pool for a guest or teammate too.
+ *
  * A policy that withholds nothing returns `enforced: false` and changes no
  * option, so an unrestricted turn keeps the engine's fast path exactly as it was.
  */
@@ -150,16 +166,19 @@ export function applyCapabilityPolicy(
   sdkOptions: Record<string, any>,
   input: ApplyCapabilityPolicyInput
 ): AppliedCapabilityPolicy {
-  const { policy, mode, mcpServers, dbMcpServers, alwaysKeep } = input
+  const { policy, mode, mcpServers, dbMcpServers, alwaysKeep, keepFileTools } = input
 
   if (!isRestrictivePolicy(policy, mode)) {
     return { enforced: false, disallowedTools: [], mcpServers: mcpServers as Record<string, any> }
   }
 
   const disallowedTools = computeDisallowedBuiltins(policy, mode)
+    .filter(name => !(keepFileTools && FILE_TOOLS.includes(name)))
   const filtered = filterMcpServersByPolicy(mcpServers, dbMcpServers, policy, mode, alwaysKeep)
 
-  sdkOptions.disallowedTools = disallowedTools
+  // Added to what the session already withholds (the user's disabled tools, the
+  // native team tools): a policy narrows a turn, it never re-opens a tool.
+  sdkOptions.disallowedTools = [...new Set([...(sdkOptions.disallowedTools ?? []), ...disallowedTools])]
   sdkOptions.allowedTools = buildAllowedToolRules(policy, mode)
   sdkOptions.mcpServers = filtered
   // Both must go: the flag and the mode each bypass the permission engine on

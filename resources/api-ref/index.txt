@@ -16,6 +16,11 @@ POST   /api/spaces                                                 [ai]       wo
 PUT    /api/spaces/reorder                                         [ai]       workspace               Set the display order of spaces
 GET    /api/spaces/$HALO_SPACE_ID                                  [ai]       workspace               Read one space
 PUT    /api/spaces/$HALO_SPACE_ID                                  [ai]       workspace               Rename a space or change its icon
+PUT    /api/spaces/$HALO_SPACE_ID/working-dir                      [ai]       workspace               Point a space at another working directory
+GET    /api/spaces/$HALO_SPACE_ID/preferences                      [ai]       workspace               Read a space's preferences (layout, memory settings)
+PUT    /api/spaces/$HALO_SPACE_ID/preferences                      [ai]       workspace               Change a space's preferences, e.g. turn its shared memory on or off
+GET    /api/spaces/$HALO_SPACE_ID/memory                           [ai]       workspace               Read the state of a space's memory
+POST   /api/spaces/$HALO_SPACE_ID/memory/consolidate               [ai]       workspace               Consolidate a space's memory now
 DELETE /api/spaces/$HALO_SPACE_ID                                  [ai]       workspace               Delete a space and everything inside it
 POST   /api/spaces/$HALO_SPACE_ID/open                             [ai]       workspace               Get a space working directory path
 GET    /api/spaces/$HALO_SPACE_ID/conversations                    [ai]       conversation            List conversations in a space
@@ -41,6 +46,7 @@ POST   /api/terminal/resize                                        [wrapped]  te
 POST   /api/terminal/kill                                          [wrapped]  terminal                Close a terminal session
 POST   /api/terminal/replay                                        [wrapped]  terminal                Read back a terminal session buffer
 GET    /api/spaces/$HALO_SPACE_ID/artifacts                        [ai]       workspace               List files and folders in a space
+GET    /api/spaces/$HALO_SPACE_ID/artifacts/query                  [ai]       workspace               Search file and folder paths in a space by name
 GET    /api/spaces/$HALO_SPACE_ID/artifacts/tree                   [ai]       workspace               Get the full lazy-loadable file tree for a space
 POST   /api/spaces/$HALO_SPACE_ID/artifacts/children               [ai]       workspace               Load one folder's children in the file tree
 GET    /api/artifacts/content                                      [ai]       workspace               Read one file from a space
@@ -69,6 +75,8 @@ GET    /api/im-sessions                                            [ai]       ch
 POST   /api/im-sessions/set-proactive                              [ai]       channels,digital-human  Toggle whether a run's result is auto-pushed to this chat when it finishes
 POST   /api/im-sessions/remove                                     [ai]       channels,digital-human  Remove a chat binding from the IM session registry
 POST   /api/im-sessions/set-custom-name                            [ai]       channels,digital-human  Set a custom display name for a chat binding
+GET    /api/im-sessions/linked                                     [ai]       channels,digital-human  List the IM chats a digital human pushes to through another digital human's bot
+POST   /api/im-sessions/set-push-link                              [ai]       channels,digital-human  Let a digital human push to an IM chat another digital human's bot knows, or stop it
 GET    /api/auth/providers                                         [ai]       settings                List the sign-in and model providers this build offers
 GET    /api/system/version                                         [ai]       settings                Read the running Halo version
 GET    /api/apps                                                   [ai]       digital-human           List digital humans (and other installed apps) in a space
@@ -80,6 +88,10 @@ DELETE /api/apps/<appId>                                           [ai]       di
 POST   /api/apps/<appId>/reinstall                                 [ai]       digital-human           Reinstall a previously soft-deleted (uninstalled) digital human
 POST   /api/apps/<appId>/move-space                                [ai]       digital-human,workspace Set which space a digital human starts new work in
 POST   /api/apps/<appId>/clear-memory                              [ai]       digital-human           Delete all of a digital human's memory files
+GET    /api/apps/<appId>/memory                                    [ai]       digital-human           Read the state of a digital human's memory
+POST   /api/apps/<appId>/memory/consolidate                        [ai]       digital-human           Consolidate a digital human's memory now
+GET    /api/apps/<appId>/reminders                                 [ai]       digital-human           List the reminders a digital human set in its conversations
+DELETE /api/apps/<appId>/reminders/<reminderId>                    [ai]       digital-human           Cancel a reminder a digital human set in one of its conversations
 DELETE /api/apps/<appId>/permanent                                 [wrapped]  digital-human           Permanently delete a digital human and all its data
 POST   /api/apps/<appId>/pause                                     [ai]       digital-human           Pause a digital human (stops scheduling)
 POST   /api/apps/<appId>/resume                                    [ai]       digital-human           Resume a paused digital human
@@ -105,6 +117,8 @@ GET    /api/apps/<appId>/chat/messages                             [ai]       di
 GET    /api/apps/<appId>/im-chat/messages                          [ai]       digital-human,channels  Read a digital human's transcript in a bound IM chat
 POST   /api/apps/<appId>/chat/clear                                [ai]       digital-human           Clear a digital human's chat history
 POST   /api/apps/<appId>/chat/restart                              [ai]       digital-human           Restart a digital human's chat agent process (reloads system prompt and config)
+GET    /api/apps/<appId>/chats/clearable                           [ai]       digital-human           Count the conversations clearing all of a digital human's chats would clear
+POST   /api/apps/<appId>/chats/clear-all                           [ai]       digital-human           Clear the history of all of a digital human's chats at once
 POST   /api/apps/<appId>/im-chat/clear                             [ai]       digital-human,channels  Clear a digital human's chat history in a bound IM chat
 POST   /api/apps/<appId>/im-chat/stop                              [ai]       digital-human,channels  Stop a digital human's in-progress reply in a bound IM chat (keeps history)
 POST   /api/apps/<appId>/sessions/create                           [ai]       digital-human           Start a new chat thread with a digital human
@@ -148,6 +162,7 @@ POST   /api/tlon/<kbId>/bind-app                                   [ai]       kn
 POST   /api/tlon/<kbId>/unbind-app                                 [ai]       knowledge-base,digital-humanUnbind a knowledge collection from a digital human
 POST   /api/tlon/<kbId>/linked-dirs                                [ai]       knowledge-base          Watch a server-local directory as a live document source
 DELETE /api/tlon/<kbId>/linked-dirs/<linkId>                       [ai]       knowledge-base          Stop watching a linked directory
+POST   /api/tlon/<kbId>/linked-dirs/<linkId>/retry                 [ai]       knowledge-base          Look for an unavailable linked directory again and resume watching it if it is back
 POST   /api/tlon/<kbId>/files                                      [ai]       knowledge-base          Add existing server-local files to a collection by absolute path
 GET    /api/tlon/<kbId>/raw                                        [ai]       knowledge-base          List the raw source files added to a collection
 POST   /api/tlon/<kbId>/remove-raw                                 [ai]       knowledge-base          Remove one document (raw source file) from a collection

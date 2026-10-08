@@ -46,7 +46,8 @@ function seedCollaboration(directory: string): SeededCollaboration {
   buildSync({
     entryPoints: [join(folder, 'team-collab-seed-worker.ts')],
     outfile: output, platform: 'node', format: 'cjs', bundle: true,
-    external: ['better-sqlite3', 'electron'], logLevel: 'silent',
+    packages: 'external',
+    external: ['better-sqlite3', 'electron', '@parcel/watcher'], logLevel: 'silent',
   })
   const payload = JSON.stringify({
     directory,

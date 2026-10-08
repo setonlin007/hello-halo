@@ -1,7 +1,7 @@
 /** Digital Team REST API routes. Thin delegation to TeamService. */
 import type { Express, Request, Response } from 'express'
 import { getTeamService, getTeamStore } from '../../apps/team'
-import { readTeamMemberMessages } from '../../apps/runtime/app-chat'
+import { readTeamMemberHistory } from '../../apps/runtime/app-chat'
 import { getOfficeCredential } from '../auth/middleware'
 import { resolveOfficeMemberAppIds } from '../identity/office-membership'
 import { createScopeGate } from '../../apps/runtime/federation/authority/scope-gate'
@@ -13,6 +13,7 @@ import {
   joinTeamOffice,
   leaveTeamOffice,
 } from '../../controllers/team-invite.controller'
+import { toMemberMessage } from '../../controllers/team-member-message.controller'
 import type { OfficeScope } from '../../apps/federation/index'
 import type { ImageAttachment } from '../../../shared/types/image-attachment'
 import type {
@@ -346,7 +347,9 @@ export function registerTeamRoutes(app: Express): void {
         res.json({ success: true, data: [] })
         return
       }
-      res.json({ success: true, data: readTeamMemberMessages(appId, teamId, epochId) })
+      const sinceRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : NaN
+      const sinceSeq = Number.isInteger(sinceRaw) && sinceRaw > 0 ? sinceRaw : undefined
+      res.json({ success: true, data: readTeamMemberHistory(appId, teamId, epochId, sinceSeq) })
     } catch (error) {
       res.json({ success: false, error: (error as Error).message })
     }
@@ -398,15 +401,22 @@ export function registerTeamRoutes(app: Express): void {
         }
       }
 
-      const { message, images, thinkingEnabled } = (req.body ?? {}) as {
-        message?: string
+      const { images, thinkingEnabled } = (req.body ?? {}) as {
         images?: ImageAttachment[]
         thinkingEnabled?: boolean
       }
-      if (typeof message !== 'string' || message.length === 0) {
+      // The space names a folder of this machine, so only the owner's own
+      // client may say which one its references were taken in.
+      const built = toMemberMessage({ ...req.body, spaceId: cred ? undefined : req.body?.spaceId })
+      if (!built.ok) {
+        res.status(400).json({ success: false, error: built.error })
+        return
+      }
+      if (built.message.length === 0) {
         res.status(400).json({ success: false, error: 'Missing required field: message' })
         return
       }
+      const message = built.message
       // One chain for send, history and stop (open run epoch → the member's
       // long-lived chat → the latest epoch even when sealed), so a caller that
       // omits epochId writes to, reads from and stops the same conversation.

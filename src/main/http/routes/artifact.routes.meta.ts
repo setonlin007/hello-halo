@@ -11,6 +11,21 @@ export const MODULE: RouteModuleMeta = {
       notes: 'Optional query param maxDepth (default 2) controls how many directory levels deep to list.',
     },
 
+    'GET /api/spaces/:spaceId/artifacts/query': {
+      expose: 'ai',
+      group: 'workspace',
+      summary: 'Search file and folder paths in a space by name',
+      query: '?q=report&limit=50',
+      returns: '{"success":true,"data":{"items":[{"name":"report.md","type":"file","path":"/…","relativePath":"docs/report.md"}],"truncated":false,"indexing":false}}',
+      notes: 'Returns only the best matches (limit defaults to 50). indexing:true means the space is still being indexed and a repeated query may find more; truncated:true means the space has more paths than the index holds.',
+    },
+
+    // Per-client lifetime of a space's watcher and caches; only the renderer calls these.
+    'POST /api/spaces/:spaceId/artifacts/retain': { expose: 'internal' },
+    'POST /api/spaces/:spaceId/artifacts/release': { expose: 'internal' },
+    // Decides which `path:line` mentions in a reply render as links; the agent has its own file tools.
+    'POST /api/spaces/:spaceId/artifacts/resolve': { expose: 'internal' },
+
     'GET /api/spaces/:spaceId/artifacts/tree': {
       expose: 'ai',
       group: 'workspace',
@@ -35,7 +50,13 @@ export const MODULE: RouteModuleMeta = {
     // hands back a .env verbatim too — its own note says so, because nothing in
     // the transport can.
     'GET /api/artifacts/download': { expose: 'internal' },
+    // Download links for the remote page and the phone carry a two-minute ticket
+    // for one file instead of the access token; only the renderer asks for one.
+    'POST /api/artifacts/download-ticket': { expose: 'internal' },
+    'GET /api/artifacts/file/:ticket': { expose: 'internal' },
     'GET /api/spaces/:spaceId/artifacts/download-all': { expose: 'internal' },
+    // A remote client's own file, streamed as the request body; only the composer uses it.
+    'POST /api/spaces/:spaceId/artifacts/upload': { expose: 'internal' },
 
     'GET /api/artifacts/content': {
       expose: 'ai',

@@ -2,8 +2,16 @@
  * createConversationsSlice — conversations slice of the chat store.
  */
 import type { ChatSlice, ChatState } from './internal'
-import { CONVERSATION_CACHE_SIZE, api, createEmptySessionState, createEmptySpaceState } from './internal'
-import type { Conversation, ConversationMeta, Thought, Question } from './internal'
+import { api, createEmptySpaceState } from './internal'
+import type { Conversation, ConversationMeta } from './internal'
+import { readTransition } from './task-read'
+import { useGoalStore } from '../goal.store'
+import { useThinkingLevelStore } from '../thinking-level.store'
+import { useGoalUiStore } from '../goal-ui.store'
+import { cacheConversation } from './backend/cache'
+import { deleteAppChatSession, digitalHumanSpaceId, backendFor, openOnce } from './backend'
+import i18n from '../../i18n'
+import { readEngineSessionState } from './backend/recover'
 
 /**
  * Optimistically write a conversation's knowledgeBaseIds into the cache, then
@@ -47,7 +55,20 @@ async function persistKnowledgeBaseIds(
   }
 }
 
-export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConversations' | 'preloadAllSpaceConversations' | 'createConversation' | 'selectConversation' | 'deleteConversation' | 'renameConversation' | 'toggleStarConversation' | 'setConversationModel' | 'attachKnowledgeBase' | 'detachKnowledgeBase'> = (set, get) => ({
+/** Where a conversation lives, for the verbs that are not handed a space. */
+function refFor(state: ChatState, conversationId: string): { spaceId: string; conversationId: string } | null {
+  const cached = state.conversationCache.get(conversationId)
+  const spaceId = cached?.spaceId
+    ?? [...state.spaceStates].find(([, ss]) => ss.conversations.some(c => c.id === conversationId))?.[0]
+    ?? digitalHumanSpaceId(state, conversationId)
+  return spaceId ? { spaceId, conversationId } : null
+}
+
+function warnNoSpace(action: string, conversationId: string): void {
+  console.warn(`[ChatStore] ${action}: space of ${conversationId} unknown, skipped`)
+}
+
+export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'openConversation' | 'loadEarlierMessages' | 'ensureMessageLoaded' | 'refreshConversation' | 'clearConversation' | 'deleteAppChatSession' | 'loadConversations' | 'preloadAllSpaceConversations' | 'createConversation' | 'selectConversation' | 'deleteConversation' | 'renameConversation' | 'toggleStarConversation' | 'setConversationModel' | 'setConversationReasoningEffort' | 'attachKnowledgeBase' | 'detachKnowledgeBase'> = (set, get) => ({
   setCurrentSpace: (spaceId: string) => {
     set({ currentSpaceId: spaceId })
   },
@@ -74,9 +95,12 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
 
           return { spaceStates: newSpaceStates }
         })
+        return true
       }
+      return false
     } catch (error) {
       console.error('Failed to load conversations:', error)
+      return false
     } finally {
       set({ isLoading: false })
     }
@@ -114,7 +138,10 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
   // Create new conversation
   createConversation: async (spaceId) => {
     try {
-      const response = await api.createConversation(spaceId)
+      // A new conversation starts at the last level picked anywhere, like its
+      // model; set at creation so the warm-up below spawns the session at it.
+      const lastLevel = useThinkingLevelStore.getState().level ?? undefined
+      const response = await api.createConversation(spaceId, undefined, lastLevel)
 
       if (response.success && response.data) {
         const newConversation = response.data as Conversation
@@ -138,22 +165,14 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
           const newSpaceStates = new Map(state.spaceStates)
           const existingState = newSpaceStates.get(spaceId) || createEmptySpaceState()
 
-          // Add to conversation cache (new conversation is full)
-          const newCache = new Map(state.conversationCache)
-          newCache.set(newConversation.id, newConversation)
-
-          // LRU eviction
-          if (newCache.size > CONVERSATION_CACHE_SIZE) {
-            const firstKey = newCache.keys().next().value
-            if (firstKey) newCache.delete(firstKey)
-          }
-
+          // Starting a regular conversation also leaves any digital-human selection.
           newSpaceStates.set(spaceId, {
             conversations: [meta, ...existingState.conversations],
             currentConversationId: newConversation.id
           })
 
-          return { spaceStates: newSpaceStates, conversationCache: newCache }
+          // A new conversation is complete; it enters the cache as the newest entry.
+          return { spaceStates: newSpaceStates, conversationCache: cacheConversation(state, newConversation) }
         })
 
         // Warm up V2 Session for new conversation - non-blocking
@@ -197,26 +216,15 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
       conversationMeta = spaceState.conversations.find((c) => c.id === conversationId)
 
       if (!conversationMeta) {
-        // Still not found after reload — clean up stale pulse state to prevent stuck entries
-        console.log(`[ChatStore] selectConversation: ${conversationId} not found after reload, cleaning up stale state`)
-        set((s) => {
-          const newUnseenCompletions = new Map(s.unseenCompletions)
-          newUnseenCompletions.delete(conversationId)
-          const newPulseReadAt = new Map(s.pulseReadAt)
-          newPulseReadAt.delete(conversationId)
-          return { unseenCompletions: newUnseenCompletions, pulseReadAt: newPulseReadAt }
-        })
+        // An unavailable or incomplete index is not proof of deletion. Main owns gone checks.
+        console.warn(`[ChatStore] Cannot select conversation ${conversationId} in space ${currentSpaceId}: metadata unavailable; task state retained`)
         return
       }
     }
 
-    // Subscribe to conversation events (for remote mode)
-    api.subscribeToConversation(conversationId)
-
-    // Update the pointer + move unseen/error items to readAt grace period.
-    // Persistence (taskMarkRead) happens after set() resolves, since a task
-    // for this conversation may transition here via either branch below.
-    let markReadTask: { spaceId: string; title: string; originalStatus: 'completed-unseen' | 'error' } | null = null
+    // Update the pointer, and move a pending finish/error into the task
+    // panel's read grace period (persisted once set() resolves).
+    let persistRead: (() => void) | undefined
 
     set((state) => {
       const newSpaceStates = new Map(state.spaceStates)
@@ -229,155 +237,85 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
         selectedAppChat: null
       })
 
-      const newUnseenCompletions = new Map(state.unseenCompletions)
-      const newPulseReadAt = new Map(state.pulseReadAt)
-      const newSessions = new Map(state.sessions)
-      const now = Date.now()
-
-      // If this conversation had an unseen completion, move to readAt grace period
-      const unseenInfo = newUnseenCompletions.get(conversationId)
-      if (unseenInfo) {
-        newPulseReadAt.set(conversationId, {
-          readAt: now,
-          originalStatus: 'completed-unseen',
-          spaceId: unseenInfo.spaceId,
-          title: unseenInfo.title
-        })
-        newUnseenCompletions.delete(conversationId)
-        markReadTask = { spaceId: unseenInfo.spaceId, title: unseenInfo.title, originalStatus: 'completed-unseen' }
+      let meta: ConversationMeta | undefined
+      for (const [, ss] of state.spaceStates) {
+        meta = ss.conversations.find(c => c.id === conversationId)
+        if (meta) break
       }
-
-      // If this conversation had an error session, move to readAt grace period and clear session error
-      // The error is now persisted in message.error and will render from MessageItem on reload
-      const session = newSessions.get(conversationId)
-      if (session?.error && session.errorType !== 'interrupted') {
-        // Find conversation meta for title/spaceId
-        let meta: ConversationMeta | undefined
-        for (const [, ss] of state.spaceStates) {
-          meta = ss.conversations.find(c => c.id === conversationId)
-          if (meta) break
-        }
-        const spaceId = meta?.spaceId || currentSpaceId
-        const title = meta?.title || 'Conversation'
-        newPulseReadAt.set(conversationId, {
-          readAt: now,
-          originalStatus: 'error',
-          spaceId,
-          title
-        })
-        // Clear session error — persisted error in message.error handles display after reload
-        newSessions.set(conversationId, {
-          ...session,
-          error: null,
-          errorType: null
-        })
-        markReadTask = { spaceId, title, originalStatus: 'error' }
-      }
-
-      return {
-        spaceStates: newSpaceStates,
-        unseenCompletions: newUnseenCompletions,
-        pulseReadAt: newPulseReadAt,
-        sessions: newSessions
-      }
+      const read = readTransition(state, conversationId, {
+        spaceId: meta?.spaceId || currentSpaceId!,
+        title: meta?.title || 'Conversation'
+      })
+      persistRead = read?.persist
+      return { spaceStates: newSpaceStates, ...read?.patch }
     })
 
-    if (markReadTask) {
-      const { spaceId: taskSpaceId, title: taskTitle, originalStatus } = markReadTask
-      api.taskMarkRead(conversationId, taskSpaceId, taskTitle, originalStatus).catch(err =>
-        console.error('[ChatStore] taskMarkRead error:', err))
-    }
+    persistRead?.()
 
     // Ensure store-level cleanup is scheduled (independent of sidebar mount state)
     get().cleanupPulseReadAt()
 
-    // Load full conversation if not in cache
-    if (!get().conversationCache.has(conversationId)) {
-      set({ isLoadingConversation: true })
-      console.log(`[ChatStore] Loading full conversation: ${conversationId}`)
+    // Read it in (if not cached), pick up a running turn, warm the session.
+    await openOnce({ set, get }, { spaceId: currentSpaceId, conversationId })
+  },
 
-      try {
-        const response = await api.getConversation(currentSpaceId, conversationId)
-        if (response.success && response.data) {
-          const fullConversation = response.data as Conversation
+  // Older page of a paged conversation (digital-human transcripts).
+  loadEarlierMessages: async (conversationId) => {
+    const ref = refFor(get(), conversationId)
+    if (!ref) return warnNoSpace('loadEarlierMessages', conversationId)
+    await backendFor(conversationId).loadEarlier({ set, get }, ref)
+  },
 
-          set((state) => {
-            const newCache = new Map(state.conversationCache)
-            newCache.set(conversationId, fullConversation)
+  ensureMessageLoaded: async (conversationId, messageId) => {
+    const ref = refFor(get(), conversationId)
+    if (!ref) return warnNoSpace('ensureMessageLoaded', conversationId)
+    await backendFor(conversationId).loadThrough({ set, get }, ref, messageId)
+  },
 
-            // LRU eviction
-            if (newCache.size > CONVERSATION_CACHE_SIZE) {
-              const firstKey = newCache.keys().next().value
-              if (firstKey) newCache.delete(firstKey)
-            }
+  // Reconnect: events during the gap are gone, so re-read the conversation and
+  // settle a turn the page still believes is running but the backend finished.
+  refreshConversation: async (conversationId) => {
+    const ref = refFor(get(), conversationId)
+    if (!ref) return warnNoSpace('refreshConversation', conversationId)
+    await backendFor(conversationId).refresh({ set, get }, ref)
 
-            return { conversationCache: newCache, isLoadingConversation: false }
-          })
-          console.log(`[ChatStore] Loaded conversation with ${fullConversation.messages?.length || 0} messages`)
-        } else {
-          set({ isLoadingConversation: false })
-        }
-      } catch (error) {
-        console.error('[ChatStore] Failed to load conversation:', error)
-        set({ isLoadingConversation: false })
-      }
+    if (!get().sessions.get(conversationId)?.isGenerating) return
+    const engine = await readEngineSessionState(conversationId)
+    if (!engine) return
+    if (engine.isActive) {
+      get().handleAgentApiRetry({ spaceId: ref.spaceId, conversationId, retry: engine.apiRetry ?? null })
+    } else {
+      console.log(`[ChatStore] Backend session inactive — settling stale turn for ${conversationId}`)
+      await get().handleAgentComplete({ spaceId: ref.spaceId, conversationId })
     }
+  },
 
-    // Check if this conversation has an active session and recover thoughts
-    try {
-      const response = await api.getSessionState(conversationId)
-      if (response.success && response.data) {
-        const sessionState = response.data as {
-          isActive: boolean
-          thoughts: Thought[]
-          spaceId?: string
-          pendingQuestion?: { id: string; questions: Question[] }
-        }
-
-        // Recover in-flight thoughts so the streaming view rebuilds after a refresh.
-        if (sessionState.isActive && sessionState.thoughts.length > 0) {
-          console.log(`[ChatStore] Recovering ${sessionState.thoughts.length} thoughts for conversation ${conversationId}`)
-
-          set((state) => {
-            const newSessions = new Map(state.sessions)
-            const existingSession = newSessions.get(conversationId) || createEmptySessionState()
-
-            newSessions.set(conversationId, {
-              ...existingSession,
-              isGenerating: true,
-              isThinking: true,
-              thoughts: sessionState.thoughts
-            })
-
-            return { sessions: newSessions }
-          })
-        }
-
-        // Recover an unanswered AskUserQuestion missed by clients that were
-        // disconnected when its one-shot event fired, else the agent stays blocked
-        // with no visible prompt. Reuse handleAskQuestion for an identical result.
-        if (sessionState.isActive && sessionState.pendingQuestion) {
-          console.log(`[ChatStore] Recovering pending question for conversation ${conversationId}`)
-          get().handleAskQuestion({
-            spaceId: sessionState.spaceId ?? '',
-            conversationId,
-            id: sessionState.pendingQuestion.id,
-            questions: sessionState.pendingQuestion.questions,
-          })
-        }
-      }
-    } catch (error) {
-      console.error('[ChatStore] Failed to recover session state:', error)
+  clearConversation: async (conversationId) => {
+    const ref = refFor(get(), conversationId)
+    const backend = backendFor(conversationId)
+    if (!ref || !backend.clear) {
+      console.warn(`[ChatStore] clearConversation: nothing to clear for ${conversationId} (${ref ? 'not clearable' : 'space unknown'})`)
+      return false
     }
+    return backend.clear({ set, get }, ref)
+  },
 
-    // Warm up V2 Session in background - non-blocking
-    // When user sends a message, V2 Session is ready to avoid delay
-    try {
-      api.ensureSessionWarm(currentSpaceId, conversationId)
-        .catch((error) => console.error('[ChatStore] Session warm up failed:', error))
-    } catch (error) {
-      console.error('[ChatStore] Failed to trigger session warm up:', error)
+  deleteAppChatSession: (appId, spaceId, conversationId) =>
+    deleteAppChatSession({ set, get }, { appId, spaceId, conversationId }),
+
+  openConversation: async (conversationId, options) => {
+    const ref = refFor(get(), conversationId)
+    if (!ref) {
+      warnNoSpace('openConversation', conversationId)
+      // Recorded so a page waiting for this conversation stops showing it as loading.
+      set((state) => {
+        const errors = new Map(state.conversationLoadErrors)
+        errors.set(conversationId, i18n.t('Conversation not found'))
+        return { conversationLoadErrors: errors }
+      })
+      return
     }
+    await openOnce({ set, get }, ref, options)
   },
 
   // Delete conversation
@@ -427,6 +365,8 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
             pulseReadAt: newPulseReadAt
           }
         })
+        useGoalStore.getState().forget(conversationId)
+        useGoalUiStore.getState().forget(conversationId)
 
         // Deleting the last conversation would leave the space with no current
         // conversation — every consumer (sendMessage, toolsets, KB) degrades to
@@ -462,6 +402,7 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
             newCache.set(conversationId, {
               ...cached,
               title: newTitle,
+              titleCustomized: true,
               updatedAt: new Date().toISOString()
             })
           }
@@ -474,7 +415,7 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
               ...existingState,
               conversations: existingState.conversations.map((c) =>
                 c.id === conversationId
-                  ? { ...c, title: newTitle, updatedAt: new Date().toISOString() }
+                  ? { ...c, title: newTitle, titleCustomized: true, updatedAt: new Date().toISOString() }
                   : c
               )
             })
@@ -555,6 +496,33 @@ export const createConversationsSlice: ChatSlice<'setCurrentSpace' | 'loadConver
       console.error('Failed to set conversation model:', error)
       return false
     }
+  },
+  // How hard this conversation thinks. Cached optimistically so the slider
+  // follows the drag; reverted if the write fails.
+  setConversationReasoningEffort: async (spaceId, conversationId, level) => {
+    const previous = get().conversationCache.get(conversationId)?.reasoningEffort
+    const apply = (value: typeof level | undefined) => set((state) => {
+      const cached = state.conversationCache.get(conversationId)
+      if (!cached) return state
+      const newCache = new Map(state.conversationCache)
+      newCache.set(conversationId, { ...cached, reasoningEffort: value })
+      return { conversationCache: newCache }
+    })
+    apply(level)
+    try {
+      const response = await api.updateConversation(spaceId, conversationId, { reasoningEffort: level })
+      if (response.success) {
+        // The engine fixes its level at spawn, so the session is rebuilt now
+        // rather than on the next send.
+        api.ensureSessionWarm(spaceId, conversationId)
+          .catch((error) => console.error('[ChatStore] Session warm up failed:', error))
+        return true
+      }
+    } catch (error) {
+      console.error('Failed to set conversation reasoning effort:', error)
+    }
+    apply(previous)
+    return false
   },
   // Knowledge bases (Tlon) loaded into a conversation. Persisted via
   // updateConversation; the cache is updated optimistically so chips re-render.

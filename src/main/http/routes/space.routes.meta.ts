@@ -70,6 +70,50 @@ export const MODULE: RouteModuleMeta = {
       impact: 'reversible',
     },
 
+    'PUT /api/spaces/:spaceId/working-dir': {
+      expose: 'ai',
+      group: 'workspace',
+      summary: 'Point a space at another working directory',
+      body: '{"workingDir":"/absolute/path/to/existing/folder"}',
+      returns: '{"success":true,"data":{...updated space}} | {"success":false,"error":"That folder does not exist."}',
+      impact: 'reversible',
+      notes: 'Confirm with the user first, saying which space’s folder you are changing: its digital humans work in the new folder too, and the files they may send come from there. The folder must already exist, given by its full path, outside Halo’s and the engine’s own data folders; nothing is moved, created or deleted. Conversations keep their history. Refused while a reply, run or background task is going in the space, or while another change of it is under way. The default space cannot be changed.',
+    },
+
+    'GET /api/spaces/:spaceId/preferences': {
+      expose: 'ai',
+      group: 'workspace',
+      summary: 'Read a space\'s preferences (layout, memory settings)',
+      returns: '{"success":true,"data":{"memory":{"enabled":true,"autoConsolidate":true,"cadence":"diligent"}}}',
+      notes: 'Absent memory fields mean the defaults: memory on, auto-consolidation on, cadence "diligent".',
+    },
+
+    'PUT /api/spaces/:spaceId/preferences': {
+      expose: 'ai',
+      group: 'workspace',
+      summary: 'Change a space\'s preferences, e.g. turn its shared memory on or off',
+      body: '{"memory":{"enabled":false}}',
+      returns: '{"success":true,"data":{...updated space}}',
+      impact: 'reversible',
+      notes: 'Merged into what is stored. memory.enabled turns the memory shared by the space\'s conversations on/off (files are kept); memory.autoConsolidate turns automatic consolidation on/off; memory.cadence is "diligent", "balanced" or "economical". Applies to new conversations.',
+    },
+
+    'GET /api/spaces/:spaceId/memory': {
+      expose: 'ai',
+      group: 'workspace',
+      summary: 'Read the state of a space\'s memory',
+      returns: '{"success":true,"data":{"exists":true,"totalBytes":48213,"topicCount":7,"lastConsolidatedAt":"2026-09-26T08:00:00.000Z","lastAttempt":{"at":"…","outcome":"committed"},"consolidating":false}}',
+    },
+
+    'POST /api/spaces/:spaceId/memory/consolidate': {
+      expose: 'ai',
+      group: 'workspace',
+      summary: 'Consolidate a space\'s memory now',
+      returns: '{"success":true,"data":{"started":true}}',
+      impact: 'reversible',
+      notes: 'Returns once started; the work runs in the background and uses the model. started:false with reason "already-running" or "empty". Every consolidation keeps a restorable snapshot.',
+    },
+
     'DELETE /api/spaces/:spaceId': {
       expose: 'ai',
       group: 'workspace',
@@ -104,7 +148,10 @@ export const MODULE: RouteModuleMeta = {
       summary: 'Create an empty conversation',
       body: '{"title":"Weekly report"}',
       returns: '{"success":true,"data":{"id":"<uuid>","title":"Weekly report"}}',
-      notes: 'Creates it empty. Make Halo reply in it with POST /api/agent/message — a conversation you made yourself is the safe target for that, since a turn you start there cannot interrupt one the user is having.',
+      notes: [
+        'Optional body field: reasoningEffort (off|minimal|low|medium|high|xhigh|max) — how hard it thinks; omit to follow the model\'s configured effort. Creates it empty. Make Halo reply in it with POST /api/agent/message — a conversation you made yourself is the safe target for that, since a turn you start there cannot interrupt one the user is having.',
+        'Optional body field: ephemeral (boolean) — for a view that shows the transcript itself (the knowledge base chat): it is left out of every conversation list and search, and deleted at the next start of Halo unless deleted before. Leave it out for a conversation the user should see.',
+      ].join('\n'),
     },
 
     'GET /api/spaces/:spaceId/conversations/:conversationId': {
@@ -162,7 +209,6 @@ export const MODULE: RouteModuleMeta = {
       returns: '{"success":true}',
       impact: 'reversible',
     },
-    'GET /api/spaces/summaries': { expose: 'internal' },
     'POST /api/spaces/:spaceId/forget': { expose: 'internal' },
   },
 }

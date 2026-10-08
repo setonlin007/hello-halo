@@ -9,6 +9,7 @@ import type { AnthropicRequest } from '../types'
 import { decodeBackendConfig, DELEGATED_ROUTING_HEADER } from '../utils'
 import { handleMessagesRequest, handleCountTokensRequest } from './request-handler'
 import { handleResponsesRequest } from './codex-responses-handler'
+import { withCurrentCredentials } from './request-credentials'
 
 export interface RouterOptions {
   debug?: boolean
@@ -31,12 +32,6 @@ export function createApp(options: RouterOptions = {}): Express {
       req.rawBody = buf
     }
   }))
-
-  // Request logging middleware (production-level)
-  app.use((req, _res, next) => {
-    console.log(`[Router] ${req.method} ${req.url}`)
-    next()
-  })
 
   // Health check endpoint
   app.get('/health', (_req, res) => {
@@ -76,6 +71,11 @@ export function createApp(options: RouterOptions = {}): Express {
 
     console.log(`[Router] in_detail endpoint=/v1/messages method=${req.method} url=${req.url} from=${req.ip || ''}:${req.socket?.remotePort ?? ''} backend_host=${(() => { try { return new URL(decodedConfig.url).host } catch { return decodedConfig.url } })()} model_override=${decodedConfig.model || ''} api_type=${decodedConfig.apiType || ''} ts=${Date.now()}`)
 
+    const credentialed = await withCurrentCredentials(decodedConfig)
+    if ('error' in credentialed) {
+      return res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: credentialed.error } })
+    }
+
     // Handle the request
     // Forward all SDK headers for transparent passthrough, excluding hop-by-hop
     // headers and those that will be overridden by fetchAnthropicUpstream.
@@ -95,7 +95,7 @@ export function createApp(options: RouterOptions = {}): Express {
 
     const rawBody = (req as any).rawBody as Buffer | undefined
 
-    await handleMessagesRequest(anthropicRequest, decodedConfig, res, {
+    await handleMessagesRequest(anthropicRequest, credentialed.config, res, {
       debug, timeoutMs, sdkHeaders, queryString, rawBody
     })
   })
@@ -125,9 +125,18 @@ export function createApp(options: RouterOptions = {}): Express {
 
     console.log(`[Router] in_detail endpoint=/v1/responses method=${req.method} url=${req.url} from=${req.ip || ''}:${req.socket?.remotePort ?? ''} backend_host=${(() => { try { return new URL(decodedConfig.url).host } catch { return decodedConfig.url } })()} model_override=${decodedConfig.model || ''} api_type=${decodedConfig.apiType || ''} ts=${Date.now()}`)
 
+    const credentialed = await withCurrentCredentials(decodedConfig)
+    if ('error' in credentialed) {
+      return res.status(401).json({ error: { type: 'authentication_error', message: credentialed.error } })
+    }
+
     // Collect SDK headers so the handler can restore session-affinity headers
     // onto the upstream request.
-    const HOP_BY_HOP = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'authorization'])
+    const HOP_BY_HOP = new Set([
+      'host', 'connection', 'content-length', 'transfer-encoding', 'authorization',
+      // Router-local routing identity; upstream must never see it.
+      DELEGATED_ROUTING_HEADER
+    ])
     const sdkHeaders: Record<string, string> = {}
     for (const [key, value] of Object.entries(req.headers)) {
       if (!HOP_BY_HOP.has(key) && value) {
@@ -135,7 +144,7 @@ export function createApp(options: RouterOptions = {}): Express {
       }
     }
 
-    await handleResponsesRequest(req.body || {}, decodedConfig, res, { debug, timeoutMs, sdkHeaders })
+    await handleResponsesRequest(req.body || {}, credentialed.config, res, { debug, timeoutMs, sdkHeaders })
   })
 
   // Token counting endpoint
@@ -143,6 +152,13 @@ export function createApp(options: RouterOptions = {}): Express {
     const { messages, system, model } = (req.body || {}) as { messages?: unknown; system?: unknown; model?: string }
     const result = handleCountTokensRequest(messages, system, model)
     res.json(result)
+  })
+
+  // Matched routes log their own requests; anything else falls through to
+  // Express's default 404.
+  app.use((req, _res, next) => {
+    console.warn(`[Router] unmatched_route method=${req.method} url=${req.url}`)
+    next()
   })
 
   return app

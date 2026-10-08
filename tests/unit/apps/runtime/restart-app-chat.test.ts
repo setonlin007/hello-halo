@@ -44,7 +44,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 //
 // vi.mock factories are hoisted above top-level statements; use vi.hoisted
 // so the maps and spies are available to the factories.
-const { consumers, v2Sessions, closeV2Session, stopGeneration } = vi.hoisted(() => {
+const { consumers, v2Sessions, closeV2Session, stopGeneration, destroyChatBrowserContext } = vi.hoisted(() => {
   const _consumers = new Map<string, unknown>()
   const _v2Sessions = new Map<string, unknown>()
   return {
@@ -56,6 +56,7 @@ const { consumers, v2Sessions, closeV2Session, stopGeneration } = vi.hoisted(() 
     stopGeneration: vi.fn(async (id: string) => {
       _consumers.delete(id)
     }),
+    destroyChatBrowserContext: vi.fn(),
   }
 })
 
@@ -65,7 +66,7 @@ vi.mock('../../../../src/main/services/agent/session-manager', () => ({
   getConsumerHandle: (id: string) => consumers.get(id) ?? null,
   getRunningConsumerIds: () => Array.from(consumers.keys()),
   // Unused by restartAppChat but referenced by app-chat module-level imports
-  getOrCreateV2Session: vi.fn(),
+  acquireV2Session: vi.fn(),
   markTurnDispatched: vi.fn(),
   updateConsumerDisplayModel: vi.fn(),
 }))
@@ -89,7 +90,7 @@ vi.mock('../../../../src/main/services/agent/helpers', () => ({
 }))
 vi.mock('../../../../src/main/services/agent/sdk-config', () => ({
   resolveCredentialsForSdk: vi.fn(),
-  buildBaseSdkOptions: vi.fn(),
+  buildUserSessionSdkOptions: vi.fn(),
 }))
 vi.mock('../../../../src/main/services/agent/permission-handler', () => ({
   createCanUseTool: vi.fn(),
@@ -106,12 +107,19 @@ vi.mock('../../../../src/main/services/agent/stream-processor', () => ({
 }))
 vi.mock('../../../../src/main/services/agent/message-utils', () => ({
   buildMessageContent: vi.fn(),
+  formatCanvasContext: () => '',
 }))
 
 // AI Browser and other MCP servers — referenced at module load.
 vi.mock('../../../../src/main/services/ai-browser', () => ({
+  AI_BROWSER_SYSTEM_PROMPT: '',
   createAIBrowserMcpServer: vi.fn(),
   createScopedBrowserContext: vi.fn(),
+}))
+vi.mock('../../../../src/main/apps/runtime/app-chat-browser', () => ({
+  acquireChatBrowserContext: vi.fn(),
+  endChatBrowserTurn: vi.fn(),
+  destroyChatBrowserContext,
 }))
 vi.mock('../../../../src/main/services/web-search', () => ({
   createWebSearchMcpServer: vi.fn().mockReturnValue({ _isMcpServer: true }),
@@ -148,12 +156,10 @@ vi.mock('../../../../src/main/apps/runtime/index', () => ({
 
 // dispatch-inbound pulls in analytics → electron-CJS at module load.
 vi.mock('../../../../src/main/apps/runtime/dispatch-inbound', () => ({
-  flushSupplementBuffer: vi.fn(),
 }))
 
-// Memory snapshot — used at module load.
-vi.mock('../../../../src/main/platform/memory/snapshot', () => ({
-  createMemoryStatusMcpServer: vi.fn(),
+vi.mock('../../../../src/main/services/memory-consolidation', () => ({
+  requestConsolidation: vi.fn(),
 }))
 
 // ============================================
@@ -192,6 +198,7 @@ describe('restartAppChat', () => {
     consumers.clear()
     v2Sessions.clear()
     closeV2Session.mockClear()
+    destroyChatBrowserContext.mockClear()
     stopGeneration.mockClear()
   })
 
@@ -355,5 +362,39 @@ describe('restartAppChat', () => {
     // One succeeded — only successful closes are counted.
     expect(result.sessionsClosed).toBe(1)
     expect(closeV2Session).toHaveBeenCalledTimes(2)
+  })
+
+  describe('browser pages', () => {
+    it('a manual restart destroys each closed chat\'s browser context', async () => {
+      const nativeKey = getAppChatConversationId('target-app')
+      const imKey = `${nativeKey}:wecom-bot:direct:user-1`
+      seedSession(nativeKey)
+      seedSession(imKey)
+
+      await restartAppChat('target-app', { interruptActive: true })
+
+      expect(destroyChatBrowserContext.mock.calls.map(c => c[0]).sort()).toEqual([nativeKey, imKey].sort())
+      for (const call of destroyChatBrowserContext.mock.calls) expect(call[1]).toBe('manual-restart')
+    })
+
+    it('an automatic config-change restart leaves the pages alone', async () => {
+      const nativeKey = getAppChatConversationId('target-app')
+      seedSession(nativeKey)
+
+      const result = await restartAppChat('target-app')
+
+      expect(result.sessionsClosed).toBe(1)
+      expect(destroyChatBrowserContext).not.toHaveBeenCalled()
+    })
+
+    it('a deferred active turn keeps its pages', async () => {
+      const nativeKey = getAppChatConversationId('target-app')
+      seedSession(nativeKey)
+      markGenerating(nativeKey)
+
+      await restartAppChat('target-app')
+
+      expect(destroyChatBrowserContext).not.toHaveBeenCalled()
+    })
   })
 })

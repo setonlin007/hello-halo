@@ -2,7 +2,7 @@
  * Space IPC Handlers
  */
 
-import { dialog } from 'electron'
+import { showOpenDialog } from '../foundation/file-dialog'
 import {
   getHaloSpace,
   listSpaces,
@@ -12,14 +12,13 @@ import {
   getSpaceWithPreferences,
   openSpaceFolder,
   updateSpace,
-  updateSpacePreferences,
-  getSpacePreferences,
   reorderSpaces
 } from '../services/space.service'
-import { listSpaceSummaries } from '../controllers/space.controller'
+import * as spaceController from '../controllers/space.controller'
 import { getSpacesDir } from '../foundation/config.service'
 import { spaceRpc } from '../../shared/rpc/contracts/space.contract'
 import { registerRawRpcHandlers } from './rpc'
+import type { MemorySettings } from '../../shared/types/memory'
 
 // Import types for preferences
 interface SpaceLayoutPreferences {
@@ -29,6 +28,7 @@ interface SpaceLayoutPreferences {
 
 interface SpacePreferences {
   layout?: SpaceLayoutPreferences
+  memory?: MemorySettings
 }
 
 export function registerSpaceHandlers(): void {
@@ -114,6 +114,10 @@ export function registerSpaceHandlers(): void {
       }
     },
 
+    // Point the space at another working directory
+    setSpaceWorkingDir: async (spaceId: string, workingDir: string) =>
+      spaceController.changeSpaceWorkingDir(spaceId, workingDir),
+
     // Get default space path
     getDefaultSpacePath: async () => {
       try {
@@ -128,7 +132,7 @@ export function registerSpaceHandlers(): void {
     // Select folder dialog (for custom space location)
     selectFolder: async () => {
       try {
-        const result = await dialog.showOpenDialog({
+        const result = await showOpenDialog({
           title: 'Select Space Location',
           properties: ['openDirectory', 'createDirectory'],
           buttonLabel: 'Select Folder'
@@ -145,27 +149,16 @@ export function registerSpaceHandlers(): void {
       }
     },
 
-    // Update space preferences (layout settings)
-    updateSpacePreferences: async (spaceId: string, preferences: Partial<SpacePreferences>) => {
-      try {
-        const space = updateSpacePreferences(spaceId, preferences)
-        return { success: true, data: space }
-      } catch (error: unknown) {
-        const err = error as Error
-        return { success: false, error: err.message }
-      }
-    },
+    // Preferences and memory go through the same controller as HTTP, so the two
+    // transports answer alike (including for a space that does not exist).
+    updateSpacePreferences: async (spaceId: string, preferences: Partial<SpacePreferences>) =>
+      spaceController.updateSpacePreferences(spaceId, preferences),
 
-    // Get space preferences
-    getSpacePreferences: async (spaceId: string) => {
-      try {
-        const preferences = getSpacePreferences(spaceId)
-        return { success: true, data: preferences }
-      } catch (error: unknown) {
-        const err = error as Error
-        return { success: false, error: err.message }
-      }
-    },
+    getSpacePreferences: async (spaceId: string) => spaceController.getSpacePreferences(spaceId),
+
+    getSpaceMemoryStatus: async (spaceId: string) => spaceController.getSpaceMemoryStatus(spaceId),
+
+    consolidateSpaceMemory: async (spaceId: string) => spaceController.consolidateSpaceMemory(spaceId),
 
     // Reorder spaces (persist user-defined display order)
     reorderSpaces: async (spaceIds: string[]) => {
@@ -190,13 +183,6 @@ export function registerSpaceHandlers(): void {
         return { success: false, error: err.message }
       }
     },
-
-    // Per-space asset counts for the workspace management page. Spans four
-    // domains (apps/skills/conversations/artifacts), so this delegates to
-    // the controller instead of a space.service function — the HTTP route
-    // needs the exact same aggregation, and the controller is the one place
-    // both already share.
-    listSpaceSummaries: async () => listSpaceSummaries(),
   })
 
 }

@@ -15,26 +15,35 @@
  */
 
 import { create } from 'zustand'
+import type { SearchResult } from '../../shared/types/search'
 
 export type SearchScope = 'conversation' | 'space' | 'global'
+export type SearchOpenSurface = 'icon' | 'shortcut' | 'mobile_menu' | 'highlight_bar'
+/** A step through highlight results, which are newest first. */
+export type ResultStep = 'earlier' | 'more-recent'
 
-interface SearchResult {
-  conversationId: string
-  conversationTitle: string
-  messageId: string
-  spaceId: string
-  spaceName: string
-  messageRole: 'user' | 'assistant'
-  messageContent: string
-  messageTimestamp: string
-  matchCount: number
-  contextBefore?: string
-  contextAfter?: string
+export interface ConversationResult {
+  result: SearchResult
+  /** Index in `highlightResults`. */
+  originalIndex: number
+}
+
+/**
+ * The highlight results the bar counts and steps through: those of the
+ * conversation on screen, or all of them when it has none.
+ */
+export function conversationResults(results: SearchResult[], conversationId: string | null): ConversationResult[] {
+  const mapped = results.map((result, originalIndex) => ({ result, originalIndex }))
+  if (!conversationId) return mapped
+  const filtered = mapped.filter(({ result }) => result.conversationId === conversationId)
+  return filtered.length > 0 ? filtered : mapped
 }
 
 interface SearchState {
   // ===== Search Panel State (Full Screen Edit Mode) =====
   isSearchOpen: boolean
+  /** Where the panel was last opened from. */
+  openSurface: SearchOpenSurface
   searchScope: SearchScope
   query: string // Current input value (UI state)
   searchedQuery: string // Query that produced current results (result metadata)
@@ -50,7 +59,7 @@ interface SearchState {
 
   // ===== Actions =====
   // Search panel (edit mode)
-  openSearch: (scope?: SearchScope) => void
+  openSearch: (scope?: SearchScope, surface?: SearchOpenSurface) => void
   closeSearch: () => void
   resetSearch: () => void // Clear search completely (for new search, not for reopening)
   setQuery: (query: string) => void
@@ -65,14 +74,15 @@ interface SearchState {
   showHighlightBar: (query: string, results: SearchResult[], initialIndex?: number) => void
   hideHighlightBar: () => void
   navigateToResultIndex: (index: number) => void
-  goToPreviousResult: () => void
-  goToNextResult: () => void
+  /** One step, circular, through `conversationResults` of the conversation on screen. */
+  stepResult: (step: ResultStep, conversationId: string | null) => void
 }
 
 export const useSearchStore = create<SearchState>((set, get) => ({
   // ===== Initial state =====
   // Search panel
   isSearchOpen: false,
+  openSurface: 'icon',
   searchScope: 'global',
   query: '',
   searchedQuery: '',
@@ -91,9 +101,10 @@ export const useSearchStore = create<SearchState>((set, get) => ({
    * Open search panel without clearing previous search state
    * This preserves query and results when user opens search from highlight bar
    */
-  openSearch: (scope = 'global') =>
+  openSearch: (scope = 'global', surface = 'icon') =>
     set({
       isSearchOpen: true,
+      openSurface: surface,
       searchScope: scope
       // Note: DO NOT clear results/query here - preserve state for user to resume
     }),
@@ -189,6 +200,8 @@ export const useSearchStore = create<SearchState>((set, get) => ({
         messageId: result.messageId,
         spaceId: result.spaceId,
         conversationId: result.conversationId,
+        kind: result.kind,
+        appId: result.appId,
         query: get().highlightQuery,
         resultIndex: validIndex
       }
@@ -197,27 +210,16 @@ export const useSearchStore = create<SearchState>((set, get) => ({
     window.dispatchEvent(event)
   },
 
-  /**
-   * Navigate to previous result (with circular behavior)
-   */
-  goToPreviousResult: () => {
+  stepResult: (step, conversationId) => {
     const { currentResultIndex, highlightResults } = get()
-    if (highlightResults.length === 0) return
+    const list = conversationResults(highlightResults, conversationId)
+    if (list.length < 2) return
 
-    // Circular: if at 0, go to last
-    const nextIndex = currentResultIndex === 0 ? highlightResults.length - 1 : currentResultIndex - 1
-    get().navigateToResultIndex(nextIndex)
-  },
-
-  /**
-   * Navigate to next result (with circular behavior)
-   */
-  goToNextResult: () => {
-    const { currentResultIndex, highlightResults } = get()
-    if (highlightResults.length === 0) return
-
-    // Circular: if at last, go to 0
-    const nextIndex = currentResultIndex === highlightResults.length - 1 ? 0 : currentResultIndex + 1
-    get().navigateToResultIndex(nextIndex)
+    // -1 when the current result is in another conversation: start from either end.
+    const at = list.findIndex(({ originalIndex }) => originalIndex === currentResultIndex)
+    const next = step === 'earlier'
+      ? (at + 1 >= list.length ? 0 : at + 1)
+      : (at - 1 < 0 ? list.length - 1 : at - 1)
+    get().navigateToResultIndex(list[next].originalIndex)
   }
 }))

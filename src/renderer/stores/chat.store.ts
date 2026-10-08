@@ -12,6 +12,8 @@
  * - sessions: Map<conversationId, SessionState> — runtime state per conversation
  */
 import { create } from 'zustand'
+import { api } from '../api'
+import type { MemoryPressureLevel } from '../../shared/types/memory-pressure'
 import { PULSE_READ_GRACE_PERIOD_MS } from './chat/internal'
 import type { ChatState, SpaceState, SessionState } from './chat/internal'
 import type { Conversation, ConversationMeta, SessionInitInfo, PulseItem, TaskStatus } from './chat/internal'
@@ -21,6 +23,13 @@ import { createMessagingSlice } from './chat/messaging'
 import { createAgentEventsSlice } from './chat/agent-events'
 import { createSessionSlice } from './chat/session'
 import { createAppChatSelectionSlice } from './chat/app-chat-selection'
+import { conversationKind, digitalHumanAppId } from './chat/backend'
+import { selectActiveConversationId, selectActiveSession } from './chat/active'
+
+export { selectActiveConversationId, selectActiveConversation, selectActiveSession } from './chat/active'
+export { conversationKind, digitalHumanAppId } from './chat/backend'
+export type { ChatState } from './chat/internal'
+export { holdOpenThoughts } from './chat/open-thoughts'
 
 export const useChatStore = create<ChatState>((set, get) => ({
   spaceStates: new Map<string, SpaceState>(),
@@ -30,12 +39,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   unseenCompletions: new Map<string, { spaceId: string; title: string }>(),
   pulseReadAt: new Map<string, { readAt: number; originalStatus: 'completed-unseen' | 'error'; spaceId: string; title: string }>(),
   currentSpaceId: null,
+  visibleConversationId: null,
   pendingPulseNavigation: null,
   pendingAppChatNavigation: null,
   pendingComposerInput: null,
   artifacts: [],
   isLoading: false,
   isLoadingConversation: false,
+  conversationLoadErrors: new Map<string, string>(),
   composerDrafts: new Map<string, string>(),
   _pulseItems: [],
   _pulseCount: 0,
@@ -65,7 +76,7 @@ function _extractPulseFingerprint(sessions: Map<string, SessionState>): string {
   for (const [id, s] of sessions) {
     // Only include sessions that could produce non-idle status
     if (s.isGenerating || s.pendingToolApproval || s.error || s.pendingQuestion?.status === 'active') {
-      parts.push(`${id}:${s.isGenerating ? 1 : 0}${s.pendingToolApproval ? 1 : 0}${s.error && s.errorType !== 'interrupted' ? 1 : 0}${s.pendingQuestion?.status === 'active' ? 1 : 0}`)
+      parts.push(`${id}:${s.isGenerating ? 1 : 0}${s.pendingToolApproval ? 1 : 0}${s.error && s.errorType !== 'interrupted' && !s.errorSeen ? 1 : 0}${s.pendingQuestion?.status === 'active' ? 1 : 0}`)
     }
   }
   return parts.join('|')
@@ -77,10 +88,6 @@ function _extractPulseFingerprint(sessions: Map<string, SessionState>): string {
 function _computePulseItems(state: ChatState): PulseItem[] {
   const items: PulseItem[] = []
   const addedIds = new Set<string>()
-
-  const getSpaceName = (spaceId: string): string => {
-    return spaceId === 'halo-temp' ? 'Halo' : spaceId
-  }
 
   const findMeta = (conversationId: string): ConversationMeta | undefined => {
     for (const [, ss] of state.spaceStates) {
@@ -96,13 +103,29 @@ function _computePulseItems(state: ChatState): PulseItem[] {
     const status = deriveTaskStatus(session, hasUnseen)
     if (status === 'idle') continue
 
+    // A listed digital-human conversation has no index entry; the task panel
+    // names it and resolves its space from the app.
+    const appId = digitalHumanAppId(conversationId)
+    if (appId) {
+      items.push({
+        conversationId,
+        appId,
+        spaceId: '',
+        title: '',
+        status,
+        starred: false,
+        updatedAt: new Date(session.turnStartedAt ?? Date.now()).toISOString()
+      })
+      addedIds.add(conversationId)
+      continue
+    }
+
     const meta = findMeta(conversationId)
     if (!meta) continue
 
     items.push({
       conversationId,
       spaceId: meta.spaceId,
-      spaceName: getSpaceName(meta.spaceId),
       title: meta.title,
       status,
       starred: !!meta.starred,
@@ -118,8 +141,8 @@ function _computePulseItems(state: ChatState): PulseItem[] {
     const meta = findMeta(conversationId)
     items.push({
       conversationId,
+      appId: digitalHumanAppId(conversationId) ?? undefined,
       spaceId: info.spaceId,
-      spaceName: getSpaceName(info.spaceId),
       title: meta?.title || info.title,
       status: 'completed-unseen',
       starred: !!meta?.starred,
@@ -136,7 +159,6 @@ function _computePulseItems(state: ChatState): PulseItem[] {
       items.push({
         conversationId: conv.id,
         spaceId: conv.spaceId,
-        spaceName: getSpaceName(conv.spaceId),
         title: conv.title,
         status: 'idle',
         starred: true,
@@ -154,8 +176,8 @@ function _computePulseItems(state: ChatState): PulseItem[] {
     if (!info.kept && now - info.readAt >= PULSE_READ_GRACE_PERIOD_MS) continue
     items.push({
       conversationId,
+      appId: digitalHumanAppId(conversationId) ?? undefined,
       spaceId: info.spaceId,
-      spaceName: getSpaceName(info.spaceId),
       title: info.title,
       status: info.originalStatus,
       starred: false,
@@ -232,7 +254,7 @@ function _computePulseCount(state: ChatState): number {
 // Track previous pulse-relevant state to avoid unnecessary recalculations
 let _prevPulseFingerprint = ''
 let _prevUnseenSize = 0
-let _prevPulseReadAtSize = 0
+let _prevPulseReadAtFingerprint = ''
 let _prevStarredFingerprint = ''
 // Last spaceStates the starred fingerprint was built from. Streaming replaces
 // `sessions` on every token but never `spaceStates`, so the walk over every
@@ -258,7 +280,10 @@ function _extractStarredFingerprint(spaceStates: Map<string, SpaceState>): strin
 useChatStore.subscribe((state) => {
   const sessionFingerprint = _extractPulseFingerprint(state.sessions)
   const unseenSize = state.unseenCompletions.size
-  const pulseReadAtSize = state.pulseReadAt.size
+  // Size alone misses "Keep", which flags an existing entry without adding one.
+  let keptCount = 0
+  for (const info of state.pulseReadAt.values()) if (info.kept) keptCount++
+  const pulseReadAtFingerprint = `${state.pulseReadAt.size}:${keptCount}`
   const starredFingerprint = state.spaceStates === _prevSpaceStates
     ? _prevStarredFingerprint
     : _extractStarredFingerprint(state.spaceStates)
@@ -267,7 +292,7 @@ useChatStore.subscribe((state) => {
   if (
     sessionFingerprint === _prevPulseFingerprint &&
     unseenSize === _prevUnseenSize &&
-    pulseReadAtSize === _prevPulseReadAtSize &&
+    pulseReadAtFingerprint === _prevPulseReadAtFingerprint &&
     starredFingerprint === _prevStarredFingerprint
   ) {
     return // No pulse-relevant changes
@@ -275,7 +300,7 @@ useChatStore.subscribe((state) => {
 
   _prevPulseFingerprint = sessionFingerprint
   _prevUnseenSize = unseenSize
-  _prevPulseReadAtSize = pulseReadAtSize
+  _prevPulseReadAtFingerprint = pulseReadAtFingerprint
   _prevStarredFingerprint = starredFingerprint
 
   const newItems = _computePulseItems(state)
@@ -290,7 +315,8 @@ useChatStore.subscribe((state) => {
       item.starred !== currentItems[i]?.starred ||
       item.title !== currentItems[i]?.title ||
       item.updatedAt !== currentItems[i]?.updatedAt ||
-      item.readAt !== currentItems[i]?.readAt
+      item.readAt !== currentItems[i]?.readAt ||
+      item.kept !== currentItems[i]?.kept
     )
 
   if (itemsChanged || newCount !== state._pulseCount) {
@@ -298,19 +324,17 @@ useChatStore.subscribe((state) => {
   }
 })
 
+/** The id of the conversation on screen (the selected digital human's, else the regular one). */
+export function useActiveConversationId(): string | null {
+  return useChatStore(selectActiveConversationId)
+}
+
 /**
- * Selector: Get current session's isGenerating state
- * Use this in components that need to react to generation state changes
+ * Selector: whether the conversation on screen is generating.
+ * Use this in components that need to react to generation state changes.
  */
 export function useIsGenerating(): boolean {
-  return useChatStore((state) => {
-    const spaceState = state.currentSpaceId
-      ? state.spaceStates.get(state.currentSpaceId)
-      : null
-    if (!spaceState?.currentConversationId) return false
-    const session = state.sessions.get(spaceState.currentConversationId)
-    return session?.isGenerating ?? false
-  })
+  return useChatStore((state) => selectActiveSession(state).isGenerating)
 }
 
 /**
@@ -322,7 +346,7 @@ export function deriveTaskStatus(
 ): TaskStatus {
   if (session) {
     if (session.pendingToolApproval || session.pendingQuestion?.status === 'active') return 'waiting'
-    if (session.error && session.errorType !== 'interrupted') return 'error'
+    if (session.error && session.errorType !== 'interrupted' && !session.errorSeen) return 'error'
     if (session.isGenerating) return 'generating'
   }
   if (hasUnseenCompletion) return 'completed-unseen'
@@ -342,7 +366,8 @@ export function useConversationTaskStatus(conversationId: string | undefined): T
 }
 
 /**
- * Selector: Get task statuses for all conversations in the current space.
+ * Selector: Get task statuses for all conversations in the current space, plus
+ * every live digital-human session (callers look those up by their row id).
  * Returns a Map of conversationId -> TaskStatus, only including non-idle entries.
  * This replaces N individual useConversationTaskStatus subscriptions with a single one.
  */
@@ -362,6 +387,16 @@ export function useAllConversationStatuses(): Map<string, TaskStatus> {
         if (status !== 'idle') {
           result.set(conv.id, status)
         }
+      }
+      // Digital-human sessions live outside spaceState.conversations but are
+      // listed beside them, keyed by the same session ids.
+      for (const [id, session] of state.sessions) {
+        if (conversationKind(id) === 'space') continue
+        const status = deriveTaskStatus(session, state.unseenCompletions.has(id))
+        if (status !== 'idle') result.set(id, status)
+      }
+      for (const id of state.unseenCompletions.keys()) {
+        if (conversationKind(id) !== 'space' && !result.has(id)) result.set(id, 'completed-unseen')
       }
       return result
     },
@@ -428,4 +463,17 @@ export function usePulseBeaconStatus(): 'waiting' | 'completed' | 'generating' |
 
     return null
   })
+}
+
+/**
+ * Under critical memory pressure the store keeps only what is on screen or
+ * running (see `backend/cache.ts`). Returns the unsubscribe.
+ */
+export function initChatMemoryPressureListener(): () => void {
+  const onLevel = (level: MemoryPressureLevel) => {
+    if (level === 'critical') useChatStore.getState().shedBackgroundDetail()
+  }
+  void api.getMemoryPressure().then(onLevel).catch((error) =>
+    console.warn('[ChatStore] Could not read memory pressure:', error))
+  return api.onMemoryPressure(({ level }) => onLevel(level))
 }

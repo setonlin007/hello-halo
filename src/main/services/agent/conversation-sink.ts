@@ -15,6 +15,7 @@ import type { TurnSink } from './turn-sink'
 import {
   addMessage,
   updateLastMessage,
+  removeEmptyReplyPlaceholder,
   saveSessionId,
   getConversation
 } from '../conversation.service'
@@ -48,15 +49,18 @@ export function createConversationSink(spaceId: string, conversationId: string):
       notifyTaskComplete(conversation?.title || 'Conversation')
     },
 
-    onTurnError(error: Error, turnStarted: boolean) {
-      // With a placeholder in place we can update it. Without one, system:init
-      // never arrived, so updateLastMessage would corrupt the *previous* turn's
-      // assistant message instead.
-      if (turnStarted) {
-        updateLastMessage(spaceId, conversationId, {
-          content: '',
-          error: error.message,
-        })
+    onConsumerStopped(partial) {
+      if (partial) {
+        persistTurnResult(spaceId, conversationId, partial, 'Chat session ended before the reply completed.')
+      }
+    },
+
+    onTurnError(error: Error, turnStarted: boolean, partial?: StreamResult) {
+      // A failure before init has no placeholder and must not overwrite the previous reply.
+      if (turnStarted && partial) {
+        persistTurnResult(spaceId, conversationId, partial, error.message)
+      } else if (turnStarted) {
+        updateLastMessage(spaceId, conversationId, { error: error.message })
       } else {
         addMessage(spaceId, conversationId, {
           role: 'assistant',
@@ -76,6 +80,7 @@ function persistTurnResult(
   spaceId: string,
   conversationId: string,
   result: StreamResult,
+  error?: string,
 ): void {
   const { finalContent, hasMeaningfulContent, thoughts, tokenUsage, capturedSessionId, hasErrorThought, errorThought } = result
 
@@ -89,8 +94,10 @@ function persistTurnResult(
   // Still persist when only thoughts exist (thinking-only turns) so the
   // reasoning survives a reload.
   const contentToStore = hasMeaningfulContent ? finalContent : ''
+  // The connection and end-of-turn markers are not something the turn produced.
+  const producedThoughts = thoughts.some((t: Thought) => t.type !== 'system' && t.type !== 'result')
 
-  if (contentToStore || hasErrorThought || thoughts.length > 0) {
+  if (contentToStore || hasErrorThought || producedThoughts || error) {
     // Extract file changes summary
     let metadata: { fileChanges?: FileChangesSummary } | undefined
     let sources: KBSource[] | undefined
@@ -121,7 +128,11 @@ function persistTurnResult(
       tokenUsage: tokenUsage || undefined,
       metadata,
       sources,
-      error: errorThought?.content,
+      error: error || errorThought?.content,
     })
+  } else {
+    // Typically stopped before the model said anything: no blank reply is left behind.
+    const outcome = removeEmptyReplyPlaceholder(spaceId, conversationId)
+    console.log(`[Consumer][${conversationId}] Turn produced nothing; reply placeholder ${outcome === 'removed' ? 'removed' : `kept (${outcome})`}`)
   }
 }

@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from '../i18n'
-import { ChevronLeft } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import { Header } from '../components/layout/Header'
 import { SearchIcon } from '../components/search/SearchIcon'
 import { useSearchStore } from '../stores/search.store'
@@ -21,8 +21,9 @@ import { KBList } from '../components/tlon/KBList'
 import { KBDetail } from '../components/tlon/KBDetail'
 import { CreateKBDialog } from '../components/tlon/CreateKBDialog'
 import { EmptyState } from '../components/tlon/EmptyState'
-import { ContentCanvas, TerminalCloseGuard } from '../components/canvas'
+import { CanvasTableOpener, CanvasToggleButton, ContentCanvas, TerminalCloseGuard } from '../components/canvas'
 import { useCanvasIsOpen } from '../stores/canvas.store'
+import { takeEntry, trackHome } from '../services/home-telemetry'
 
 export function TlonPage() {
   const { t } = useTranslation()
@@ -43,6 +44,10 @@ export function TlonPage() {
   const [isDraggingChat, setIsDraggingChat] = useState(false)
   const [dragChatWidth, setDragChatWidth] = useState(effectiveChatWidth)
   const detailRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    trackHome('kb.view', { entry: takeEntry() })
+  }, [])
 
   useEffect(() => {
     if (!isDraggingChat) setDragChatWidth(effectiveChatWidth)
@@ -84,96 +89,101 @@ export function TlonPage() {
   }
 
   return (
-    <div className="h-full flex flex-col bg-background relative">
-      <Header
-        left={
-          <>
-            <span className="text-sm font-semibold text-foreground whitespace-nowrap">{t('Knowledge Base')}</span>
-            <SearchIcon onClick={() => openSearch('global')} />
-          </>
-        }
-      />
+    <CanvasTableOpener>
+      <div className="h-full flex flex-col bg-background relative">
+        <Header
+          left={
+            <>
+              <span className="text-sm font-semibold text-foreground whitespace-nowrap">{t('Knowledge Base')}</span>
+            </>
+          }
+          right={<SearchIcon onClick={() => openSearch('global')} />}
+        />
 
-      {/* Page title area — hidden when on the detail page */}
-      {!selectedKBId && (
-        <div className="px-6 sm:px-10 pt-5 sm:pt-7 flex-shrink-0">
-          <h1 className="text-xl font-semibold mb-1">{t('Knowledge Base')}</h1>
-          <p className="text-[13px] text-muted-foreground mb-5">
-            {t('Maintain knowledge bases; reference with @ in conversations or attach to a digital human.')}
-          </p>
-        </div>
-      )}
-
-      {kbs.length === 0 && !selectedKBId ? (
-        <div className="flex-1 overflow-y-auto">
-          <EmptyState hasKBs={false} onCreate={() => setShowCreate(true)} />
-        </div>
-      ) : selectedKB ? (
-        /* Detail page: replaces the card wall entirely. Desktop and mobile
-           share the same code path — only the ContentCanvas split differs. */
-        <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Back bar */}
-          <div className="flex items-center gap-2 px-3 sm:px-4 py-2 border-b border-border flex-shrink-0">
-            <button
-              onClick={() => selectKB(null)}
-              className="inline-flex items-center gap-1 text-sm text-primary hover:text-primary/80 transition-colors"
-            >
-              <ChevronLeft className="w-4 h-4" />
-              {t('Knowledge Bases')}
-            </button>
+        {/* Page title area — hidden when on the detail page */}
+        {!selectedKBId && (
+          <div className="px-6 sm:px-10 pt-5 sm:pt-7 flex-shrink-0">
+            <h1 className="text-xl font-semibold mb-1">{t('Knowledge Base')}</h1>
+            <p className="text-[13px] text-muted-foreground mb-5">
+              {t('Maintain knowledge bases; load them into a conversation with the Knowledge button in the message box, or attach them to a digital human.')}
+            </p>
           </div>
+        )}
 
-          {/* Detail + optional Content Canvas */}
-          <div className="flex-1 flex overflow-hidden min-h-0">
-            <div
-              ref={detailRef}
-              className="flex flex-col overflow-hidden min-w-0 relative flex-1"
-              style={
-                canvasOpen && !isMobile
-                  ? { width: dragChatWidth, flex: 'none', minWidth: chatWidthMin, maxWidth: chatWidthMax }
-                  : undefined
-              }
-            >
-              <KBDetail kb={selectedKB} onDeleted={() => selectKB(null)} />
+        {kbs.length === 0 && !selectedKBId ? (
+          <div className="flex-1 overflow-y-auto">
+            <EmptyState hasKBs={false} onCreate={() => setShowCreate(true)} />
+          </div>
+        ) : selectedKB ? (
+          /* Detail page: replaces the card wall entirely. Desktop and mobile
+             share the same code path — only the ContentCanvas split differs. */
+          <div className="flex-1 flex flex-col overflow-hidden">
+            {/* Back bar */}
+            <div className="flex items-center gap-2 px-6 sm:px-10 pt-3 flex-shrink-0">
+              <button
+                onClick={() => selectKB(null)}
+                className="inline-flex min-h-8 items-center gap-1.5 text-sm text-muted-foreground transition-colors ease-halo hover:text-primary"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                {t('Knowledge Bases')}
+              </button>
+            </div>
 
-              {/* Resize handle for Content Canvas (desktop only) */}
+            {/* Detail + optional Content Canvas */}
+            <div className="flex-1 flex overflow-hidden min-h-0">
+              <div
+                ref={detailRef}
+                className="flex flex-col overflow-hidden min-w-0 relative flex-1"
+                style={
+                  canvasOpen && !isMobile
+                    ? { width: dragChatWidth, flex: 'none', minWidth: chatWidthMin, maxWidth: chatWidthMax }
+                    : undefined
+                }
+              >
+                <KBDetail kb={selectedKB} onDeleted={() => selectKB(null)} />
+
+                {/* Resize handle for Content Canvas (desktop only) */}
+                {canvasOpen && !isMobile && (
+                  <div
+                    className="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize z-20 hover:bg-primary/50 transition-colors"
+                    onMouseDown={handleChatDragStart}
+                    title={t('Drag to resize')}
+                  />
+                )}
+
+                {/* A collapsed canvas keeps its tabs; this edge handle brings it back */}
+                {!isMobile && <CanvasToggleButton placement="edge" />}
+              </div>
+
+              {/* Content Canvas (desktop: side-by-side; mobile: fullscreen overlay) */}
               {canvasOpen && !isMobile && (
-                <div
-                  className="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize z-20 hover:bg-primary/50 transition-colors"
-                  onMouseDown={handleChatDragStart}
-                  title={t('Drag to resize')}
-                />
+                <div className="flex-1 min-w-0 overflow-hidden">
+                  <ContentCanvas className="h-full" />
+                </div>
               )}
             </div>
 
-            {/* Content Canvas (desktop: side-by-side; mobile: fullscreen overlay) */}
-            {canvasOpen && !isMobile && (
-              <div className="flex-1 min-w-0 overflow-hidden">
+            {/* Mobile: Content Canvas fullscreen overlay */}
+            {canvasOpen && isMobile && (
+              <div className="absolute inset-0 z-30 bg-background">
                 <ContentCanvas className="h-full" />
               </div>
             )}
           </div>
+        ) : (
+          /* Card wall */
+          <KBList onCreate={() => setShowCreate(true)} />
+        )}
 
-          {/* Mobile: Content Canvas fullscreen overlay */}
-          {canvasOpen && isMobile && (
-            <div className="absolute inset-0 z-30 bg-background">
-              <ContentCanvas className="h-full" />
-            </div>
-          )}
-        </div>
-      ) : (
-        /* Card wall */
-        <KBList onCreate={() => setShowCreate(true)} />
-      )}
+        {showCreate && (
+          <CreateKBDialog
+            onClose={() => setShowCreate(false)}
+            onCreated={handleCreated}
+          />
+        )}
 
-      {showCreate && (
-        <CreateKBDialog
-          onClose={() => setShowCreate(false)}
-          onCreated={handleCreated}
-        />
-      )}
-
-      <TerminalCloseGuard />
-    </div>
+        <TerminalCloseGuard />
+      </div>
+    </CanvasTableOpener>
   )
 }

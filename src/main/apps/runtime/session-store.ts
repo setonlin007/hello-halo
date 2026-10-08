@@ -8,81 +8,29 @@
  * of the user's conversation list.
  *
  * Format: one JSON object per line (JSONL), each representing a SDK stream event.
- * On read, events are converted to the renderer's Message format — including
- * the `thoughts[]` array (thinking, tool_use, tool_result) — so that the
- * existing MessageItem component renders them identically to main-chat messages.
+ * On read, events are converted to the shared `TranscriptMessage` format by
+ * session-transcript.ts, and the result is cached per file. The file is
+ * append-only; every read rebuilds messages from it, so a message id must be
+ * derived from file content (see convertEventsToMessages).
  */
 
-import { existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync, fstatSync, statSync, copyFileSync, readSync, rmSync } from 'fs'
 import { join } from 'path'
-import { jsonrepair } from 'jsonrepair'
-import { isTransparentTool } from '../../services/agent/constants'
 import type { TeamTriggerContext } from '../../../shared/apps/team-types'
-import type { ImageAttachment, ImageMediaType } from '../../../shared/types/image-attachment'
-
-// ============================================
-// Types
-// ============================================
-
-/** A serialized SDK stream event stored as a JSONL line */
-export interface StoredEvent {
-  /** Timestamp when the event was captured */
-  _ts: string
-  /** SDK event type (assistant, user, result, system, etc.) */
-  type: string
-  /** Whether this is a synthetic trigger message (not from SDK stream) */
-  _isTrigger?: boolean
-  _teamOrigin?: Pick<TeamTriggerContext, 'kind' | 'correlationId'>
-  /** The SDK message payload */
-  message?: {
-    role?: string
-    content?: unknown
-  }
-  [key: string]: unknown
-}
-
-/**
- * Thought record — mirrors the renderer's Thought interface exactly
- * so MessageItem can render it without any adaptation layer.
- */
-interface ThoughtRecord {
-  id: string
-  type: 'thinking' | 'text' | 'tool_use' | 'tool_result' | 'system' | 'result' | 'error'
-  content: string
-  timestamp: string
-  toolName?: string
-  toolInput?: Record<string, unknown>
-  toolOutput?: string
-  isError?: boolean
-  toolResult?: {
-    output: string
-    isError: boolean
-    timestamp: string
-  }
-}
-
-/** Lightweight thought summary — matches renderer's ThoughtsSummary */
-interface ThoughtsSummaryRecord {
-  count: number
-  types: Partial<Record<string, number>>
-  duration?: number
-}
-
-/**
- * Message record returned to the renderer.
- * Matches renderer's Message interface so MessageItem renders correctly.
- */
-interface MessageRecord {
-  id: string
-  role: 'user' | 'assistant'
-  metadata?: { teamTriggerKind?: string; correlationId?: string }
-  content: string
-  timestamp: string
-  thoughts?: ThoughtRecord[]
-  thoughtsSummary?: ThoughtsSummaryRecord
-  /** Images the user attached to this message (trigger records only) */
-  images?: ImageAttachment[]
-}
+import type { ImageAttachment } from '../../../shared/types/image-attachment'
+import type { ContentReference } from '../../../shared/types/content-reference'
+import type {
+  ChatPushVia,
+  Thought,
+  TranscriptMessage,
+  TranscriptPage,
+  TranscriptPageRequest,
+  TranscriptProvenance,
+} from '../../../shared/types/transcript'
+import { pageTranscript, withThoughtsUnloaded } from '../../../shared/transcript'
+import { createStampedLru } from '../../platform/file-cache'
+import { convertEventsToMessages, type StoredEvent } from './session-transcript'
+import { LineIndex, scanJsonlLines, withFileDescriptor } from './session-file-reader'
 
 // ============================================
 // Writer
@@ -95,8 +43,36 @@ export interface SessionWriter {
    * Write the initial trigger message (before stream starts). Images are
    * stored as base64 image blocks in the trigger content (same trade-off as
    * main-chat conversation JSON) so chat bubbles survive the JSONL reload.
+   *
+   * `provenance` marks a message that did not come from the owner typing into
+   * this conversation (an injection, another conversation, ...). Write the text
+   * to show, not any framed text the model was given. `references` are the
+   * places the user pointed at, kept as records; the expanded block the model
+   * read is not stored.
    */
-  writeTrigger(content: string, images?: ImageAttachment[], teamOrigin?: Pick<TeamTriggerContext, 'kind' | 'correlationId'>): void
+  writeTrigger(
+    content: string,
+    images?: ImageAttachment[],
+    teamOrigin?: Pick<TeamTriggerContext, 'kind' | 'correlationId'>,
+    provenance?: TranscriptProvenance,
+    references?: ContentReference[]
+  ): void
+  /**
+   * Record a message the digital human sent to this chat outside its turns.
+   * Never among a turn's lines: reading the file back takes it as the end of any
+   * turn before it.
+   */
+  writePush(push: RecordedPush): void
+}
+
+/** A message sent to a chat outside its turns, as the chat's record keeps it. */
+export interface RecordedPush {
+  text: string
+  via: ChatPushVia
+  /** When it was sent (ISO); now when omitted */
+  at?: string
+  /** The digital human that sent it, when it is not the chat's own (one linked to the chat) */
+  by?: { appId: string; name: string }
 }
 
 /** Get the directory for run session files */
@@ -137,7 +113,7 @@ export function openSessionWriter(spacePath: string, appId: string, runId: strin
       appendLine({ _ts: new Date().toISOString(), ...event } as StoredEvent)
     },
 
-    writeTrigger(content, images, teamOrigin): void {
+    writeTrigger(content, images, teamOrigin, provenance, references): void {
       const blocks: Array<Record<string, unknown>> = [{ type: 'text', text: content }]
       for (const img of images ?? []) {
         blocks.push({
@@ -151,7 +127,20 @@ export function openSessionWriter(spacePath: string, appId: string, runId: strin
         type: 'user',
         _isTrigger: true,
         ...(teamOrigin ? { _teamOrigin: teamOrigin } : {}),
+        ...(provenance ? { _source: provenance.source } : {}),
+        ...(provenance?.metadata ? { _metadata: provenance.metadata } : {}),
+        ...(references && references.length > 0 ? { _references: references } : {}),
         message: { role: 'user', content: blocks },
+      })
+    },
+
+    writePush({ text, via, at, by }): void {
+      appendLine({
+        _ts: at ?? new Date().toISOString(),
+        type: 'push',
+        _pushVia: via,
+        ...(by ? { _pushedBy: by } : {}),
+        message: { role: 'assistant', content: [{ type: 'text', text }] },
       })
     },
   }
@@ -162,32 +151,303 @@ export function openSessionWriter(spacePath: string, appId: string, runId: strin
 // ============================================
 
 /**
- * Read a run's session JSONL and convert to renderer-compatible Message[].
- *
- * Returns an empty array if the file doesn't exist or is unreadable.
+ * A session file parsed into messages, thoughts included, plus the parse
+ * position so an append is parsed from where the last read stopped. Cached per
+ * file (see `parsedSessions`) so paging and on-demand thought loads do not
+ * re-parse a long transcript on every call. Treat as immutable — it is shared.
  */
-export function readSessionMessages(spacePath: string, appId: string, runId: string): MessageRecord[] {
-  const filePath = getSessionFilePath(spacePath, appId, runId)
-  if (!existsSync(filePath)) return []
+interface ParsedSession {
+  messages: TranscriptMessage[]
+  ino: number
+  /** Bytes consumed, through the last complete line. */
+  endByte: number
+  nextLine: number
+  /** The bytes just before `endByte`; a resume requires them unchanged (the file was appended to, not rewritten). */
+  probe: string
+  events: StoredEvent[]
+  lines: number[]
+}
 
-  let raw: string
-  try {
-    raw = readFileSync(filePath, 'utf8')
-  } catch {
-    return []
+const PROBE_BYTES = 64
+
+function readProbe(fd: number, endByte: number): string {
+  const start = Math.max(0, endByte - PROBE_BYTES)
+  const buffer = Buffer.alloc(endByte - start)
+  readSync(fd, buffer, 0, buffer.length, start)
+  return buffer.toString('base64')
+}
+
+/**
+ * Files up to this size are parsed whole and cached; larger ones are read in
+ * windows through a line index (see `readSessionTranscript`). Also the cache's
+ * weight budget, so a larger file is never retained whole.
+ */
+export const FULL_PARSE_MAX_BYTES = 32 * 1024 * 1024
+/** Bytes read per window of a large file. */
+export const SESSION_WINDOW_BYTES = 8 * 1024 * 1024
+
+// Bounded by file bytes; parsed messages cost 2-3x that on the heap.
+const parsedSessions = createStampedLru<ParsedSession>({ maxEntries: 8, maxWeight: FULL_PARSE_MAX_BYTES })
+
+/** Files already reported unreadable: every read retries, the log says it once. */
+const reportedUnreadable = new Set<string>()
+/** Large files already reported as read whole by a non-paged caller. */
+const reportedWholeReads = new Set<string>()
+
+function reportUnreadable(filePath: string, error: unknown): void {
+  if ((error as NodeJS.ErrnoException).code !== 'ENOENT' && !reportedUnreadable.has(filePath)) {
+    reportedUnreadable.add(filePath)
+    console.warn(`[SessionStore] Cannot read session file ${filePath}; showing it as empty:`, error)
   }
+}
 
-  const lines = raw.split('\n').filter(l => l.trim())
+/**
+ * Parse [start, end) of `fd` into events. Physical line numbers (blank and
+ * malformed lines included) are what message ids derive from, so they never
+ * shift when a line is skipped. A torn final line is a write in progress;
+ * anywhere else an unparsable line is damage.
+ */
+function parseRange(fd: number, filePath: string, start: number, end: number, startLine: number) {
   const events: StoredEvent[] = []
-  for (const line of lines) {
+  const lines: number[] = []
+  const corrupt: number[] = []
+  const scan = scanJsonlLines(fd, start, end, startLine, (text, line) => {
+    if (!text.trim()) return
     try {
-      events.push(JSON.parse(line))
+      events.push(JSON.parse(text))
+      lines.push(line)
     } catch {
-      // Skip malformed lines
+      corrupt.push(line)
+    }
+  })
+  let trailingEvent: { event: StoredEvent; line: number } | null = null
+  if (scan.trailing && scan.trailing.text.trim()) {
+    try {
+      trailingEvent = { event: JSON.parse(scan.trailing.text), line: scan.trailing.line }
+    } catch {
+      // In progress; read again once its newline lands.
     }
   }
+  if (corrupt.length > 0) {
+    console.warn(`[SessionStore] Skipped ${corrupt.length} unreadable line(s) in ${filePath} (first: line ${corrupt[0]})`)
+  }
+  return { events, lines, trailingEvent, endByte: scan.endByte, nextLine: scan.nextLine }
+}
 
-  return convertEventsToMessages(events)
+function toMessages(events: StoredEvent[], lines: number[], trailing: { event: StoredEvent; line: number } | null) {
+  return trailing
+    ? convertEventsToMessages([...events, trailing.event], [...lines, trailing.line])
+    : convertEventsToMessages(events, lines)
+}
+
+/** Parse a whole file, continuing from `previous` when the file only grew since. */
+function parseSessionFile(filePath: string, previous?: ParsedSession): ParsedSession | null {
+  try {
+    return withFileDescriptor(filePath, (fd) => {
+      const { size, ino } = fstatSync(fd)
+      const resume = previous && previous.ino === ino && previous.endByte <= size
+        && readProbe(fd, previous.endByte) === previous.probe
+        ? previous
+        : undefined
+      const parsed = parseRange(fd, filePath, resume?.endByte ?? 0, size, resume?.nextLine ?? 1)
+      const events = resume ? resume.events.concat(parsed.events) : parsed.events
+      const lines = resume ? resume.lines.concat(parsed.lines) : parsed.lines
+      return {
+        messages: toMessages(events, lines, parsed.trailingEvent),
+        ino,
+        endByte: parsed.endByte,
+        nextLine: parsed.nextLine,
+        probe: readProbe(fd, parsed.endByte),
+        events,
+        lines,
+      }
+    })
+  } catch (error) {
+    reportUnreadable(filePath, error)
+    return null
+  }
+}
+
+function sessionFileSize(filePath: string): number | null {
+  try {
+    return statSync(filePath).size
+  } catch (error) {
+    reportUnreadable(filePath, error)
+    return null
+  }
+}
+
+function loadParsedSession(filePath: string): ParsedSession | null {
+  return parsedSessions.get(filePath, (previous) => parseSessionFile(filePath, previous))
+}
+
+function lineIndexPath(filePath: string): string {
+  return filePath.replace(/\.jsonl$/, '.lineidx.json')
+}
+
+/**
+ * Messages of one window of a large file: [start, end) widened to line starts.
+ *
+ * A window that does not begin at the file start may open in the middle of a
+ * turn, so its first message is dropped — the next older window reads it whole.
+ * One turn can be larger than a window, so when dropping it would leave no
+ * complete message the window doubles backwards until one fits (or reaches the
+ * file start): a page is never empty while messages exist. A window placed on a
+ * message's first line (`startsAtMessage`) instead grows forwards until that
+ * message ends inside it.
+ */
+function readWindow(
+  filePath: string,
+  choose: (fd: number, index: LineIndex) => { start: number; end: number; startsAtMessage?: boolean },
+) {
+  return withFileDescriptor(filePath, (fd) => {
+    const index = LineIndex.open(lineIndexPath(filePath), fd)
+    const fileSize = fstatSync(fd).size
+    const chosen = choose(fd, index)
+    let rawStart = chosen.start
+    let end = chosen.end
+    let span = Math.max(1, end - rawStart)
+    for (;;) {
+      const { byte: start, line } = index.lineStartingAtOrAfter(fd, rawStart)
+      const parsed = parseRange(fd, filePath, start, end, line)
+      const trailing = end >= index.indexedBytes ? parsed.trailingEvent : null
+      const messages = toMessages(parsed.events, parsed.lines, trailing)
+      if (chosen.startsAtMessage) {
+        if (messages.length >= 2 || end >= fileSize) return { messages, truncated: start > 0, end }
+        span *= 2
+        end = Math.min(fileSize, start + span)
+        continue
+      }
+      if (start === 0) return { messages, truncated: false, end }
+      if (messages.length >= 2) return { messages: messages.slice(1), truncated: true, end }
+      span *= 2
+      rawStart = Math.max(0, end - span)
+    }
+  })
+}
+
+function lineOfMessageId(messageId: string | undefined): number | null {
+  const match = messageId ? /^session-msg-(\d+)$/.exec(messageId) : null
+  return match ? Number(match[1]) : null
+}
+
+/**
+ * Read a run's session JSONL and convert to renderer-compatible messages, each
+ * with its full thought process.
+ *
+ * Whole-transcript readers belong to small files; a caller that only needs the
+ * recent part passes `limit` (newest `limit` messages) and never pays for the
+ * rest of a large file. Returns an empty array if the file doesn't exist or is
+ * unreadable.
+ */
+export function readSessionMessages(
+  spacePath: string,
+  appId: string,
+  runId: string,
+  options: { limit?: number } = {}
+): TranscriptMessage[] {
+  const filePath = getSessionFilePath(spacePath, appId, runId)
+  const size = sessionFileSize(filePath)
+  if (size === null) return []
+  if (size > FULL_PARSE_MAX_BYTES) {
+    if (options.limit !== undefined) {
+      try {
+        return readWindow(filePath, (_fd, index) => ({
+          start: Math.max(0, index.indexedBytes - SESSION_WINDOW_BYTES),
+          end: size,
+        })).messages.slice(-options.limit)
+      } catch (error) {
+        reportUnreadable(filePath, error)
+        return []
+      }
+    }
+    if (!reportedWholeReads.has(filePath)) {
+      reportedWholeReads.add(filePath)
+      console.warn(`[SessionStore] Whole read of a large transcript (${Math.round(size / 1048576)} MB, not cached): ${filePath}`)
+    }
+  }
+  const messages = loadParsedSession(filePath)?.messages ?? []
+  return options.limit !== undefined ? messages.slice(-options.limit) : [...messages]
+}
+
+/**
+ * One page of a session's transcript, newest first (see `pageTranscript`).
+ * Messages carry `thoughts: null` plus `thoughtsSummary`; load a message's
+ * thought process with `readSessionMessageThoughts`.
+ *
+ * A large file is read one window at a time: the newest window for the first
+ * page, the window ending at `before` for older pages. `total` then counts the
+ * messages read so far, not the whole file.
+ */
+export function readSessionTranscript(
+  spacePath: string,
+  appId: string,
+  runId: string,
+  request: TranscriptPageRequest = {}
+): TranscriptPage {
+  const filePath = getSessionFilePath(spacePath, appId, runId)
+  const size = sessionFileSize(filePath)
+  if (size !== null && size > FULL_PARSE_MAX_BYTES) {
+    try {
+      const beforeLine = lineOfMessageId(request.before)
+      const window = readWindow(filePath, (fd, index) => {
+        const end = beforeLine !== null ? index.offsetOfLine(fd, beforeLine) ?? size : size
+        return { start: Math.max(0, end - SESSION_WINDOW_BYTES), end }
+      })
+      const page = pageTranscript(window.messages, { limit: request.limit, through: request.through })
+      return {
+        ...page,
+        hasMoreBefore: page.hasMoreBefore || window.truncated,
+        messages: page.messages.map(withThoughtsUnloaded),
+      }
+    } catch (error) {
+      reportUnreadable(filePath, error)
+      return pageTranscript([], request)
+    }
+  }
+  const page = pageTranscript(size === null ? [] : loadParsedSession(filePath)?.messages ?? [], request)
+  return { ...page, messages: page.messages.map(withThoughtsUnloaded) }
+}
+
+/** The thought process of one message; empty when the message is unknown or has none. */
+export function readSessionMessageThoughts(
+  spacePath: string,
+  appId: string,
+  runId: string,
+  messageId: string
+): Thought[] {
+  const filePath = getSessionFilePath(spacePath, appId, runId)
+  const size = sessionFileSize(filePath)
+  if (size === null) return []
+  let message: TranscriptMessage | undefined
+  if (size > FULL_PARSE_MAX_BYTES) {
+    const line = lineOfMessageId(messageId)
+    if (line === null) return []
+    try {
+      // The window starts exactly at the message, so it is read whole.
+      message = readWindow(filePath, (fd, index) => {
+        const start = index.offsetOfLine(fd, line) ?? size
+        return { start, end: Math.min(size, start + SESSION_WINDOW_BYTES), startsAtMessage: true }
+      }).messages.find(m => m.id === messageId)
+    } catch (error) {
+      reportUnreadable(filePath, error)
+      return []
+    }
+  } else {
+    message = loadParsedSession(filePath)?.messages.find(m => m.id === messageId)
+  }
+  return message?.thoughts ? [...message.thoughts] : []
+}
+
+/**
+ * Delete a run's transcript and its line index. Only that run's files: the
+ * same folder holds the person's chat transcripts.
+ */
+export function deleteRunTranscript(spacePath: string, appId: string, runId: string): void {
+  const filePath = getSessionFilePath(spacePath, appId, runId)
+  rmSync(filePath, { force: true })
+  rmSync(lineIndexPath(filePath), { force: true })
+  parsedSessions.delete(filePath)
 }
 
 /**
@@ -243,394 +503,11 @@ export function copySessionJsonl(
   try {
     const dir = getRunsDir(spacePath, appId)
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-    writeFileSync(toPath, readFileSync(fromPath, 'utf8'), 'utf8')
+    copyFileSync(fromPath, toPath)
     return true
   } catch (err) {
     console.error(`[SessionStore] Failed to copy transcript ${fromRunId} → ${toRunId}:`, err)
     return false
-  }
-}
-
-// ============================================
-// Event → Message Conversion
-// ============================================
-
-/** Create a thought ID generator scoped to a single convertEventsToMessages() call.
- *  Avoids module-level mutable state that could race under concurrent reads. */
-function createThoughtIdGenerator(): () => string {
-  let idx = 0
-  return () => `session-thought-${++idx}`
-}
-
-// isTransparentTool imported from services/agent/constants — single source of truth.
-
-/**
- * Convert stored SDK events into renderer-compatible Message[] with full thoughts.
- *
- * Strategy — deferred flush, merge per agent turn (aligned with main-space behavior):
- *
- * An automation run's agent loop produces many rounds of:
- *   assistant (thinking + tool_use) → user (tool_result) → assistant (text) → ...
- *
- * The main-space conversation shows each agent turn as a single message bubble
- * with one merged thought-process block. Previously, this function flushed on
- * every assistant text event, producing 5-8 fragmented messages per run.
- *
- * New strategy:
- * 1. Text does NOT trigger a flush. Only a user message (new conversation turn)
- *    or end-of-events triggers a flush.
- * 2. Intermediate text blocks are demoted to 'text' type thoughts visible in the
- *    collapsed thought process (same as stream-processor.ts:586).
- * 3. Text merging follows the main-space rule:
- *    - Consecutive text (no substantive tool in between) → concatenate.
- *    - Substantive tool in between → previous text demoted to thought, replaced.
- * 4. Tool-result user events merge into the corresponding tool_use thought.
- * 5. Non-tool user events (trigger, escalation) flush and start a new turn.
- *
- * Result: one agent turn = one collapsed thought-process block + one message bubble,
- * identical to the main-space rendering.
- */
-export function convertEventsToMessages(events: StoredEvent[]): MessageRecord[] {
-  const generateThoughtId = createThoughtIdGenerator()
-
-  const messages: MessageRecord[] = []
-  let msgIdx = 0
-
-  // Map from SDK tool_use block id → ThoughtRecord reference (for result merging)
-  const toolUseMap = new Map<string, ThoughtRecord>()
-
-  // ── Accumulator: collects thoughts across multiple assistant events ──
-  let pendingThoughts: ThoughtRecord[] = []
-  let lastThoughtTs = ''
-
-  // ── Text merge state (mirrors stream-processor.ts logic) ──
-  // lastText holds the candidate final text for the current turn.
-  // hadSubstantiveTool tracks whether a non-transparent tool appeared since lastText was set.
-  let teamMetadata: MessageRecord['metadata']
-  let lastText = ''
-  let lastTextTs = ''
-  let hadSubstantiveTool = false
-
-  // ── Terminal result fallback ──
-  // Final text + timestamp from the `result` envelope; adopted as bubble
-  // content when a turn reconstructed no assistant text.
-  let pendingResultText = ''
-  let pendingResultTs = ''
-
-  const streamBlocks = new Map<number, {
-    type: 'text' | 'thinking' | 'tool_use'
-    content: string
-    toolName?: string
-    toolId?: string
-    initialToolInput?: Record<string, unknown>
-    thought?: ThoughtRecord
-  }>()
-
-  /** Flush accumulated thoughts + lastText into one assistant Message, then reset state. */
-  function flush(): void {
-    const content = lastText || pendingResultText
-    if (pendingThoughts.length === 0 && !content) return
-
-    const record: MessageRecord = {
-      id: `session-msg-${++msgIdx}`,
-      role: 'assistant',
-      ...(teamMetadata ? { metadata: teamMetadata } : {}),
-      content,
-      timestamp: lastTextTs || lastThoughtTs || pendingResultTs || new Date().toISOString(),
-    }
-
-    if (pendingThoughts.length > 0) {
-      record.thoughts = pendingThoughts
-      record.thoughtsSummary = buildThoughtsSummary(pendingThoughts)
-    }
-
-    messages.push(record)
-
-    // Reset all turn state
-    pendingThoughts = []
-    lastThoughtTs = ''
-    lastText = ''
-    lastTextTs = ''
-    hadSubstantiveTool = false
-    pendingResultText = ''
-    pendingResultTs = ''
-  }
-
-  for (const event of events) {
-    const ts = event._ts || new Date().toISOString()
-
-    // ── User events ──
-    if (event.type === 'user') {
-      const content = event.message?.content
-      const toolResults = extractToolResults(content)
-
-      if (toolResults.length > 0) {
-        // Tool-result user message: merge results into corresponding tool_use thoughts.
-        // These are internal round-trip messages, not visible to the user.
-        for (const tr of toolResults) {
-          const toolThought = toolUseMap.get(tr.toolUseId)
-          if (toolThought) {
-            toolThought.toolResult = {
-              output: tr.output,
-              isError: tr.isError,
-              timestamp: ts,
-            }
-          }
-        }
-      } else {
-        // Normal user message (trigger or escalation response).
-        // Flush the current turn before showing the user message.
-        flush()
-        teamMetadata = event._teamOrigin ? { teamTriggerKind: event._teamOrigin.kind ?? 'human_message', correlationId: event._teamOrigin.correlationId } : undefined
-        const textContent = extractTextContent(content)
-        // Image blocks become bubble attachments only for trigger records (our
-        // own format) — SDK round-trip user events may carry image blocks that
-        // are tool plumbing, not something the user attached.
-        const images = event._isTrigger ? extractImageAttachments(content, msgIdx + 1) : []
-        if (textContent || images.length > 0) {
-          messages.push({
-            id: `session-msg-${++msgIdx}`,
-            role: 'user',
-            ...(teamMetadata ? { metadata: teamMetadata } : {}),
-            content: textContent,
-            timestamp: ts,
-            ...(images.length > 0 ? { images } : {}),
-          })
-        }
-      }
-      continue
-    }
-
-    // ── Token-level stream events (LEGACY Codex adapter persistence) ──
-    //
-    // BACKWARD COMPATIBILITY ONLY. As of the engine-protocol unification
-    // (codex/event-normalizer.ts → aggregateBlock), the Codex adapter emits
-    // top-level `type: 'assistant'`/`type: 'user'` envelopes alongside its
-    // stream_events, and `app-chat.ts` no longer persists stream_events to
-    // JSONL for either engine. New runs therefore reconstruct entirely from
-    // the assistant/user branches above.
-    //
-    // This branch handles JSONL files written BEFORE that change, where
-    // Codex runs persisted stream_events as their sole record of assistant
-    // content. Removing it would break "View process" replay for those
-    // historical runs. Leave it; it is a no-op for new files.
-    if (event.type === 'stream_event') {
-      const streamEvent = event.event as any
-      if (!streamEvent) continue
-      const index = streamEvent.index ?? 0
-
-      if (streamEvent.type === 'content_block_start') {
-        const block = streamEvent.content_block
-        if (block?.type === 'text') {
-          streamBlocks.set(index, { type: 'text', content: block.text || '' })
-        } else if (block?.type === 'thinking') {
-          const thought: ThoughtRecord = {
-            id: generateThoughtId(),
-            type: 'thinking',
-            content: block.thinking || '',
-            timestamp: ts,
-          }
-          pendingThoughts.push(thought)
-          lastThoughtTs = ts
-          streamBlocks.set(index, { type: 'thinking', content: thought.content, thought })
-        } else if (block?.type === 'tool_use') {
-          const thought: ThoughtRecord = {
-            id: generateThoughtId(),
-            type: 'tool_use',
-            content: '',
-            timestamp: ts,
-            toolName: block.name || '',
-            toolInput: block.input || {},
-          }
-          pendingThoughts.push(thought)
-          lastThoughtTs = ts
-          if (!isTransparentTool(block.name || '')) {
-            hadSubstantiveTool = true
-          }
-          if (block.id) {
-            toolUseMap.set(block.id, thought)
-          }
-          streamBlocks.set(index, {
-            type: 'tool_use',
-            content: '',
-            toolName: block.name || '',
-            toolId: block.id,
-            initialToolInput: block.input || {},
-            thought,
-          })
-        }
-        continue
-      }
-
-      if (streamEvent.type === 'content_block_delta') {
-        const blockState = streamBlocks.get(index)
-        if (!blockState) continue
-        const delta = streamEvent.delta
-        if (blockState.type === 'text' && delta?.type === 'text_delta') {
-          blockState.content += delta.text || ''
-        } else if (blockState.type === 'thinking' && delta?.type === 'thinking_delta') {
-          blockState.content += delta.thinking || ''
-          if (blockState.thought) blockState.thought.content = blockState.content
-        } else if (blockState.type === 'tool_use' && delta?.type === 'input_json_delta') {
-          blockState.content += delta.partial_json || ''
-        }
-        continue
-      }
-
-      if (streamEvent.type === 'content_block_stop') {
-        const blockState = streamBlocks.get(index)
-        if (!blockState) continue
-
-        if (blockState.type === 'text' && blockState.content) {
-          if (hadSubstantiveTool) {
-            if (lastText) {
-              pendingThoughts.push({
-                id: generateThoughtId(),
-                type: 'text',
-                content: lastText,
-                timestamp: lastTextTs,
-              })
-            }
-            lastText = blockState.content
-            lastTextTs = ts
-            hadSubstantiveTool = false
-          } else if (lastText) {
-            lastText += '\n\n' + blockState.content
-            lastTextTs = ts
-          } else {
-            lastText = blockState.content
-            lastTextTs = ts
-          }
-        } else if (blockState.type === 'tool_use' && blockState.thought) {
-          blockState.thought.toolInput = blockState.content
-            ? parseToolInput(blockState.content)
-            : (blockState.initialToolInput || {})
-        }
-
-        streamBlocks.delete(index)
-        continue
-      }
-
-      continue
-    }
-
-    // ── Assistant events ──
-    if (event.type === 'assistant') {
-      const content = event.message?.content
-      if (!Array.isArray(content)) continue
-
-      // Extract thinking and tool_use blocks into the accumulator
-      for (const block of content) {
-        if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim()) {
-          pendingThoughts.push({
-            id: generateThoughtId(),
-            type: 'thinking',
-            content: block.thinking,
-            timestamp: ts,
-          })
-          lastThoughtTs = ts
-        }
-
-        if (block.type === 'tool_use') {
-          const thought: ThoughtRecord = {
-            id: generateThoughtId(),
-            type: 'tool_use',
-            content: '',
-            timestamp: ts,
-            toolName: block.name || '',
-            toolInput: block.input || {},
-          }
-          pendingThoughts.push(thought)
-          lastThoughtTs = ts
-
-          // Mark substantive tool — breaks text continuity
-          if (!isTransparentTool(block.name || '')) {
-            hadSubstantiveTool = true
-          }
-
-          if (block.id) {
-            toolUseMap.set(block.id, thought)
-          }
-        }
-      }
-
-      // Handle text output — deferred flush, merge into current turn
-      const textContent = extractTextContent(content)
-      if (textContent) {
-        if (hadSubstantiveTool) {
-          // A substantive tool occurred since last text — previous text was transitional.
-          // Demote it to a 'text' type thought so it remains visible in the thought process.
-          if (lastText) {
-            pendingThoughts.push({
-              id: generateThoughtId(),
-              type: 'text',
-              content: lastText,
-              timestamp: lastTextTs,
-            })
-          }
-          // Replace with current text
-          lastText = textContent
-          lastTextTs = ts
-          hadSubstantiveTool = false
-        } else {
-          // Consecutive text (no substantive tool in between) — concatenate
-          if (lastText) {
-            lastText += '\n\n' + textContent
-          } else {
-            lastText = textContent
-          }
-          lastTextTs = ts
-        }
-      }
-
-      continue
-    }
-
-    // ── Result events: final-text fallback for suppressed assistant text ──
-    //
-    // The Codex event normalizer suppresses the aggregate `assistant` text
-    // envelope in live-UI mode (includePartialMessages=true) so the token-
-    // level stream_event is the sole live bubble source and isn't double-
-    // counted. Digital-human chat persists only the aggregate envelopes (not
-    // stream_event), so such a turn lands in JSONL with thinking/tool
-    // aggregates but no recoverable bubble text. The engine still reports the
-    // turn's final text in `result.result`; adopt it when no text block was
-    // reconstructed. Engine-agnostic: Claude carries text in assistant events,
-    // so `lastText` is already set and this stays inert. Error results are
-    // skipped — emitTerminalError already surfaces the message as assistant text.
-    if (event.type === 'result') {
-      if (event.is_error !== true) {
-        const resultText = typeof event.result === 'string' ? event.result : ''
-        if (resultText) {
-          pendingResultText = resultText
-          pendingResultTs = ts
-        }
-      }
-      continue
-    }
-
-    // Skip 'system' and other metadata events — not displayable messages
-  }
-
-  // Flush any remaining turn (the common case — most runs are a single turn).
-  flush()
-
-  return messages
-}
-
-/**
- * Build a lightweight ThoughtsSummary from an array of thoughts.
- * Used by CollapsedThoughtProcess to display the collapsed header
- * without iterating the full thoughts array in the renderer.
- */
-function buildThoughtsSummary(thoughts: ThoughtRecord[]): ThoughtsSummaryRecord {
-  const types: Partial<Record<string, number>> = {}
-  for (const t of thoughts) {
-    types[t.type] = (types[t.type] || 0) + 1
-  }
-  return {
-    count: thoughts.length,
-    types,
   }
 }
 
@@ -712,63 +589,4 @@ export function deleteChatSessionId(spacePath: string, appId: string, runId: str
   if (!(runId in map)) return
   delete map[runId]
   writeSessionIdMap(spacePath, appId, map)
-}
-
-// ============================================
-// Content Block Extractors
-// ============================================
-
-function extractTextContent(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text || '')
-    .join('')
-}
-
-/**
- * Rebuild image attachments from base64 image blocks in a trigger record.
- *
- * `msgIdx` only seeds the bubble id — the stored block has no id of its own,
- * so it just has to be stable within one read for React keys to hold.
- */
-function extractImageAttachments(content: unknown, msgIdx: number): ImageAttachment[] {
-  if (!Array.isArray(content)) return []
-  return content
-    .filter((b: any) => b.type === 'image' && b.source?.type === 'base64' && b.source.data)
-    .map((b: any, i: number) => ({
-      id: `session-img-${msgIdx}-${i}`,
-      type: 'image' as const,
-      mediaType: (b.source.media_type || 'image/png') as ImageMediaType,
-      data: b.source.data,
-      ...(b._name ? { name: b._name } : {}),
-    }))
-}
-
-function extractToolResults(content: unknown): Array<{ toolUseId: string; output: string; isError: boolean }> {
-  if (!Array.isArray(content)) return []
-  return content
-    .filter((b: any) => b.type === 'tool_result')
-    .map((b: any) => ({
-      toolUseId: b.tool_use_id || '',
-      output: typeof b.content === 'string'
-        ? b.content
-        : Array.isArray(b.content)
-          ? b.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('')
-          : JSON.stringify(b.content ?? ''),
-      isError: !!b.is_error,
-    }))
-}
-
-function parseToolInput(raw: string): Record<string, unknown> {
-  try {
-    return JSON.parse(raw)
-  } catch {
-    try {
-      return JSON.parse(jsonrepair(raw))
-    } catch {
-      return { raw }
-    }
-  }
 }

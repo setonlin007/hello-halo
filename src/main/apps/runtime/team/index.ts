@@ -13,6 +13,8 @@ import { createTeamChecks } from './checks'
 import { createBoardDigest } from './board-digest'
 import { createBoardArchive } from './board-archive'
 import { createTurnReport } from './turn-report'
+import { createTeamFolders } from './team-folder'
+import type { TeamFolders } from './team-folder'
 import type { NoteTurnEndedInput } from './turn-report'
 import type { TeamChecks } from './checks'
 import type { BoardDigest } from './board-digest'
@@ -22,6 +24,7 @@ import type { MessageBus, TurnCompletion, CircuitLimits } from './message-bus'
 import type { Blackboard, BlackboardWriteRecord } from './blackboard'
 import type { TeamPromptContext } from './team-prompt'
 import type { ReadTeamArtifact } from './artifact-read'
+import type { ReadTeamMemberRecord } from './member-record'
 import type { TeamStore } from '../../team'
 import type {
   TeamEpoch,
@@ -42,7 +45,8 @@ import type { ImSessionContext } from '../im-channels/im-prompt'
 import { resolveImFileSend } from '../im-channels/file-send-resolve'
 import type { FileSendFn } from '../im-channels/file-send-mcp'
 import type { ImChannelInstance } from '../../../../shared/types/im-channel'
-import { isAppChatConversationGenerating, injectIntoAppChat } from '../app-chat-live-turn'
+import { beginAppChatTurnStart, isAppChatConversationGenerating, injectIntoAppChat } from '../app-chat-live-turn'
+import { withTurnEndingNote, type AppChatTurnEnding } from '../turn-ending'
 import { getAppManager } from '../../manager'
 import { getSpaceDir } from '../../../services/space.service'
 
@@ -59,6 +63,20 @@ interface ImRoute {
   imSession: ImSessionContext
   /** Undefined for a text-only channel — the same answer dispatch-inbound gets. */
   imFileSend: FileSendFn | undefined
+}
+
+/**
+ * Push to the chat a front desk answers. Nobody waits on a woken turn, so a
+ * push the chat does not take is only logged.
+ */
+function pushToFrontDesk(route: ImRoute, text: string, what: string): void {
+  try {
+    if (!route.instance.pushToChat(route.chatId, text, route.chatType)) {
+      console.warn(`${LOG_TAG} The ${what} was not taken by the IM chat: ${route.chatId}`)
+    }
+  } catch (err) {
+    console.error(`${LOG_TAG} failed to push the ${what} to the IM chat:`, err)
+  }
 }
 
 /**
@@ -148,8 +166,12 @@ export interface TeamRuntime {
    * on this machine — it describes this computer, not the office.
    */
   recordToolAudit(entry: TeamToolAudit): void
+  /** Where each piece of work keeps its in-between files on this machine (see `team-folder.ts`). */
+  teamFolders: TeamFolders
   /** Location-transparent read of a published team artifact (see {@link ReadTeamArtifact}). */
   readArtifact?: ReadTeamArtifact
+  /** Location-transparent read of a member's record for the lead (see {@link ReadTeamMemberRecord}). */
+  readMemberRecord?: ReadTeamMemberRecord
   /**
    * A member's live runtime status (idle/working/waiting_user/error) on this node,
    * derived from its active team sessions. Read-only projection consumed by the
@@ -204,6 +226,18 @@ export interface TeamRuntime {
    * an unchanged answer writes, publishes and announces nothing.
    */
   reconcileAwaitingDecision(appId: string): void
+  /**
+   * The run epoch this machine is executing for the team right now, or null.
+   * The question every trigger guard is really asking — asked of live state,
+   * never of the persisted `currentEpochId`, which outlives the process that
+   * set it and would otherwise refuse every future run.
+   */
+  activeRunEpochId(teamId: string): string | null
+  /**
+   * Seal the runs a previous session left open. Called once at bootstrap,
+   * before triggers are rehydrated. Returns how many were sealed.
+   */
+  recoverInterruptedRuns(): Promise<number>
   /** `instruction` is this run's concrete brief, appended to the lead's start wake. */
   startEpoch(teamId: string, trigger?: TeamRunTrigger, instruction?: string): Promise<TeamEpoch>
   /** Get/create a per-chat long-lived 'conversation' epoch (message-driven entries, e.g. IM). */
@@ -221,8 +255,8 @@ export interface TeamRuntime {
   sealConversationEpoch(teamId: string, epochId: string, endReason?: EpochEndReason, summary?: string | null): Promise<void>
   requestSeal(teamId: string, epochId: string, summary: string): void
   captureReport(correlationId: string, outcome: TurnCompletion): void
-  /** The team layers of a member's system prompt — stable per (team, member). */
-  buildPromptContext(teamId: string, selfAppId: string): TeamPromptContext | null
+  /** The team layers of a member's system prompt — stable per (team, member, epoch). */
+  buildPromptContext(teamId: string, selfAppId: string, epochId: string): TeamPromptContext | null
   /**
    * What this team is called. Separate from `buildPromptContext` because a name
    * is not membership: that one answers null for an app that is not on the
@@ -308,6 +342,12 @@ export interface CreateTeamRuntimeDeps {
    */
   readArtifact?: ReadTeamArtifact
   /**
+   * Location-transparent member-record reader (bootstrap wires it to the chat
+   * transcript store + federation manager). Powers the lead's `team_read_member`
+   * tool. Absent → the tool reports the capability is unavailable.
+   */
+  readMemberRecord?: ReadTeamMemberRecord
+  /**
    * Epoch lifecycle replication capture (open/seal/reopen/rename/outcome).
    * Bootstrap wires it to the federation authority write log so conversations
    * and run history converge office-wide (P0-1). Absent → no replication.
@@ -315,6 +355,11 @@ export interface CreateTeamRuntimeDeps {
   onEpochMutation?: (epoch: TeamEpoch) => void
   /** Resolve pending decisions after the task's local sessions have stopped. */
   onTaskClosed?: (teamId: string, epochId: string) => void
+  /**
+   * An epoch was sealed and persisted. Bootstrap closes its members' idle engine
+   * sessions (a reopened epoch resumes them from the stored session id).
+   */
+  onEpochSealed?: (teamId: string, epochId: string) => void
   /**
    * Persisted unanswered-escalation check (activity store), so waiting_user
    * survives a run seal and a restart (P0-5). Absent → in-memory only.
@@ -357,6 +402,12 @@ export interface CreateTeamRuntimeDeps {
    * dead busy-gate.
    */
   isLeadGenerating: (sessionKey: string) => boolean
+  /**
+   * The directory holding every team folder on this machine. Required for the
+   * same reason as `isLeadGenerating`: its one caller must not be able to forget
+   * it and silently send members back to writing reports into the project.
+   */
+  teamFolderRoot: string
 }
 
 export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
@@ -374,6 +425,7 @@ export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
   // no message can be sent before the runtime finishes constructing.
   let board: Blackboard | null = null
 
+  const teamFolders = createTeamFolders({ store, root: deps.teamFolderRoot })
   const digest = createBoardDigest({ store })
   const archive = createBoardArchive({ store })
   // Printouts are regenerated on demand, so anything left from an earlier run is
@@ -422,6 +474,7 @@ export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
     onTaskClosed: deps.onTaskClosed,
     describeChatKey: deps.describeChatKey,
     getMemberDescription: deps.getMemberDescription,
+    teamFolders,
     renderDigest: (teamId, epochId, viewerAppId) => digest.render({ teamId, epochId, viewerAppId }),
     noteTurnEnded: (input) => turnReport.noteTurnEnded(input),
     // A 'stopped' epoch (pause) is reopenable — noteEpochTurn wakes it back up
@@ -432,6 +485,7 @@ export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
       digest.clearEpoch(epochId)
       archive.clearEpoch(epochId)
       turnReport.clearEpoch(epochId)
+      deps.onEpochSealed?.(teamId, epochId)
     },
   })
 
@@ -491,9 +545,11 @@ export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
     checks,
     digest,
     archive,
+    teamFolders,
     getDelegatedPolicy: (teamId, appId) => store.getMember(teamId, appId)?.delegatedPolicy ?? null,
     recordToolAudit: (entry) => store.insertToolAudit(entry),
     ...(deps.readArtifact ? { readArtifact: deps.readArtifact } : {}),
+    ...(deps.readMemberRecord ? { readMemberRecord: deps.readMemberRecord } : {}),
     getMemberStatus: memberStatus,
     getObservableStatus: (teamId) => orchestration!.getObservableStatus(teamId),
     getMemberBusy: (appId, teamId) => orchestration!.getMemberBusy(appId, teamId),
@@ -505,6 +561,8 @@ export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
       turnReport.noteTurnEnded(params)
     },
     reconcileAwaitingDecision: (appId) => orchestration!.reconcileAwaitingDecision(appId),
+    activeRunEpochId: (teamId) => orchestration!.activeRunEpochId(teamId),
+    recoverInterruptedRuns: () => orchestration!.recoverInterruptedRuns(),
     startEpoch: (teamId, trigger, instruction) => orchestration!.startEpoch(teamId, trigger, instruction),
     ensureConversationEpoch: (teamId, chatKey, title, createdBy, entryAppId) =>
       orchestration!.ensureConversationEpoch(teamId, chatKey, title, createdBy, entryAppId),
@@ -521,6 +579,7 @@ export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
       digest.clearEpoch(epochId)
       archive.clearEpoch(epochId)
       turnReport.clearEpoch(epochId)
+      deps.onEpochSealed?.(teamId, epochId)
     },
     sealEpoch: (teamId, reason, summary) => orchestration!.sealEpoch(teamId, reason, summary),
     sealConversationEpoch: async (teamId, epochId, reason, summary) => {
@@ -529,8 +588,8 @@ export function createTeamRuntime(deps: CreateTeamRuntimeDeps): TeamRuntime {
     },
     requestSeal: (teamId, epochId, summary) => orchestration!.requestSeal(teamId, epochId, summary),
     captureReport: (correlationId, outcome) => orchestration!.captureReport(correlationId, outcome),
-    buildPromptContext: (teamId, selfAppId) =>
-      orchestration!.buildPromptContext(teamId, selfAppId),
+    buildPromptContext: (teamId, selfAppId, epochId) =>
+      orchestration!.buildPromptContext(teamId, selfAppId, epochId),
     getTeamName: (teamId) => store.getTeamById(teamId)?.name ?? null,
     describeTaskSource: (teamId, epochId) => {
       const team = store.getTeamById(teamId)
@@ -566,30 +625,43 @@ export function createDefaultSessionDeps(store: TeamStore): OrchestrationSession
       // Held in a box, not a `let`: the assignment happens inside `onReply`, which
       // TypeScript's flow analysis does not see, so a plain local reads as `null`
       // below and silently types the IM push away.
-      const captured: { reply: string | null } = { reply: null }
-      await sendAppChatMessage({
-        appId: request.appId,
-        spaceId: request.spaceId,
-        message: request.message,
-        conversationId: request.conversationId,
-        teamContext: request.teamContext,
-        // Both halves of the IM route, or neither: the framing and the tool set
-        // must match what dispatch-inbound gives this same session.
-        ...(imRoute ? { imSession: imRoute.imSession, imFileSend: imRoute.imFileSend } : {}),
-        onReply: (finalContent) => {
-          captured.reply = finalContent
-        },
-      })
+      const captured: { reply: string | null; ending?: AppChatTurnEnding } = { reply: null }
+      try {
+        await sendAppChatMessage({
+          appId: request.appId,
+          spaceId: request.spaceId,
+          message: request.message,
+          conversationId: request.conversationId,
+          teamContext: request.teamContext,
+          ...(request.turnStart ? { turnStart: request.turnStart } : {}),
+          // Both halves of the IM route, or neither: the framing and the tool set
+          // must match what dispatch-inbound gives this same session.
+          ...(imRoute ? { imSession: imRoute.imSession, imFileSend: imRoute.imFileSend } : {}),
+          onReply: (finalContent, ending) => {
+            captured.reply = finalContent
+            captured.ending = ending
+          },
+        })
+      } catch (err) {
+        // The chat is told as of a failed turn of its own; the team still gets
+        // the failure. Loaded on use, as the turn itself is.
+        if (imRoute) {
+          await import('../im-error-reply')
+            .then(({ imErrorReply }) => pushToFrontDesk(imRoute, imErrorReply(err), 'note that the turn failed'))
+            .catch(loadError => console.error(`${LOG_TAG} could not tell the IM chat its turn failed:`, loadError))
+        }
+        throw err
+      }
 
       const finalMessage = captured.reply
-      if (imRoute && finalMessage && finalMessage.trim()) {
-        try {
-          await imRoute.instance.pushToChat(imRoute.chatId, finalMessage, imRoute.chatType)
-        } catch (err) {
-          console.error(`${LOG_TAG} failed to push front-desk reply to IM chat:`, err)
-        }
-      }
+      // The chat reads a turn that stopped short the way a person's own turn
+      // reads in dispatch-inbound; the team gets the text as written.
+      const pushed = captured.ending ? withTurnEndingNote(finalMessage ?? '', captured.ending) : finalMessage
+      if (imRoute && pushed && pushed.trim()) pushToFrontDesk(imRoute, pushed, 'front-desk reply')
       return { finalMessage }
+    },
+    holdTurn(sessionKey) {
+      return beginAppChatTurnStart(sessionKey)
     },
     isSessionActive(sessionKey) {
       // A team turn runs through app-chat's consumer model, which never writes
@@ -652,6 +724,7 @@ export {
   createTeamArtifactOpener,
   createLocalArtifactResolver,
   createLocalArtifactPathResolver,
+  createMemberWorkDirResolver,
   defaultSharedCopyRoot,
   pruneSharedFileCopies,
   RemoteArtifactError,
@@ -662,8 +735,17 @@ export type {
   TeamArtifactReadResult,
   RemoteArtifactFailure,
 } from './artifact-read'
-export { resolveArtifactRef } from './artifact-path'
+export { createTeamMemberRecordReader, renderMemberRecord, MEMBER_RECORD_PAGE_CHARS } from './member-record'
+export type {
+  ReadTeamMemberRecord,
+  TeamMemberRecordResult,
+  MemberRecordLine,
+  RemoteRecordRow,
+} from './member-record'
+export { resolveArtifactRef, resolvePublishedRef } from './artifact-path'
 export type { ArtifactRefResolution, ArtifactRefRejection } from './artifact-path'
+export { teamFolderDir } from './team-folder'
+export type { TeamFolders, TeamFolderPaths } from './team-folder'
 export { createTeamTriggerScheduler, TEAM_JOB_KIND } from './team-triggers'
 export type { TeamTriggerScheduler } from './team-triggers'
 export { TEAM_CHECK_JOB_KIND, TeamCheckError, describeSchedule, renderCheckWake } from './checks'

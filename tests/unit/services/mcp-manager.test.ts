@@ -5,10 +5,10 @@
  * into per-server groups.
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 
 // Mock heavy dependencies that mcp-manager.ts imports transitively
-vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
+vi.mock('../../../src/main/services/agent/resolved-sdk', () => ({
   query: vi.fn()
 }))
 vi.mock('../../../src/main/foundation/config.service', () => ({
@@ -31,9 +31,11 @@ vi.mock('../../../src/main/services/agent/helpers', () => ({
 vi.mock('../../../src/main/services/agent/events', () => ({
   emitAgentBroadcast: vi.fn()
 }))
+const sdk = vi.hoisted(() => ({ resolveCredentialsForSdk: vi.fn(), buildSdkEnv: vi.fn() }))
 vi.mock('../../../src/main/services/agent/sdk-config', () => ({
   getCleanUserEnv: vi.fn(() => ({})),
-  resolveCredentialsForSdk: vi.fn()
+  resolveCredentialsForSdk: sdk.resolveCredentialsForSdk,
+  buildSdkEnv: sdk.buildSdkEnv,
 }))
 const { track } = vi.hoisted(() => ({ track: vi.fn().mockResolvedValue(undefined) }))
 vi.mock('../../../src/main/services/analytics/analytics.service', () => ({
@@ -44,11 +46,14 @@ import {
   broadcastMcpStatus,
   getCachedMcpStatus,
   groupToolsByMcpServer,
+  onMcpServerRecovered,
   removeServerStatus,
   testMcpConnections,
   updateServerStatus
 } from '../../../src/main/services/agent/mcp-manager'
-import { getApiCredentials } from '../../../src/main/services/agent/helpers'
+import { getApiCredentials, getDbMcpServers } from '../../../src/main/services/agent/helpers'
+import { query } from '../../../src/main/services/agent/resolved-sdk'
+import type { ApiCredentials } from '../../../src/main/services/agent/types'
 
 describe('groupToolsByMcpServer', () => {
   it('groups MCP tools by server name', () => {
@@ -188,6 +193,66 @@ describe('MCP status derivation', () => {
   })
 })
 
+describe('MCP recovery notifications', () => {
+  const recovered = vi.fn()
+  let unsubscribe: () => void = () => {}
+
+  afterEach(() => {
+    unsubscribe()
+    recovered.mockReset()
+    for (const s of [...getCachedMcpStatus()]) removeServerStatus(s.name)
+  })
+
+  function listen(): void {
+    unsubscribe = onMcpServerRecovered(recovered)
+  }
+
+  it('reports a failed server that a probe then connects', () => {
+    broadcastMcpStatus([{ name: 'srv', status: 'failed' }])
+    listen()
+
+    updateServerStatus('srv', { status: 'connected' })
+
+    expect(recovered).toHaveBeenCalledTimes(1)
+    expect(recovered).toHaveBeenCalledWith('srv')
+  })
+
+  it('reports a failed server that another session connects, after the cache is updated', () => {
+    broadcastMcpStatus([{ name: 'srv', status: 'failed' }])
+    let statusSeen: string | undefined
+    recovered.mockImplementation(() => {
+      statusSeen = getCachedMcpStatus().find(s => s.name === 'srv')?.status
+    })
+    listen()
+
+    broadcastMcpStatus([{ name: 'srv', status: 'connected' }, { name: 'down', status: 'failed' }])
+
+    expect(recovered.mock.calls).toEqual([['srv']])
+    expect(statusSeen).toBe('connected')
+  })
+
+  it('stays quiet while a server keeps its status or fails', () => {
+    broadcastMcpStatus([{ name: 'srv', status: 'connected' }])
+    listen()
+
+    broadcastMcpStatus([{ name: 'srv', status: 'connected' }])
+    updateServerStatus('srv', { status: 'connected' })
+    updateServerStatus('srv', { status: 'failed', errorDetail: 'ECONNREFUSED' })
+
+    expect(recovered).not.toHaveBeenCalled()
+  })
+
+  it('stops reporting after unsubscribe', () => {
+    broadcastMcpStatus([{ name: 'srv', status: 'failed' }])
+    listen()
+    unsubscribe()
+
+    updateServerStatus('srv', { status: 'connected' })
+
+    expect(recovered).not.toHaveBeenCalled()
+  })
+})
+
 // ============================================
 // testMcpConnections() telemetry
 // ============================================
@@ -195,8 +260,42 @@ describe('MCP status derivation', () => {
 describe('testMcpConnections telemetry', () => {
   const credentialsMock = getApiCredentials as ReturnType<typeof vi.fn>
 
+  beforeEach(() => {
+    sdk.resolveCredentialsForSdk.mockImplementation(async (credentials: ApiCredentials) => ({
+      anthropicBaseUrl: credentials.baseUrl, anthropicApiKey: credentials.apiKey, sdkModel: credentials.model,
+      capabilities: credentials.capabilities, sourceId: credentials.sourceId,
+    }))
+    sdk.buildSdkEnv.mockReturnValue({})
+  })
+
   afterEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('forwards the captured account and capabilities to the query without reconstructing them', async () => {
+    vi.useFakeTimers()
+    const credentials: ApiCredentials = {
+      provider: 'anthropic', sourceId: 'account-a', credentialsGeneration: 'captured-a',
+      baseUrl: 'https://example.invalid/v1/messages', apiKey: 'test-account-a', model: 'test-model-a',
+      customHeaders: { 'x-account-id': 'account-a' }, supportsVision: false,
+      capabilities: { contextWindow: 100_000, maxOutputTokens: 64_000, maxOutputTokensConfigured: true },
+    }
+    credentialsMock.mockResolvedValue(credentials)
+    vi.mocked(getDbMcpServers).mockReturnValue({ srv: { type: 'stdio', command: 'test-mcp' } })
+    vi.mocked(query).mockImplementation(async function* () {
+      yield { type: 'system', mcp_servers: [{ name: 'srv', status: 'connected' }] }
+    })
+    try {
+      expect(await testMcpConnections()).toMatchObject({ success: true, servers: [{ name: 'srv', status: 'connected' }] })
+      expect(credentialsMock).toHaveBeenCalledTimes(1)
+      const options = vi.mocked(query).mock.calls[0][0].options
+      expect(options.apiCredentials).toBe(credentials)
+      expect(options.credentialsGeneration).toBe('captured-a')
+    } finally {
+      removeServerStatus('srv')
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
   })
 
   it('does not report any event when no API key is configured', async () => {
@@ -227,5 +326,65 @@ describe('testMcpConnections telemetry', () => {
 
     releaseFirstCall?.()
     await firstCall
+  })
+})
+
+describe('testMcpConnections environment', () => {
+  const credentials: ApiCredentials = {
+    provider: 'oauth', sourceId: 'account-a', credentialsGeneration: 'captured-a',
+    baseUrl: 'https://example.invalid/v1/messages', apiKey: 'token-a', model: 'model-a',
+    capabilities: { contextWindow: 200_000, maxOutputTokens: 32_000, maxOutputTokensConfigured: false },
+  }
+  const builtEnv = { CLAUDE_CONFIG_DIR: '/halo/claude-config', NO_PROXY: 'localhost,127.0.0.1,[::1],.weixin.qq.com' }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.mocked(getApiCredentials).mockResolvedValue(credentials)
+    vi.mocked(getDbMcpServers).mockReturnValue({ srv: { type: 'stdio', command: 'test-mcp' } })
+    vi.mocked(query).mockImplementation(async function* () {
+      yield { type: 'system', mcp_servers: [{ name: 'srv', status: 'connected' }] }
+    })
+    sdk.buildSdkEnv.mockReturnValue(builtEnv)
+  })
+
+  afterEach(() => {
+    removeServerStatus('srv')
+    vi.clearAllTimers()
+    vi.useRealTimers()
+    vi.clearAllMocks()
+  })
+
+  it('starts the test process with the environment a conversation gets', async () => {
+    sdk.resolveCredentialsForSdk.mockResolvedValue({
+      anthropicBaseUrl: 'http://127.0.0.1:3457', anthropicApiKey: 'encoded-a', sdkModel: 'model-a',
+      capabilities: credentials.capabilities, sourceId: 'account-a',
+    })
+
+    await testMcpConnections()
+
+    expect(sdk.resolveCredentialsForSdk).toHaveBeenCalledWith(credentials)
+    expect(sdk.buildSdkEnv).toHaveBeenCalledWith({
+      anthropicApiKey: 'encoded-a', anthropicBaseUrl: 'http://127.0.0.1:3457', delegatedRoutingHeader: undefined,
+      capabilities: credentials.capabilities, sourceId: 'account-a',
+      // The servers under test are part of the proxy policy they are tested under.
+      mcpServers: { srv: { type: 'stdio', command: 'test-mcp' } },
+    })
+    const options = vi.mocked(query).mock.calls[0][0].options
+    expect(options.env).toBe(builtEnv)
+    expect(options).toMatchObject({ apiKey: 'encoded-a', model: 'model-a', anthropicBaseUrl: 'http://127.0.0.1:3457' })
+  })
+
+  it('gives a source signed in through the Claude Code CLI no key, as its conversations get none', async () => {
+    sdk.resolveCredentialsForSdk.mockResolvedValue({
+      anthropicBaseUrl: 'http://127.0.0.1:3457', anthropicApiKey: '', sdkModel: 'claude-model',
+      delegatedRoutingHeader: 'x-halo-backend: encoded', capabilities: credentials.capabilities, sourceId: 'account-a',
+    })
+
+    await testMcpConnections()
+
+    expect(sdk.buildSdkEnv).toHaveBeenCalledWith(expect.objectContaining({ delegatedRoutingHeader: 'x-halo-backend: encoded' }))
+    const options = vi.mocked(query).mock.calls[0][0].options
+    expect(options).not.toHaveProperty('apiKey')
+    expect(options.env).toBe(builtEnv)
   })
 })

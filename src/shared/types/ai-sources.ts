@@ -17,7 +17,7 @@
 
 import { v4 as uuidv4 } from 'uuid'
 import type { CatalogModelCapability, ModelCapabilityOverride } from './model-capabilities'
-import type { ReasoningEffortSetting } from '../constants/reasoning-effort'
+import type { ReasoningEffortLevel, ReasoningEffortSetting } from '../constants/reasoning-effort'
 
 // ============================================================================
 // Localization Utilities
@@ -130,6 +130,11 @@ export interface ModelOption {
  */
 export const AVAILABLE_MODELS: ModelOption[] = [
   {
+    id: 'claude-sonnet-5-5',
+    name: 'Claude Sonnet 5.5',
+    description: 'Best combination of speed and intelligence, suitable for most tasks'
+  },
+  {
     id: 'claude-sonnet-5',
     name: 'Claude Sonnet 5',
     description: 'Best combination of speed and intelligence, suitable for most tasks'
@@ -152,11 +157,6 @@ export const AVAILABLE_MODELS: ModelOption[] = [
   {
     id: 'claude-opus-5',
     name: 'Claude Opus 5',
-    description: 'Most capable model for complex agentic coding and enterprise work'
-  },
-  {
-    id: 'claude-opus-4-8',
-    name: 'Claude Opus 4.8',
     description: 'Most capable model for complex agentic coding and enterprise work'
   },
   {
@@ -196,8 +196,34 @@ export function resolveModelId(model?: string | null): string {
 export interface AISourceUser {
   name: string
   avatar?: string
-  /** User ID (for API headers, should be ASCII-safe) */
+  /** Verified stable account identity, separate from provider-owned routing context. */
   uid?: string
+}
+
+/** Only fields consumed by the ChatGPT picker and request adapter are cached. */
+export interface CodexCatalogEntry {
+  slug: string
+  display_name?: string
+  visibility?: string
+  priority?: number
+  input_modalities?: string[]
+  context_window?: number
+  supports_reasoning_summary_parameter?: boolean
+  use_responses_lite?: boolean
+  /** Effort levels the model accepts (the wire's `{ effort }` presets, flattened). */
+  supported_reasoning_levels?: string[]
+}
+
+export interface ModelCatalogCache {
+  provider: 'chatgpt'
+  version: 1
+  fetchedAt: string
+  entries: CodexCatalogEntry[]
+}
+
+export interface ModelRefreshSummary {
+  degradedSourceIds: string[]
+  failedSourceIds: string[]
 }
 
 /**
@@ -218,6 +244,10 @@ export interface AISource {
   // ===== API Configuration (Required) =====
   /** API endpoint URL (base URL, e.g., https://api.openai.com/v1) */
   apiUrl: string
+  /** Provider-owned workspace used for account routing, separate from user identity. */
+  accountId?: string
+  /** Provider-owned account routing context (Kiro Desktop). */
+  profileArn?: string
   /** API type for OpenAI compatible providers (default: chat_completions) */
   apiType?: 'chat_completions' | 'responses' | 'anthropic_passthrough' | 'kiro'
 
@@ -239,6 +269,8 @@ export interface AISource {
   model: string
   /** Available models list (at least one required) */
   availableModels: ModelOption[]
+  /** Last successful remote overlay, including explicitly hidden models. */
+  modelCatalogCache?: ModelCatalogCache
 
   // ===== Metadata (Required) =====
   /** Creation timestamp (ISO 8601) */
@@ -292,11 +324,18 @@ export interface AISourcesConfig {
  * Legacy OAuth source configuration (v1)
  */
 export interface OAuthSourceConfig {
+  sourceId?: string
+  apiUrl?: string
+  accountId?: string
+  profileArn?: string
   loggedIn: boolean
   user?: AISourceUser
   model: string
   availableModels: string[]
   modelNames?: Record<string, string>
+  modelCapabilities?: Record<string, CatalogModelCapability>
+  modelVision?: Record<string, boolean>
+  modelCatalogCache?: ModelCatalogCache
   accessToken?: string
   refreshToken?: string
   tokenExpires?: number
@@ -357,7 +396,15 @@ export interface DirectCallEndpoint {
  * Configuration for making API requests
  * Used by OpenAI compat router
  */
+export interface CodexModelCapability {
+  reasoningSummary: boolean
+  responsesLite: boolean
+  reasoningLevels?: readonly string[]
+}
+
 export interface BackendRequestConfig {
+  sourceId?: string
+  codexModelCapabilities?: CodexModelCapability
   url: string
   key: string
   model?: string
@@ -385,6 +432,15 @@ export interface BackendRequestConfig {
    */
   reasoningEffort?: ReasoningEffortSetting
   /**
+   * Level picked for this session — a conversation's or digital human's own
+   * level, or one an API send carried — which wins over `reasoningEffort`.
+   * It rides here because the engine cannot state it on the wire: Claude Code
+   * sends a non-Claude model only an adaptive thinking block. A Halo ladder
+   * level, not a value typed for this model, so the converter clamps it to
+   * what the upstream accepts.
+   */
+  pickedReasoningEffort?: ReasoningEffortLevel
+  /**
    * The CLI subprocess authenticates itself; `key` carries no credential.
    * Routes the SDK env away from `ANTHROPIC_API_KEY` and tells the router to
    * forward the subprocess's own Authorization header untouched.
@@ -409,6 +465,7 @@ export interface OAuthLoginState {
  * Result from starting an OAuth login flow
  */
 export interface OAuthStartResult {
+  loginId?: string
   loginUrl: string
   state: string
   /** User code for device code flow (e.g., GitHub Copilot) */
@@ -424,10 +481,39 @@ export interface OAuthStartResult {
   redirectUri?: string
 }
 
+/** Rejects empty, padded or oversized identifiers before they reach the account manager. */
+export function isAuthRequestString(value: unknown, maxLength = 512): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength && value === value.trim()
+}
+
+/** Allowlist of what leaves the main process; providers may attach credentials to their results. */
+export function toPublicOAuthCompleteResult(data: OAuthCompleteResult): OAuthCompleteResult {
+  return {
+    success: data.success,
+    sourceId: data.sourceId,
+    sourceIds: data.sourceIds ? [...data.sourceIds] : undefined,
+    user: data.user ? { name: data.user.name, avatar: data.user.avatar, uid: data.user.uid } : undefined,
+    error: data.error,
+  }
+}
+
+export function toPublicOAuthStartResult(data: OAuthStartResult): OAuthStartResult {
+  return {
+    loginId: data.loginId,
+    loginUrl: data.loginUrl,
+    state: data.state,
+    redirectUri: data.redirectUri,
+    userCode: data.userCode,
+    verificationUri: data.verificationUri,
+  }
+}
+
 /**
  * Result from completing an OAuth login flow
  */
 export interface OAuthCompleteResult {
+  sourceId?: string
+  sourceIds?: string[]
   success: boolean
   user?: AISourceUser
   error?: string
@@ -463,6 +549,11 @@ export function getSourceById(config: AISourcesConfig, id: string): AISource | n
   return config.sources.find(s => s.id === id) || null
 }
 
+/** The signed-in account a source shows: OAuth and Claude Code CLI sources have one. */
+export function getSourceAccountName(source: AISource): string | undefined {
+  return source.authType === 'oauth' || source.authType === 'delegated' ? source.user?.name : undefined
+}
+
 /**
  * Get current model display name
  */
@@ -475,27 +566,23 @@ export function getCurrentModelName(config: AISourcesConfig): string {
 }
 
 /**
- * Resolve the display name for an explicit source + model pair, used by the
- * per-conversation model selector (a conversation may be pinned to a model that
- * differs from the current global selection).
- *
- * Falls back to the current global model name when the pin is absent or its
- * source is no longer available — so legacy conversations and pins whose source
- * was deleted still render a sensible label.
+ * Only an absent source pin follows global selection. A pin whose account was
+ * removed has no name — never another account's; callers show their own
+ * translated missing-account notice.
  */
 export function getModelDisplayName(
   config: AISourcesConfig,
   sourceId?: string,
   modelId?: string
 ): string {
-  if (sourceId && modelId) {
-    const source = config.sources.find(s => s.id === sourceId)
-    if (source) {
-      const modelOption = source.availableModels.find(m => m.id === modelId)
-      return modelOption?.name || modelId
-    }
-  }
-  return getCurrentModelName(config)
+  if (!sourceId) return getCurrentModelName(config)
+
+  const source = getSourceById(config, sourceId)
+  if (!source) return ''
+
+  const effectiveModelId = modelId || source.model
+  const modelOption = source.availableModels.find(m => m.id === effectiveModelId)
+  return modelOption?.name || effectiveModelId
 }
 
 /**

@@ -3,10 +3,11 @@
 import { ipcMain } from 'electron'
 import { getTeamService } from '../apps/team'
 import { TEAM_IPC, memberChatKey } from '../../shared/apps/team-types'
-import { readTeamMemberMessages } from '../apps/runtime/app-chat'
+import { readTeamMemberHistory } from '../apps/runtime/app-chat'
 import { getTeamStore } from '../apps/team'
 import { getFederationManager } from '../apps/runtime/federation/manager'
 import { generateTeamInvite, revokeTeamInvite, joinTeamOffice, leaveTeamOffice } from '../controllers/team-invite.controller'
+import { toMemberMessage } from '../controllers/team-member-message.controller'
 import type { TeamService } from '../apps/team'
 import type { OfficeScope } from '../apps/federation/index'
 import type {
@@ -133,7 +134,7 @@ export function registerTeamIpc(): void {
   )
 
   // ── team:chat-messages — a member's team-channel chat history for ONE run ──
-  // The read logic lives in readTeamMemberMessages (apps/runtime/app-chat) so the
+  // The read logic lives in readTeamMemberHistory (apps/runtime/app-chat) so the
   // IPC and HTTP surfaces share a single source of truth. spaceId is accepted for
   // wire compatibility but ignored — the app's installed spaceId is authoritative.
   ipcMain.handle('team:chat-messages', async (_e, input: { appId: string; spaceId?: string; teamId: string; epochId: string; sinceSeq?: number }) => {
@@ -177,11 +178,9 @@ export function registerTeamIpc(): void {
       // Locally-owned member: its transcript is per-epoch on disk. No epoch yet
       // means nothing has run for it here → empty (never an error).
       if (!input.epochId) return { success: true, data: [] }
-      // A local JSONL read is already fast, so return the full transcript regardless
-      // of sinceSeq — the renderer dedups by seq, so re-sending known rows is harmless
-      // and avoids a second read path.
-      const messages = readTeamMemberMessages(input.appId, input.teamId, input.epochId)
-      return { success: true, data: messages }
+      // Rows carry seq like the remote path, so a caller holding the history
+      // passes sinceSeq and receives only the tail.
+      return { success: true, data: readTeamMemberHistory(input.appId, input.teamId, input.epochId, sinceSeq) }
     } catch (err) {
       const e = err as Error
       console.error('[TeamIPC] team:chat-messages error:', e.message)
@@ -205,8 +204,15 @@ export function registerTeamIpc(): void {
         message: string
         images?: ImageAttachment[]
         thinkingEnabled?: boolean
+        spaceId?: string
+        references?: unknown
       }
-    ) => handle('team:send-to-member', (s) => s.sendToMember(input))
+    ): Promise<Envelope> => {
+      const built = toMemberMessage(input)
+      if (!built.ok) return { success: false, error: built.error }
+      const { teamId, appId, epochId, images, thinkingEnabled } = input
+      return handle('team:send-to-member', (s) => s.sendToMember({ teamId, appId, epochId, message: built.message, images, thinkingEnabled }))
+    }
   )
 
   // ── team:stop-member — abort the turn ONE member is running ───────────────

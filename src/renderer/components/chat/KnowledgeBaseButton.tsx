@@ -25,6 +25,7 @@ import { useSpaceStore } from '../../stores/space.store'
 import { useAppStore } from '../../stores/app.store'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/Popover'
 import { BookOpen, Check, Star, Pin, ArrowRight } from 'lucide-react'
+import { trackNavigate } from '../../services/home-telemetry'
 
 const NO_IDS: string[] = []
 
@@ -38,7 +39,7 @@ export function KnowledgeBaseButton() {
   const unbindSpace = useTlonStore(s => s.unbindSpace)
   const navigate = useAppStore(s => s.navigate)
 
-  const getCurrentConversationId = useChatStore(s => s.getCurrentConversationId)
+  const getActiveConversationId = useChatStore(s => s.getActiveConversationId)
   const getCachedConversation = useChatStore(s => s.getCachedConversation)
   const createConversation = useChatStore(s => s.createConversation)
   const attachKnowledgeBase = useChatStore(s => s.attachKnowledgeBase)
@@ -51,7 +52,7 @@ export function KnowledgeBaseButton() {
   useEffect(() => { void loadKBs() }, [loadKBs])
 
   const spaceId = currentSpace?.id ?? null
-  const convId = getCurrentConversationId()
+  const convId = getActiveConversationId()
   const convIds = (convId ? cache.get(convId)?.knowledgeBaseIds : undefined) ?? NO_IDS
   const defaultKb = kbs.find(k => k.isDefault)
   // Before the conversation exists, mirror what the main process would seed:
@@ -66,7 +67,7 @@ export function KnowledgeBaseButton() {
 
   const toggleKb = async (kbId: string) => {
     if (!spaceId) return
-    let conversationId = getCurrentConversationId()
+    let conversationId = getActiveConversationId()
     if (!conversationId) {
       const conv = await createConversation(spaceId)
       conversationId = conv?.id ?? null
@@ -92,6 +93,7 @@ export function KnowledgeBaseButton() {
 
   const openKnowledgePage = () => {
     setOpen(false)
+    trackNavigate('tlon', 'composer', 'composer')
     navigate('tlon')
   }
 

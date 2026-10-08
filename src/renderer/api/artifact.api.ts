@@ -6,6 +6,7 @@ import {
   getAuthToken,
   getRemoteServerUrl,
   httpRequest,
+  isCapacitor,
   isElectron,
   onEvent,
 } from './_shared'
@@ -13,6 +14,11 @@ import type {
   ApiResponse,
 } from './_shared'
 import { MAX_PREVIEW_DOCUMENT_SIZE, formatPreviewSize } from '../../shared/constants/artifact-preview'
+import type { ArtifactChangeBatchEvent, FileQueryResult, ResolvedArtifactPath } from '../../shared/types/artifact'
+
+// Batches raised inside this renderer (a lapsed space hold: changes were lost),
+// delivered to the same subscribers as those from main.
+const localChangedBatchListeners = new Set<(data: ArtifactChangeBatchEvent) => void>()
 
 export const artifactApi = {
   // ===== Artifact =====
@@ -21,6 +27,22 @@ export const artifactApi = {
       return window.halo.listArtifacts(spaceId, maxDepth)
     }
     return httpRequest('GET', `/api/spaces/${spaceId}/artifacts?maxDepth=${maxDepth}`)
+  },
+
+  // Best path matches for a typed query; only `limit` items cross processes
+  queryArtifactFiles: async (spaceId: string, query: string, limit: number): Promise<ApiResponse<FileQueryResult>> => {
+    if (isElectron()) {
+      return window.halo.queryArtifactFiles(spaceId, query, limit)
+    }
+    return httpRequest('GET', `/api/spaces/${spaceId}/artifacts/query?q=${encodeURIComponent(query)}&limit=${limit}`)
+  },
+
+  // Which mentioned paths are existing files or folders of the space (one stat each, no scan)
+  resolveArtifactPaths: async (spaceId: string, paths: string[], baseDir?: string): Promise<ApiResponse<ResolvedArtifactPath[]>> => {
+    if (isElectron()) {
+      return window.halo.resolveArtifactPaths(spaceId, paths, baseDir)
+    }
+    return httpRequest('POST', `/api/spaces/${spaceId}/artifacts/resolve`, { paths, ...(baseDir ? { baseDir } : {}) })
   },
 
   listArtifactsTree: async (spaceId: string): Promise<ApiResponse> => {
@@ -38,41 +60,42 @@ export const artifactApi = {
     return httpRequest('POST', `/api/spaces/${spaceId}/artifacts/children`, { dirPath })
   },
 
-  // Initialize file watcher for a space
-  initArtifactWatcher: async (spaceId: string): Promise<ApiResponse> => {
+  // Declare that this client shows / stopped showing a space (see services/artifact-space-holds)
+  retainArtifactSpace: async (spaceId: string, clientId: string): Promise<ApiResponse> => {
     if (isElectron()) {
-      return window.halo.initArtifactWatcher(spaceId)
+      return window.halo.retainArtifactSpace(spaceId, clientId)
     }
-    // In remote mode, watcher is managed by server
-    return { success: true }
+    return httpRequest('POST', `/api/spaces/${spaceId}/artifacts/retain`, { clientId })
   },
 
-  // Subscribe to artifact change events
-  onArtifactChanged: (callback: (data: {
-    type: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir'
-    path: string
-    relativePath: string
-    spaceId: string
-    item?: unknown
-  }) => void) => {
+  releaseArtifactSpace: async (spaceId: string, clientId: string): Promise<ApiResponse> => {
     if (isElectron()) {
-      return window.halo.onArtifactChanged(callback)
+      return window.halo.releaseArtifactSpace(spaceId, clientId)
     }
-    // In remote mode, use WebSocket events
-    return onEvent('artifact:changed', callback)
+    return httpRequest('POST', `/api/spaces/${spaceId}/artifacts/release`, { clientId })
+  },
+
+  // Subscribe to file changes: one event per flush per space, not one per file
+  onArtifactChangedBatch: (callback: (data: ArtifactChangeBatchEvent) => void) => {
+    localChangedBatchListeners.add(callback)
+    const offRemote = isElectron()
+      ? window.halo.onArtifactChangedBatch(callback)
+      : onEvent<ArtifactChangeBatchEvent>('artifact:changed-batch', callback)
+    return () => {
+      localChangedBatchListeners.delete(callback)
+      offRemote()
+    }
+  },
+
+  // Deliver a batch to this renderer's subscribers only (never sent to main)
+  emitLocalArtifactChangedBatch: (batch: ArtifactChangeBatchEvent): void => {
+    for (const listener of Array.from(localChangedBatchListeners)) listener(batch)
   },
 
   // Subscribe to tree update events (pre-computed data, zero IPC round-trips)
   onArtifactTreeUpdate: (callback: (data: {
     spaceId: string
     updatedDirs: Array<{ dirPath: string; children: unknown[] }>
-    changes: Array<{
-      type: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir'
-      path: string
-      relativePath: string
-      spaceId: string
-      item?: unknown
-    }>
   }) => void) => {
     if (isElectron()) {
       return window.halo.onArtifactTreeUpdate(callback)
@@ -105,28 +128,66 @@ export const artifactApi = {
     return { success: false, error: 'Cannot open folder in remote mode' }
   },
 
-  // Download artifact (remote mode only - triggers browser download)
-  downloadArtifact: (filePath: string): void => {
+  // Download artifact: the desktop opens the file; elsewhere the browser or the
+  // phone saves it from a link that carries a short-lived ticket, never the token.
+  downloadArtifact: async (filePath: string): Promise<ApiResponse> => {
     if (isElectron()) {
-      // In Electron, just open the file
-      window.halo.openArtifact(filePath)
-      return
+      void window.halo.openArtifact(filePath)
+      return { success: true }
     }
-    // In remote mode, trigger download via browser with token in URL
-    const token = getAuthToken()
-    const url = `/api/artifacts/download?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(token || '')}`
+    // Asked for first, so a missing file is reported here instead of a link
+    // opening onto an error page.
+    const issued = await httpRequest<{ ticket: string }>('POST', '/api/artifacts/download-ticket', { path: filePath })
+    if (!issued.success || !issued.data?.ticket) {
+      return { success: false, error: issued.error || 'Download failed' }
+    }
+    // On the Halo server's own address: the mobile app's page is local to the
+    // phone, and a reverse proxy may serve Halo under a path prefix.
+    const url = `${getRemoteServerUrl()}/api/artifacts/file/${encodeURIComponent(issued.data.ticket)}`
+    if (isCapacitor()) {
+      // The app's web view cannot save files: the native shell hands the link
+      // to the system (Android's download listener, the system browser on iOS).
+      window.open(url, '_blank')
+      return { success: true }
+    }
     const link = document.createElement('a')
     link.href = url
     link.download = filePath.split('/').pop() || 'download'
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
+    return { success: true }
   },
 
-  // Get download URL for an artifact (for use with fetch or direct links)
+  // Remote clients only: put one file from this device into the space's working
+  // directory. The file is the request body, so the browser streams it.
+  uploadArtifactFile: async (spaceId: string, file: File): Promise<ApiResponse<{ path: string; name: string; size: number }>> => {
+    const baseUrl = getRemoteServerUrl()
+    if (!baseUrl) return { success: false, error: 'Server URL not configured' }
+    const token = getAuthToken()
+    try {
+      const res = await fetch(`${baseUrl}/api/spaces/${encodeURIComponent(spaceId)}/artifacts/upload?name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: file,
+      })
+      const body = await res.json().catch(() => null)
+      if (!res.ok || !body?.success || !body.data) {
+        // A proxy or tunnel in between answers 413 with a page of its own.
+        const code = body?.code ?? (res.status === 413 ? 'TOO_LARGE' : undefined)
+        return { success: false, error: body?.error || `Upload failed (${res.status})`, ...(code ? { code } : {}) }
+      }
+      return { success: true, data: body.data }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  },
+
+  // For this page's own use only (the image viewer's source): it carries the
+  // access token, so it is never handed to another app or saved as a download.
   getArtifactDownloadUrl: (filePath: string): string => {
     const token = getAuthToken()
-    return `/api/artifacts/download?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(token || '')}`
+    return `${getRemoteServerUrl()}/api/artifacts/download?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(token || '')}`
   },
 
   // Read artifact content for Content Canvas

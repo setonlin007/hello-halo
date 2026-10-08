@@ -7,7 +7,10 @@ const { fetchModelsFromApiMock } = vi.hoisted(() => ({
 
 vi.mock('../../../src/main/foundation/config.service', () => ({
   getConfig: vi.fn(),
-  saveConfig: vi.fn()
+  saveConfig: vi.fn(),
+  isConfigUnreadable: vi.fn(() => false),
+  getConfigReadFailureCount: vi.fn(() => 0),
+  getConfigPath: vi.fn(() => '/home/user/.halo/config.json')
 }))
 
 vi.mock('../../../src/main/foundation/config-encryption', () => ({
@@ -20,7 +23,122 @@ vi.mock('../../../src/main/services/api-validator.service', () => ({
   fetchModelsFromApi: fetchModelsFromApiMock
 }))
 
-import { fetchModels } from '../../../src/main/controllers/config.controller'
+import {
+  configSnapshotEpoch,
+  fetchModels,
+  preserveManagedSources,
+  reloadRequiredBeforeSave,
+  setConfig
+} from '../../../src/main/controllers/config.controller'
+import {
+  getConfig,
+  getConfigReadFailureCount,
+  isConfigUnreadable,
+  saveConfig
+} from '../../../src/main/foundation/config.service'
+
+describe('managed account configuration writes', () => {
+  const live = {
+    id: 'a', name: 'Account A', authType: 'oauth', provider: 'chatgpt',
+    accessToken: 'live-access', refreshToken: 'live-refresh', tokenExpires: 1000,
+    user: { uid: 'account-a', name: 'Account' }, model: 'chosen', apiUrl: '',
+    modelCatalogCache: { entries: ['live'] }, availableModels: ['live']
+  }
+
+  it('preserves live managed metadata, auth, routing and catalog data', () => {
+    const incoming = { aiSources: { version: 2, currentId: 'a', sources: [{
+      ...live, name: 'Renamed', model: 'new-model', accessToken: 'stale', refreshToken: 'stale',
+      tokenExpires: 1, user: { uid: 'other' }, provider: 'claude', apiUrl: 'https://wrong.example',
+      modelCatalogCache: { entries: ['stale'] }, availableModels: ['stale']
+    }] } }
+    preserveManagedSources(incoming, { aiSources: { version: 2, currentId: 'a', sources: [live] } })
+    expect(incoming.aiSources.sources).toEqual([live])
+  })
+
+  it('retains newly added accounts and cannot resurrect removed accounts from stale snapshots', () => {
+    const incoming = { aiSources: { version: 2, currentId: 'removed', sources: [{ ...live, id: 'removed' }] } }
+    preserveManagedSources(incoming, { aiSources: { version: 2, currentId: 'a', sources: [live] } })
+    expect(incoming.aiSources).toEqual({ version: 2, currentId: 'a', sources: [live] })
+  })
+
+  it('allows custom API additions without removing managed accounts omitted by a client', () => {
+    const custom = { id: 'custom', authType: 'api-key', apiKey: 'new-key' }
+    const incoming = { aiSources: { version: 2, currentId: 'custom', sources: [custom] } }
+    preserveManagedSources(incoming, { aiSources: { version: 2, currentId: 'a', sources: [live] } })
+    expect(incoming.aiSources.sources).toEqual([custom, live])
+  })
+
+  it('cannot roll back live account selection or model overrides from an unrelated settings save', () => {
+    const accountB = { ...live, id: 'b', name: 'Renamed B', model: 'new-b', modelOverrides: { 'new-b': { contextWindow: 400000 } } }
+    const incoming = { aiSources: { version: 2, currentId: 'a', sources: [live, {
+      ...accountB, name: 'Old B', model: 'old-b', modelOverrides: {}
+    }] }, appearance: { theme: 'light' } }
+    preserveManagedSources(incoming, { aiSources: { version: 2, currentId: 'b', sources: [live, accountB] } })
+    expect(incoming.aiSources).toEqual({ version: 2, currentId: 'b', sources: [live, accountB] })
+    expect(incoming.appearance).toEqual({ theme: 'light' })
+  })
+
+  it('rejects malformed or duplicate-id snapshots instead of erasing account state', () => {
+    expect(() => preserveManagedSources({ aiSources: null }, {})).toThrow('Invalid AI sources')
+    expect(() => preserveManagedSources({ aiSources: { version: 2, sources: [live, live] } }, {})).toThrow('Duplicate AI source ids')
+  })
+
+  it('applies the protection on the HTTP configuration save path', () => {
+    vi.mocked(getConfig).mockReturnValue({ aiSources: { version: 2, currentId: 'a', sources: [live] } } as any)
+    setConfig({ aiSources: { version: 2, currentId: 'a', sources: [{ ...live, accessToken: 'stale' }] } })
+    expect(saveConfig).toHaveBeenLastCalledWith({ aiSources: { version: 2, currentId: 'a', sources: [live] } })
+  })
+
+  it('reports a save that an unreadable config file kept off disk as not saved', () => {
+    vi.mocked(getConfig).mockReturnValue({} as any)
+    vi.mocked(isConfigUnreadable).mockReturnValueOnce(true)
+
+    const result = setConfig({ appearance: { theme: 'dark' } })
+
+    expect(result).toMatchObject({ success: false, code: 'CONFIG_UNREADABLE' })
+    expect(result.error).toContain('/home/user/.halo/config.json')
+  })
+})
+
+describe('settings snapshot stamps', () => {
+  it('stamp a good read with the failures so far, and a read that fell back to defaults with -1', () => {
+    vi.mocked(getConfigReadFailureCount).mockReturnValueOnce(3)
+    expect(configSnapshotEpoch()).toBe(3)
+
+    vi.mocked(isConfigUnreadable).mockReturnValueOnce(true)
+    expect(configSnapshotEpoch()).toBe(-1)
+  })
+
+  it('let a save through only when no read has failed since its settings were loaded', () => {
+    vi.mocked(getConfigReadFailureCount).mockReturnValue(3)
+    try {
+      expect(reloadRequiredBeforeSave(3)).toBeNull()
+      expect(reloadRequiredBeforeSave(2)).toMatchObject({ success: false, code: 'CONFIG_RELOAD_REQUIRED' })
+      expect(reloadRequiredBeforeSave(-1)).toMatchObject({ success: false, code: 'CONFIG_RELOAD_REQUIRED' })
+      // No stamp: not judged here.
+      expect(reloadRequiredBeforeSave(undefined)).toBeNull()
+    } finally {
+      vi.mocked(getConfigReadFailureCount).mockReturnValue(0)
+    }
+  })
+
+  it('leave a save made while the file is still unreadable to the not-saved answer', () => {
+    vi.mocked(isConfigUnreadable).mockReturnValueOnce(true)
+    expect(reloadRequiredBeforeSave(-1)).toBeNull()
+  })
+
+  it('refuse a stale save on the HTTP path before anything is written', () => {
+    vi.mocked(getConfig).mockReturnValue({} as any)
+    vi.mocked(saveConfig).mockClear()
+    vi.mocked(getConfigReadFailureCount).mockReturnValue(1)
+    try {
+      expect(setConfig({ imChannels: { instances: [] } }, 0)).toMatchObject({ code: 'CONFIG_RELOAD_REQUIRED' })
+      expect(saveConfig).not.toHaveBeenCalled()
+    } finally {
+      vi.mocked(getConfigReadFailureCount).mockReturnValue(0)
+    }
+  })
+})
 
 describe('config controller model fetching', () => {
   beforeEach(() => {

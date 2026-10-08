@@ -9,6 +9,7 @@ import {
 import type {
   ApiResponse,
 } from './_shared'
+import type { MemorySettings, MemoryStatus } from '../../shared/types/memory'
 
 export const spaceApi = {
   // ===== Space =====
@@ -86,6 +87,13 @@ export const spaceApi = {
     return httpRequest('PUT', `/api/spaces/${spaceId}`, updates)
   },
 
+  setSpaceWorkingDir: async (spaceId: string, workingDir: string): Promise<ApiResponse> => {
+    if (isElectron()) {
+      return window.halo.setSpaceWorkingDir(spaceId, workingDir)
+    }
+    return httpRequest('PUT', `/api/spaces/${spaceId}/working-dir`, { workingDir })
+  },
+
   // Update space preferences (layout settings)
   updateSpacePreferences: async (
     spaceId: string,
@@ -94,6 +102,7 @@ export const spaceApi = {
         artifactRailExpanded?: boolean
         chatWidth?: number
       }
+      memory?: MemorySettings
     }
   ): Promise<ApiResponse> => {
     if (isElectron()) {
@@ -110,21 +119,26 @@ export const spaceApi = {
     return httpRequest('GET', `/api/spaces/${spaceId}/preferences`)
   },
 
+  getSpaceMemoryStatus: async (spaceId: string): Promise<ApiResponse<MemoryStatus>> => {
+    if (isElectron()) {
+      return window.halo.getSpaceMemoryStatus(spaceId)
+    }
+    return httpRequest('GET', `/api/spaces/${spaceId}/memory`)
+  },
+
+  consolidateSpaceMemory: async (spaceId: string): Promise<ApiResponse<{ started: boolean; reason?: string }>> => {
+    if (isElectron()) {
+      return window.halo.consolidateSpaceMemory(spaceId)
+    }
+    return httpRequest('POST', `/api/spaces/${spaceId}/memory/consolidate`)
+  },
+
   // Reorder spaces (persist user-defined display order)
   reorderSpaces: async (spaceIds: string[]): Promise<ApiResponse> => {
     if (isElectron()) {
       return window.halo.reorderSpaces(spaceIds)
     }
     return httpRequest('PUT', '/api/spaces/reorder', { spaceIds })
-  },
-
-  // Per-space asset counts (files/digital humans/skills/MCP) for the
-  // workspace management page's cards
-  listSpaceSummaries: async (): Promise<ApiResponse> => {
-    if (isElectron()) {
-      return window.halo.listSpaceSummaries()
-    }
-    return httpRequest('GET', '/api/spaces/summaries')
   },
 
   // Remove an unreachable space's registry entry (does not touch disk)

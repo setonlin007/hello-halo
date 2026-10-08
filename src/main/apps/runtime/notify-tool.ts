@@ -28,6 +28,7 @@ import { getConfig } from '../../foundation/config.service'
 import { getActiveImChannelManager } from './im-channels'
 import { FileExportGate, FileExportDeniedError } from './file-export-gate'
 import { getPendingRelayStore, type RelaySubject } from './pending-relays'
+import { recordChatPush } from './chat-push'
 import { buildImSessionKey } from '../../../shared/apps/im-keys'
 import type { NotificationChannelType } from '../../../shared/types/notification-channels'
 import type { ImSessionRecord } from '../../../shared/types/im-channel'
@@ -262,6 +263,17 @@ function buildNotifyBotTool(context: NotifyToolContext) {
       const instanceId = input.to.slice(0, colonIndex)
       const chatId = input.to.slice(colonIndex + 1)
 
+      // The chat this turn answers gets the turn's reply anyway; a push there
+      // arrives as a second copy of it.
+      if (context.relay.contact && input.to === context.relay.contact) {
+        return textResult(
+          'Not sent: this is the chat you are answering right now, and your reply — the text you ' +
+          'end this turn with — is delivered to it. Write the message as your reply instead; ' +
+          'to send a file here, use send_file_to_chat.',
+          true
+        )
+      }
+
       // Find the matching session to get chatType
       const session = context.imSessions!.find(
         s => s.instanceId === instanceId && s.chatId === chatId
@@ -299,13 +311,23 @@ function buildNotifyBotTool(context: NotifyToolContext) {
       let sentMessage = false
       let sentFile: { name: string } | undefined
 
-      // Record delivered content into the pending-relay spool so the target
-      // session's AI learns about this push on its next inbound message.
-      // Skipped when pushing to the invoking session itself — there the push
-      // already lives in this run's tool history. Must never fail the tool:
-      // the push succeeded regardless of spool state.
-      const recordRelay = () => {
+      // What was delivered is kept twice: in the chat's record, which its owner
+      // reads in Halo (chat-push), and in the pending-relay spool, so the target
+      // session's AI learns about this push on its next inbound message. The
+      // spool skips the invoking session itself — there the push already lives
+      // in this run's tool history. Neither may fail the tool: the push
+      // succeeded regardless.
+      const recordDelivery = () => {
         if (!sentMessage && !sentFile) return
+        recordChatPush({
+          appId: session.appId,
+          channel: session.channel,
+          chatType: session.chatType,
+          chatId: session.chatId,
+          text: [sentMessage ? input.message : '', sentFile ? `📎 ${sentFile.name}` : ''].filter(Boolean).join('\n\n'),
+          via: 'message',
+          pushedBy: context.appId,
+        })
         try {
           const targetKey = buildImSessionKey(
             session.appId, session.channel, session.chatType, session.chatId
@@ -337,7 +359,7 @@ function buildNotifyBotTool(context: NotifyToolContext) {
       // When message was already sent but file fails, the AI must know
       // the message went through to avoid duplicate sends on retry.
       const errorWithContext = (errorMsg: string) => {
-        recordRelay()
+        recordDelivery()
         if (results.length > 0) {
           return textResult(`${results.join(' ')} However, ${errorMsg}`, true)
         }
@@ -374,8 +396,10 @@ function buildNotifyBotTool(context: NotifyToolContext) {
           if (err instanceof FileExportDeniedError) {
             console.warn(`[Runtime][${runTag}] File export denied: "${input.file}"`)
             return errorWithContext(
-              `file export denied: "${input.file}" is outside the allowed directory. ` +
-              'Only files within the app workspace or temp directory can be sent.'
+              err.reason
+                ? `file export denied: "${input.file}". ${err.reason}`
+                : `file export denied: "${input.file}" is outside the allowed directory. ` +
+                  'Only files within the app workspace or temp directory can be sent.'
             )
           }
           // File not found or other sanction error
@@ -413,7 +437,7 @@ function buildNotifyBotTool(context: NotifyToolContext) {
         }
       }
 
-      recordRelay()
+      recordDelivery()
       return textResult(results.join(' '))
     }
   )

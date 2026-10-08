@@ -1,24 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="halo-title halo-desc">
-  <title id="halo-title">Halo App Icon</title>
-  <desc id="halo-desc">Halo app icon: a glowing blue halo ring on a near-black squircle</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="t d">
+  <title id="t">Halo App Icon</title>
+  <desc id="d">A big round digital-human head peeking in from the left of a rounded tile, cropped by the tile, with capsule eyes and a smile</desc>
+  <!-- The head is cropped by the tile, leaving a sliver of the tile color at the top right (same in light and dark).
+       Generic version: full-bleed rounded square (corner ≈ 22.4%); each platform adds its own mask or shadow. -->
   <defs>
-    <!-- 真 squircle：R = 22.37% × 1024，圆角平滑 0.6（Figma corner-smoothing 算法） -->
-    <path id="squircle" d="M657.49 0c128.291 0 192.436 0 241.436 24.967a229.069 229.069 0 0 1 100.107 100.107c24.967 49.001 24.967 113.146 24.967 241.436L1024 657.49c0 128.291 0 192.436 -24.967 241.436a229.069 229.069 0 0 1 -100.107 100.107c-49.001 24.967 -113.146 24.967 -241.436 24.967L366.51 1024c-128.291 0 -192.436 0 -241.436 -24.967a229.069 229.069 0 0 1 -100.107 -100.107c-24.967 -49.001 -24.967 -113.146 -24.967 -241.436L0 366.51c0 -128.291 0 -192.436 24.967 -241.436a229.069 229.069 0 0 1 100.107 -100.107c49.001 -24.967 113.146 -24.967 241.436 -24.967Z"/>
-    <clipPath id="squircle-clip"><use href="#squircle"/></clipPath>
-    <filter id="halo-glow" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur stdDeviation="150"/>
-    </filter>
-    <linearGradient id="halo-inner" x1="0.869" y1="0.0" x2="0.131" y2="1.0">
-      <stop offset="0" stop-color="#3B82F6" stop-opacity=".3"/>
-      <stop offset="1" stop-color="#3B82F6" stop-opacity="0"/>
-    </linearGradient>
+    <clipPath id="tile"><rect x="0" y="0" width="1024" height="1024" rx="229"/></clipPath>
   </defs>
-  <g clip-path="url(#squircle-clip)">
-    <use href="#squircle" fill="#0A0A0A"/>
-    <circle cx="512" cy="512" r="360" fill="#3B82F6" fill-opacity=".2" filter="url(#halo-glow)"/>
-    <g transform="translate(152 152) scale(7.5)">
-      <circle cx="48" cy="48" r="36" fill="url(#halo-inner)"/>
-      <circle cx="48" cy="48" r="46" fill="none" stroke="#3B82F6" stroke-opacity=".6" stroke-width="4"/>
-    </g>
+  <rect x="0" y="0" width="1024" height="1024" rx="229" fill="#F3F5F9"/>
+  <g clip-path="url(#tile)">
+    <g transform="translate(0 0)"><g transform="scale(28.444444)"><rect width="36" height="36" rx="36" fill="#84B9EF" transform="translate(-12 0) scale(1.22)"/><g transform="translate(-3 1) rotate(-10 18 17) translate(18 17) scale(1.9) translate(-18 -17)"><rect x="13" y="14" width="1.5" height="2" rx="1" fill="#000000"/><rect x="21" y="14" width="1.5" height="2" rx="1" fill="#000000"/><path d="M15 19 c2 1 4 1 6 0" stroke="#000000" stroke-width="0.95" fill="none" stroke-linecap="round"/></g></g></g>
   </g>
+  <rect x="1.5" y="1.5" width="1021" height="1021" rx="227.5" fill="none" stroke="rgba(255,255,255,.55)" stroke-width="3"/>
 </svg>

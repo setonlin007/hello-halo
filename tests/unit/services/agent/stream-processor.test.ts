@@ -37,7 +37,7 @@ vi.mock('@electron-toolkit/utils', () => ({ is: { dev: false } }))
 // module resolves the app config path at import time, which needs Electron.
 vi.mock('../../../../src/main/foundation/logging', () => ({ isDeveloperMode: () => false }))
 
-import { processStream } from '../../../../src/main/services/agent/stream-processor'
+import { processStream, type StreamResult } from '../../../../src/main/services/agent/stream-processor'
 import { computeContextUsed } from '../../../../src/main/services/agent/context-usage'
 import type { SessionState, Thought, TokenUsage } from '../../../../src/main/services/agent/types'
 
@@ -169,6 +169,156 @@ function messageDelta(usage: Record<string, number>): Record<string, unknown> {
 // ============================================
 // Tests
 // ============================================
+
+describe('processStream interruption and retirement', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it.each(['onTurnInit', 'onRawMessage'] as const)('discards the current frame when %s retires the consumer synchronously', async hook => {
+    const session = new AbortController()
+    const onTurnInit = vi.fn()
+    const onRawMessage = vi.fn()
+    const onComplete = vi.fn()
+    const callbacks = { onTurnInit, onRawMessage, onComplete }
+    callbacks[hook].mockImplementation(() => session.abort())
+    await expect(processStream(baseParams({
+      messageContent: undefined,
+      sessionSignal: session.signal,
+      callbacks,
+      v2Session: fakeSession([systemInit()]),
+    }))).rejects.toMatchObject({ name: 'AbortError' })
+    expect(onTurnInit).toHaveBeenCalledTimes(1)
+    expect(onRawMessage).toHaveBeenCalledTimes(hook === 'onRawMessage' ? 1 : 0)
+    expect(onComplete).not.toHaveBeenCalled()
+    expect(emitAgentEvent).not.toHaveBeenCalled()
+  })
+
+  it('does not publish stream-end events after onComplete retires its session', async () => {
+    const session = new AbortController()
+    const onComplete = vi.fn(() => session.abort())
+    await expect(processStream(baseParams({
+      sessionSignal: session.signal,
+      callbacks: { onComplete },
+      v2Session: fakeSession([systemInit(), resultCarrying('Fixture reply')]),
+    }))).rejects.toMatchObject({ name: 'AbortError' })
+    expect(onComplete).toHaveBeenCalledTimes(1)
+    expect(emitAgentEvent.mock.calls.filter(([channel]) => channel === 'agent:complete' || channel === 'agent:error')).toEqual([])
+  })
+
+  it('still drains a normal interrupted turn while its session remains active', async () => {
+    const abortController = new AbortController()
+    const session = new AbortController()
+    const onRawMessage = vi.fn()
+    const onComplete = vi.fn()
+    let readPastResult = false
+    const result = await processStream(baseParams({
+      messageContent: undefined,
+      abortController,
+      sessionSignal: session.signal,
+      callbacks: { onRawMessage, onComplete },
+      v2Session: {
+        async *stream() {
+          yield systemInit()
+          yield assistantText('partial', 'Partial reply.')
+          abortController.abort()
+          yield assistantText('ignored', 'Drained output')
+          yield resultCarrying('Drained output')
+          readPastResult = true
+        },
+      },
+    }))
+    expect(result).toMatchObject({ finalContent: 'Partial reply.', wasAborted: true, drainTimedOut: false })
+    expect(onRawMessage).toHaveBeenCalledTimes(2)
+    expect(onComplete).toHaveBeenCalledWith(result)
+    expect(readPastResult).toBe(false)
+    expect(JSON.stringify(emitAgentEvent.mock.calls)).not.toContain('Drained output')
+  })
+})
+
+describe('processStream: a turn cut off by the step limit', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  const STEP_LIMIT_NOTICE = 'Reached the maximum turn limit. Send a message to continue.'
+
+  /**
+   * The default engine's frame (Claude Code 2.1.89 cli.js, `max_turns_reached`
+   * attachment): flagged is_error, the limit only in `errors`, no `result`.
+   */
+  function claudeCodeStepLimit(limit: number): Record<string, unknown>[] {
+    return [{
+      type: 'result', subtype: 'error_max_turns', duration_ms: 1200, duration_api_ms: 900, is_error: true,
+      num_turns: limit + 1, stop_reason: 'tool_use', session_id: 'sess-1', total_cost_usd: 0.01,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      modelUsage: {}, permission_denials: [], uuid: 'u-1',
+      errors: [`Reached maximum number of turns (${limit})`],
+    }]
+  }
+
+  /**
+   * Halo SDK's frames (halo-sdk query-loop): a system notice naming the limit,
+   * then a result flagged is_error whose `result` is the error text.
+   */
+  function haloSdkStepLimit(limit: number): Record<string, unknown>[] {
+    const text = `Max turns exceeded: ${limit} turns completed, limit is ${limit}`
+    return [
+      { type: 'system', subtype: 'max_turns_reached', max_turns: limit, turn_count: limit, session_id: 'sess-1', uuid: 'u-1' },
+      {
+        type: 'result', subtype: 'error_max_turns', errors: [text], result: text, is_error: true, num_turns: limit,
+        total_cost_usd: 0, usage: {}, modelUsage: {}, session_id: 'sess-1', stop_reason: 'max_turns',
+        duration_ms: 1200, duration_api_ms: 900, permission_denials: [], uuid: 'u-2',
+      },
+    ]
+  }
+
+  function errorEvents(): unknown[] {
+    return emitAgentEvent.mock.calls
+      .filter(([channel]) => channel === 'agent:error')
+      .map(([, , , data]) => data)
+  }
+
+  it.each([
+    ['the default engine', claudeCodeStepLimit],
+    ['Halo SDK', haloSdkStepLimit],
+  ])('%s: says why it stopped after part of an answer, which stands as written', async (_engine, frames) => {
+    // What was written is not the whole answer; without the notice the chat page
+    // shows it as if the work were done, and an IM chat gets no word of it.
+    const result = await processStream(baseParams({
+      v2Session: fakeSession([systemInit(), assistantText('m1', 'First half of the work.'), ...frames(3)]),
+    }))
+
+    expect(result).toMatchObject({
+      reachedMaxTurns: true, maxTurnsLimit: 3, hasErrorThought: false, isInterrupted: false,
+      finalContent: 'First half of the work.',
+    })
+    expect(errorEvents()).toEqual([expect.objectContaining({ errorType: 'interrupted', error: STEP_LIMIT_NOTICE })])
+  })
+
+  it.each([
+    ['the default engine', claudeCodeStepLimit],
+    ['Halo SDK', haloSdkStepLimit],
+  ])('%s: says the same when it wrote nothing, and nothing else', async (_engine, frames) => {
+    // Was: an error with no text (nothing shown) on the default engine, the
+    // engine's own "Max turns exceeded…" on Halo SDK.
+    const result = await processStream(baseParams({ v2Session: fakeSession([systemInit(), ...frames(3)]) }))
+
+    expect(result).toMatchObject({ reachedMaxTurns: true, maxTurnsLimit: 3, hasErrorThought: false, finalContent: '' })
+    expect(errorEvents()).toEqual([expect.objectContaining({ errorType: 'interrupted', error: STEP_LIMIT_NOTICE })])
+  })
+
+  it('does not read a reply cut at the output-token ceiling as the step limit', async () => {
+    // The shape every engine ends that with once its own recovery runs out.
+    const result = await processStream(baseParams({
+      v2Session: fakeSession([
+        systemInit(),
+        assistantText('m1', 'A long answer that ran out of'),
+        { type: 'result', subtype: 'success', is_error: false, stop_reason: 'max_tokens', result: '', duration_ms: 100, session_id: 'sess-1' },
+      ]),
+    }))
+
+    expect(result).toMatchObject({ reachedMaxTurns: false, hasErrorThought: false, isInterrupted: false })
+    expect(result.maxTurnsLimit).toBeUndefined()
+    expect(errorEvents()).toEqual([])
+  })
+})
 
 describe('processStream thinking-only turns', () => {
   beforeEach(() => {
@@ -501,6 +651,213 @@ describe('processStream llm.invocation token attribution', () => {
  * cumulative usage in either case, so a multi-call turn read through `result`
  * over-states the context by its call count.
  */
+describe('processStream partial snapshot', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('reads open blocks lazily and includes a streamed suffix after a completed block', async () => {
+    let readSnapshot!: () => StreamResult
+    let snapshot!: StreamResult
+    const sessionState = makeSessionState()
+    const session = {
+      async *stream() {
+        yield systemInit()
+        yield messageStart('first')
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'Completed prefix' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } }
+        yield assistantText('first', 'Completed prefix')
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Received suffix' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 2, content_block: { type: 'thinking', thinking: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 2, delta: { type: 'thinking_delta', thinking: 'Open reasoning' } } }
+        snapshot = readSnapshot()
+      },
+    }
+    const onSnapshotReady = vi.fn(reader => { readSnapshot = reader })
+    const result = await processStream(baseParams({ messageContent: undefined, v2Session: session, sessionState, callbacks: { onSnapshotReady } }))
+    expect(onSnapshotReady).toHaveBeenCalledTimes(1)
+    expect(snapshot).toMatchObject({
+      finalContent: 'Completed prefix\n\nReceived suffix', capturedSessionId: 'sess-1', isInterrupted: true,
+    })
+    expect(snapshot.thoughts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'thinking', content: 'Open reasoning', isStreaming: false }),
+    ]))
+    expect(sessionState.thoughts.find(thought => thought.type === 'thinking')?.isStreaming).toBe(true)
+    expect(result.finalContent).toBe(snapshot.finalContent)
+  })
+
+  it('does not duplicate a completed streamed block when its aggregate arrives before retirement', async () => {
+    let readSnapshot!: () => StreamResult
+    let snapshot!: StreamResult
+    const session = {
+      async *stream() {
+        yield systemInit()
+        yield messageStart('streamed-reply')
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Received completed block' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } }
+        yield assistantText('streamed-reply', 'Received completed block')
+        snapshot = readSnapshot()
+      },
+    }
+    await processStream(baseParams({
+      messageContent: undefined, v2Session: session,
+      callbacks: { onSnapshotReady: reader => { readSnapshot = reader } },
+    }))
+    expect(snapshot.finalContent).toBe('Received completed block')
+  })
+
+  it.each([false, true])('prefers a completed fallback over the abandoned open response (committed prefix=%s)', async prefix => {
+    let readSnapshot!: () => StreamResult
+    let snapshot!: StreamResult
+    const expected = `${prefix ? 'Committed prefix\n\n' : ''}Complete fallback answer`
+    const session = {
+      async *stream() {
+        yield systemInit()
+        if (prefix) yield assistantText('prefix', 'Committed prefix')
+        yield messageStart('failed-stream')
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Half of failed response' } } }
+        yield assistantText('nonstream-fallback', 'Complete fallback answer')
+        snapshot = readSnapshot()
+        yield resultCarrying('Complete fallback answer')
+      },
+    }
+    const result = await processStream(baseParams({
+      messageContent: undefined, v2Session: session,
+      callbacks: { onSnapshotReady: reader => { readSnapshot = reader } },
+    }))
+    expect(snapshot.finalContent).toBe(expected)
+    expect(snapshot.thoughts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'text', content: 'Complete fallback answer' }),
+    ]))
+    expect(result.finalContent).toBe(expected)
+  })
+
+  it.each(['Bash', 'TodoWrite'])('preserves the %s continuity boundary when an open response is replaced by a completed fallback', async toolName => {
+    let readSnapshot!: () => StreamResult
+    let beforeFallback!: StreamResult
+    let snapshot!: StreamResult
+    const prefix = toolName === 'Bash' ? '' : 'Earlier text\n\n'
+    const session = {
+      async *stream() {
+        yield systemInit()
+        yield messageStart('prefix-response')
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Earlier text' } } }
+        yield assistantText('prefix-response', 'Earlier text')
+        yield { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } }
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'completed-tool', name: toolName } } }
+        yield { type: 'stream_event', event: { type: 'content_block_stop', index: 1 } }
+        yield { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'completed-tool', content: 'Done' }] } }
+        yield messageStart('failed-response')
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Half of failed response' } } }
+        beforeFallback = readSnapshot()
+        yield assistantText('fallback-response', 'Complete fallback answer')
+        snapshot = readSnapshot()
+        yield resultCarrying('Complete fallback answer')
+      },
+    }
+    const result = await processStream(baseParams({
+      messageContent: undefined, v2Session: session,
+      callbacks: { onSnapshotReady: reader => { readSnapshot = reader } },
+    }))
+    expect(beforeFallback.finalContent).toBe(prefix + 'Half of failed response')
+    expect(snapshot.finalContent).toBe(prefix + 'Complete fallback answer')
+    expect(result.finalContent).toBe(prefix + 'Complete fallback answer')
+    expect(snapshot.thoughts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'text', content: 'Earlier text' }),
+      expect.objectContaining({ type: 'tool_use', toolResult: expect.objectContaining({ output: 'Done' }) }),
+    ]))
+  })
+
+  it('keeps a same-response aggregate from finalizing its still-open streamed block', async () => {
+    let readSnapshot!: () => StreamResult
+    let snapshot!: StreamResult
+    const session = {
+      async *stream() {
+        yield systemInit()
+        yield messageStart('streamed-reply')
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'First block' } } }
+        yield assistantText('streamed-reply', 'First block')
+        snapshot = readSnapshot()
+        yield { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } }
+        yield { type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } } }
+        yield { type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Second block' } } }
+        yield assistantText('streamed-reply', 'Second block')
+        yield { type: 'stream_event', event: { type: 'content_block_stop', index: 1 } }
+        yield resultCarrying('Second block')
+      },
+    }
+    const result = await processStream(baseParams({
+      messageContent: undefined, v2Session: session,
+      callbacks: { onSnapshotReady: reader => { readSnapshot = reader } },
+    }))
+    expect(snapshot.finalContent).toBe('First block')
+    expect(result.finalContent).toBe('First block\n\nSecond block')
+  })
+
+  it('preserves an aggregate-only prefix before a distinct streamed suffix', async () => {
+    const result = await processStream(baseParams({
+      messageContent: undefined,
+      v2Session: fakeSession([
+        systemInit(), assistantText('first', 'Completed prefix'), messageStart('second'),
+        { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Received suffix' } } },
+      ]),
+    }))
+    expect(result.finalContent).toBe('Completed prefix\n\nReceived suffix')
+  })
+
+  it('does not deduplicate equal text from distinct assistant responses', async () => {
+    const result = await processStream(baseParams({
+      messageContent: undefined,
+      v2Session: fakeSession([
+        systemInit(), messageStart('first'),
+        { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Repeated reply' } } },
+        { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } },
+        assistantText('first', 'Repeated reply'),
+        assistantText('second', 'Repeated reply'),
+      ]),
+    }))
+    expect(result.finalContent).toBe('Repeated reply\n\nRepeated reply')
+  })
+
+  it.each(['Bash', 'TodoWrite'])('preserves the %s continuity rule when a streamed response also carries its aggregate', async toolName => {
+    const result = await processStream(baseParams({
+      messageContent: undefined,
+      v2Session: fakeSession([
+        systemInit(), messageStart('first'),
+        { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Earlier text' } } },
+        { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } },
+        { type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'tool-1', name: toolName } } },
+        { type: 'stream_event', event: { type: 'content_block_stop', index: 1 } },
+        assistantText('first', 'Earlier text'),
+        { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'done' }] } },
+        messageStart('second'),
+        { type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Final answer' } } },
+        { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } },
+        assistantText('second', 'Final answer'), resultCarrying('Final answer'),
+      ]),
+    }))
+    expect(result.finalContent).toBe(toolName === 'Bash' ? 'Final answer' : 'Earlier text\n\nFinal answer')
+  })
+
+  it('does not fabricate text or a session id before any output', async () => {
+    let snapshot!: StreamResult
+    await processStream(baseParams({
+      messageContent: undefined,
+      callbacks: { onSnapshotReady: readSnapshot => { snapshot = readSnapshot() } },
+    }))
+    expect(snapshot).toMatchObject({ finalContent: '', hasMeaningfulContent: false, firstEventReceived: false, thoughts: [] })
+    expect(snapshot.capturedSessionId).toBeUndefined()
+  })
+})
+
 describe('processStream context gauge', () => {
   beforeEach(() => {
     vi.clearAllMocks()

@@ -24,7 +24,9 @@ import type {
   SingleCallUsage,
   SessionState
 } from './types'
+import type { Goal, GoalChangeSource } from '../../../shared/types/goal'
 import { emitAgentEvent } from './events'
+import { createDeltaCoalescer, type DeltaCoalescer } from './delta-coalescer'
 import { parseSDKMessage } from './message-utils'
 import {
   extractRealAssistantUsage,
@@ -48,9 +50,25 @@ import { analytics } from '../analytics/analytics.service'
 import { AnalyticsEvents } from '../analytics/types'
 import { deriveErrorCode } from '../analytics/error-code'
 import { logWriteOutsideSpace } from '../space-scope'
+import { beginApiRetry, endApiRetry, parseApiRetryMessage } from './api-retry'
+import { explainEngineError } from './local-connection'
 
 // Unified fallback error suffix - guides user to check logs
 const FALLBACK_ERROR_HINT = 'Check logs in Settings > System > Logs.'
+
+// A turn that ran out of steps, with or without a partial answer
+const MAX_TURNS_NOTICE = 'Reached the maximum turn limit. Send a message to continue.'
+
+/**
+ * The step limit named in an error_max_turns result's text, which closes on
+ * it: "Reached maximum number of turns (N)" (Claude Code), "… limit is N"
+ * (Halo SDK, which also names it in a system message first).
+ */
+function stepLimitFromErrors(errors: unknown[] | undefined): number | undefined {
+  const text = typeof errors?.[0] === 'string' ? errors[0] : ''
+  const match = /(\d+)\D*$/.exec(text)
+  return match ? Number(match[1]) : undefined
+}
 
 // ============================================
 // Telemetry: tool usage aggregation
@@ -210,6 +228,8 @@ export interface StreamCallbacks {
    *  Consumer uses this to create the assistant placeholder message.
    *  Fires once per stream() call (first system:init only). */
   onTurnInit?(): void
+  /** Supplies a lazy authoritative snapshot for synchronous retirement or thrown streams. */
+  onSnapshotReady?(readSnapshot: () => StreamResult): void
 }
 
 /**
@@ -240,6 +260,8 @@ export interface StreamResult {
   errorThought?: Thought
   /** Whether the session hit the SDK's maxTurns limit (error_max_turns subtype) */
   reachedMaxTurns: boolean
+  /** The step limit the engine said it reached, when it named one */
+  maxTurnsLimit?: number
   /** Whether at least one event was received in this stream() call */
   firstEventReceived: boolean
   /** Whether the post-abort drain timed out without receiving a result.
@@ -271,8 +293,10 @@ export interface ProcessStreamParams {
    *  When provided, token-usage display uses it instead of guessing from the
    *  model name — keeps the UI window consistent with compaction behavior. */
   contextWindow?: number
-  /** Abort controller for cancellation */
+  /** Abort controller for per-turn interruption; the stream drains its result. */
   abortController: AbortController
+  /** Session retirement ends consumption without publishing late output. */
+  sessionSignal?: AbortSignal
   /** Timestamp of send start (for timing logs) */
   t0: number
   /** Strategy callbacks for caller-specific behavior */
@@ -301,6 +325,21 @@ export interface ProcessStreamParams {
  * @returns StreamResult with final content, thoughts, token usage, and status flags
  */
 export async function processStream(params: ProcessStreamParams): Promise<StreamResult> {
+  const deltas = createDeltaCoalescer(params.spaceId, params.conversationId)
+  // A stop shows at once what streamed before it; a retired stream publishes nothing more.
+  const settle = () => (params.sessionSignal?.aborted ? deltas.discard() : deltas.flush())
+  params.abortController.signal.addEventListener('abort', settle)
+  params.sessionSignal?.addEventListener('abort', settle)
+  try {
+    return await consumeStream(params, deltas)
+  } finally {
+    params.abortController.signal.removeEventListener('abort', settle)
+    params.sessionSignal?.removeEventListener('abort', settle)
+    settle()
+  }
+}
+
+async function consumeStream(params: ProcessStreamParams, deltas: DeltaCoalescer): Promise<StreamResult> {
   const {
     v2Session,
     sessionState,
@@ -310,41 +349,21 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
     displayModel,
     contextWindow,
     abortController,
+    sessionSignal,
     t0,
     callbacks
   } = params
 
-  // Only keep track of the LAST text block as the final reply
-  // Intermediate text blocks are shown in thought process, not accumulated into message bubble
-  //
-  // TODO: lastTextContent can be corrupted by dual-path state interference.
-  //   The for-await loop processes both stream_events (token-level SSE) and SDK messages
-  //   (complete assistant/result messages). Both paths write to lastTextContent and share
-  //   the hadSubstantiveToolSinceLastText flag. When parseSDKMessage (message-utils.ts)
-  //   skips tool_use blocks for assistant messages, the SDK message path's text handler
-  //   resets hadSubstantiveToolSinceLastText without the corresponding tool_use ever
-  //   setting it — corrupting the stream_event path's merge/overwrite logic.
-  //
-  //   Current impact: IM channels (app-chat.ts) now bypass this by extracting text
-  //   directly from raw SDK messages (same principle as JSONL → AppChatView path).
-  //   Halo UI uses frontend delta accumulation (unaffected).
-  //   The main chat path (send-message.ts) persists finalContent via updateLastMessage —
-  //   investigate whether this path is also affected under certain provider/adapter configs.
-  //
-  //   Root fix options:
-  //   - Skip SDK message path writes to shared state when stream_events are active
-  //   - Make parseSDKMessage return tool_use thoughts for assistant messages
-  //   - Separate state tracking per path
+  const assertSessionActive = () => {
+    if (!sessionSignal?.aborted) return
+    console.warn(`[Agent][${conversationId}] Discarded retired session stream: consumer stopped before output could be published`)
+    throw Object.assign(new Error('Session consumer stopped'), { name: 'AbortError' })
+  }
+
+  // Consecutive text blocks form one reply; substantive tools break continuity.
   let lastTextContent = ''
 
-  // Authoritative final content locked at the SDK result thought.
-  // Set exactly once when the result message arrives. Unlike lastTextContent, this variable
-  // is never touched after the result thought, so subsequent stream_events (e.g. a trailing
-  // content_block_stop that re-fires after the result) cannot corrupt it.
-  //
-  // Note: this only protects against POST-result corruption. If lastTextContent is already
-  // wrong at result time (due to the dual-path issue above), lockedFinalContent locks a bad value.
-  // IM channels have a separate fix (see app-chat.ts lastAssistantText).
+  // A trailing frame must not rewrite the reply finalized by the result envelope.
   let lockedFinalContent = ''
 
   let capturedSessionId: string | undefined
@@ -419,12 +438,15 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
   // Token-level streaming state
   let currentStreamingText = ''  // Accumulates text_delta tokens
   let isStreamingTextBlock = false  // True when inside a text content block
-  const STREAM_THROTTLE_MS = 30  // Throttle updates to ~33fps
+  let streamingTextBlockIndex: number | undefined
+  // The aggregate for a streamed response still adds a thought, but not its text twice.
+  let streamedTextResponse: { messageId: string | undefined } | null = null
 
   // Track if SDK reported error_during_execution (for interrupted detection)
   let hadErrorDuringExecution = false
   // Track if SDK reported error_max_turns (session hit the configured maxTurns limit)
   let hadMaxTurnsReached = false
+  let maxTurnsLimit: number | undefined
   // Track if we received a result message (for detecting stream interruption)
   let receivedResult = false
 
@@ -462,6 +484,88 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
 
   // Tool ID to Thought ID mapping - for merging tool_result into tool_use
   const toolIdToThoughtId = new Map<string, string>()
+  let nextStreamThoughtId = 0
+  const attemptTools = new Map<string, string>()
+  let attemptTextBaseline = lastTextContent
+  let attemptStreamingTextBaseline = currentStreamingText
+  let attemptToolBreakBaseline = hadSubstantiveToolSinceLastText
+
+  const beginStreamingAttempt = (): void => {
+    if (isStreamingTextBlock || streamingBlocks.size > 0 ||
+        [...attemptTools.keys()].some(thoughtId =>
+          !sessionState.thoughts.find((t: Thought) => t.id === thoughtId)?.toolResult)) return
+    attemptTools.clear()
+    attemptTextBaseline = lastTextContent
+    attemptStreamingTextBaseline = currentStreamingText
+    attemptToolBreakBaseline = hadSubstantiveToolSinceLastText
+  }
+
+  const abandonStreamingAttempt = (): void => {
+    for (const block of streamingBlocks.values()) {
+      if (block.type !== 'thinking') continue
+      const thought = sessionState.thoughts.find((t: Thought) => t.id === block.thoughtId)
+      if (thought) {
+        thought.content = block.content
+        thought.isStreaming = false
+      }
+      emitAgentEvent('agent:thought-delta', spaceId, conversationId, {
+        thoughtId: block.thoughtId,
+        content: block.content,
+        isComplete: true
+      })
+    }
+
+    let abandonedTools = 0
+    for (const [thoughtId, toolId] of attemptTools) {
+      const thought = sessionState.thoughts.find((t: Thought) => t.id === thoughtId)
+      if (!thought || thought.toolResult) continue
+      const block = [...streamingBlocks.values()].find(b => b.thoughtId === thoughtId)
+      const toolResult = {
+        output: 'Not run: the model request was interrupted and sent again.',
+        isError: true,
+        timestamp: new Date().toISOString()
+      }
+      thought.isStreaming = false
+      thought.isReady = true
+      thought.toolResult = toolResult
+      if (block) {
+        emitAgentEvent('agent:thought-delta', spaceId, conversationId, {
+          thoughtId,
+          toolInput: {},
+          isComplete: true,
+          isReady: true,
+          isToolInput: true
+        })
+      }
+      emitAgentEvent('agent:thought-delta', spaceId, conversationId, {
+        thoughtId,
+        toolResult,
+        isToolResult: true
+      })
+      toolIdToThoughtId.delete(toolId)
+      abandonedTools++
+    }
+    streamingBlocks.clear()
+    attemptTools.clear()
+
+    const rolledBackText = isStreamingTextBlock ||
+      lastTextContent !== attemptTextBaseline || currentStreamingText !== attemptStreamingTextBaseline
+    isStreamingTextBlock = false
+    streamingTextBlockIndex = undefined
+    streamedTextResponse = null
+    lastTextContent = attemptTextBaseline
+    currentStreamingText = attemptStreamingTextBaseline
+    hadSubstantiveToolSinceLastText = attemptToolBreakBaseline
+    if (rolledBackText) {
+      emitAgentEvent('agent:message', spaceId, conversationId, {
+        type: 'message',
+        content: attemptTextBaseline,
+        isComplete: false,
+        isStreaming: false
+      })
+    }
+    console.log(`[Agent][${conversationId}] api_retry rolled back attempt: not_run_tools=${abandonedTools} text_reset=${rolledBackText}`)
+  }
 
   const t1 = Date.now()
 
@@ -490,10 +594,45 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
   // Track whether onTurnInit has been called (once per stream() call)
   let turnInitFired = false
 
+  const readSnapshot = (): StreamResult => {
+    const openThoughts = new Map([...streamingBlocks.values()].map(block => [block.thoughtId, block]))
+    const thoughts = openThoughts.size === 0 ? sessionState.thoughts : sessionState.thoughts.map(thought => {
+      const block = openThoughts.get(thought.id)
+      if (!block) return thought
+      return {
+        ...thought,
+        ...(block.type === 'thinking' ? { content: block.content } : {}),
+        isStreaming: false,
+      }
+    })
+    const finalContent = lockedFinalContent ||
+      (isStreamingTextBlock ? currentStreamingText : lastTextContent || currentStreamingText) || ''
+    const errorThought = thoughts.find(thought => thought.type === 'error')
+    const wasAborted = abortController.signal.aborted
+    return {
+      finalContent,
+      hasMeaningfulContent: finalContent.trim().length > 0,
+      thoughts,
+      tokenUsage,
+      capturedSessionId,
+      isInterrupted: !receivedResult || hadErrorDuringExecution,
+      wasAborted,
+      hasErrorThought: !!errorThought,
+      errorThought,
+      reachedMaxTurns: hadMaxTurnsReached,
+      ...(maxTurnsLimit !== undefined ? { maxTurnsLimit } : {}),
+      firstEventReceived: firstEventFired,
+      drainTimedOut: wasAborted && drainStartTime !== null && !receivedResult,
+    }
+  }
+  callbacks.onSnapshotReady?.(readSnapshot)
+  assertSessionActive()
+
   // Stream messages from V2 session
   // Single-turn stream consumption: process events until stream() completes.
   // The consumer's outer loop handles turn boundaries and re-entering stream().
   for await (const sdkMessage of v2Session.stream()) {
+    assertSessionActive()
     loopIterationCount++
 
     // Track first event for no-event detection
@@ -505,8 +644,10 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
     // Fires once per stream() call; consumer uses this to create assistant placeholder.
     if (!turnInitFired && sdkMessage.type === 'system' && (sdkMessage as any).subtype === 'init') {
       turnInitFired = true
+      capturedSessionId = (sdkMessage as { session_id?: string }).session_id
       if (callbacks.onTurnInit) {
         callbacks.onTurnInit()
+        assertSessionActive()
       }
     }
 
@@ -545,6 +686,11 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
       continue
     }
 
+    // Whatever this frame publishes goes out after the deltas streamed before it.
+    if (sdkMessage.type !== 'stream_event' || (sdkMessage as any).event?.type !== 'content_block_delta') {
+      deltas.flush()
+    }
+
     // The SDK keeps emitting after `result`; how long it does so and what it
     // sends is the only visibility into that tail.
     if (resultReceivedAt !== null) {
@@ -564,6 +710,17 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
     // Notify caller of raw SDK message (for JSONL persistence in automation)
     if (callbacks.onRawMessage) {
       callbacks.onRawMessage(sdkMessage)
+      assertSessionActive()
+    }
+
+    // A pending retry is over as soon as the resent request answers.
+    if (
+      sessionState.apiRetry &&
+      (sdkMessage.type === 'stream_event' || sdkMessage.type === 'assistant') &&
+      (sdkMessage as any).parent_tool_use_id == null
+    ) {
+      console.log(`[Agent][${conversationId}] api_retry recovered on attempt ${sessionState.apiRetry.state.attempt}`)
+      endApiRetry(sessionState)
     }
 
     // Handle stream_event for token-level streaming (text only)
@@ -587,7 +744,9 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
       // message_start, the counts from message_delta — see streamUsageByMessageId
       // for the telemetry side and `lastSingleUsage` for the context gauge.
       if (event.type === 'message_start') {
+        beginStreamingAttempt()
         streamingMessageId = event.message?.id
+        streamedTextResponse = null
       } else if (event.type === 'message_delta') {
         const deltaUsage = extractStreamDeltaUsage(event)
         if (deltaUsage) {
@@ -603,20 +762,16 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
       // Text block started
       if (event.type === 'content_block_start' && event.content_block?.type === 'text') {
         isStreamingTextBlock = true
+        streamingTextBlockIndex = event.index ?? 0
+        streamedTextResponse = { messageId: streamingMessageId }
         const blockText = event.content_block.text || ''
-
         if (hadSubstantiveToolSinceLastText) {
-          // A substantive tool occurred — previous text was transitional, start fresh
-          currentStreamingText = blockText
-          hadSubstantiveToolSinceLastText = false
-        } else {
-          // Consecutive text block (or only transparent tools in between) — append
-          if (currentStreamingText) {
-            currentStreamingText += '\n\n' + blockText
-          } else {
-            currentStreamingText = blockText
-          }
+          lastTextContent = ''
         }
+        currentStreamingText = lastTextContent
+          ? lastTextContent + '\n\n' + blockText
+          : blockText
+        hadSubstantiveToolSinceLastText = false
 
         // 🔑 Send precise signal for new text block (fixes truncation bug)
         // This is 100% reliable - comes directly from SDK's content_block_start event
@@ -634,7 +789,7 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
       // Thinking block started - send empty thought immediately
       if (event.type === 'content_block_start' && event.content_block?.type === 'thinking') {
         const blockIndex = event.index ?? 0
-        const thoughtId = `thought-thinking-${Date.now()}-${blockIndex}`
+        const thoughtId = `thought-thinking-${Date.now()}-${nextStreamThoughtId++}`
 
         // Track this block for delta correlation
         streamingBlocks.set(blockIndex, {
@@ -668,12 +823,8 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
           const delta = event.delta.thinking || ''
           blockState.content += delta
 
-          // Send delta to renderer for incremental update
-          emitAgentEvent('agent:thought-delta', spaceId, conversationId, {
-            thoughtId: blockState.thoughtId,
-            delta,
-            content: blockState.content  // Also send full content for fallback
-          })
+          // Delta only: the accumulated text goes out once, with isComplete at block stop.
+          deltas.thought(blockState.thoughtId, delta)
         }
       }
 
@@ -681,14 +832,7 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && isStreamingTextBlock) {
         const delta = event.delta.text || ''
         currentStreamingText += delta
-
-        // Send delta immediately without throttling
-        emitAgentEvent('agent:message', spaceId, conversationId, {
-          type: 'message',
-          delta,
-          isComplete: false,
-          isStreaming: true
-        })
+        deltas.text(delta)
       }
 
       // ========== Tool use block streaming ==========
@@ -697,7 +841,8 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
         const blockIndex = event.index ?? 0
         const toolId = event.content_block.id || `tool-${Date.now()}`
         const toolName = event.content_block.name || 'Unknown'
-        const thoughtId = `thought-tool-${Date.now()}-${blockIndex}`
+        const thoughtId = `thought-tool-${Date.now()}-${nextStreamThoughtId++}`
+        attemptTools.set(thoughtId, toolId)
 
         // Mark substantive tool — breaks text continuity (transparent tools like TodoWrite do not)
         if (!isTransparentTool(toolName)) {
@@ -737,21 +882,14 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
         // We track the toolId here so we can check when the block completes.
       }
 
-      // Tool use input JSON delta - accumulate partial JSON
+      // Tool use input JSON delta - accumulate partial JSON. Nothing is published:
+      // no client shows partial input, and the parsed input goes out at block stop.
       if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta') {
         const blockIndex = event.index ?? 0
         const blockState = streamingBlocks.get(blockIndex)
 
         if (blockState && blockState.type === 'tool_use') {
-          const partialJson = event.delta.partial_json || ''
-          blockState.content += partialJson
-
-          // Send delta to renderer (for progress indication, not for parsing)
-          emitAgentEvent('agent:thought-delta', spaceId, conversationId, {
-            thoughtId: blockState.thoughtId,
-            delta: partialJson,
-            isToolInput: true  // Flag: this is tool input JSON, not thinking text
-          })
+          blockState.content += event.delta.partial_json || ''
         }
       }
 
@@ -841,8 +979,9 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
         }
 
         // Handle text block stop (existing logic)
-        if (isStreamingTextBlock) {
+        if (isStreamingTextBlock && streamingTextBlockIndex === blockIndex) {
           isStreamingTextBlock = false
+          streamingTextBlockIndex = undefined
           // Send final content of this block (full accumulated text including merged blocks)
           emitAgentEvent('agent:message', spaceId, conversationId, {
             type: 'message',
@@ -910,6 +1049,7 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
     // Parse SDK message into Thought and send to renderer
     // Pass credentials.model to display the user's actual configured model
     const thought = parseSDKMessage(sdkMessage, displayModel)
+    if (thought?.type === 'error') thought.content = explainEngineError(thought.content)
 
     if (thought) {
       // Handle tool_result specially - merge into corresponding tool_use thought
@@ -981,21 +1121,28 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
 
         // Handle specific thought types
         if (thought.type === 'text') {
-          // Merge consecutive text blocks: append if no substantive tool in between
-          if (hadSubstantiveToolSinceLastText || !lastTextContent) {
-            lastTextContent = thought.content
-            hadSubstantiveToolSinceLastText = false
-          } else {
-            // Consecutive text (or only transparent tools like TodoWrite in between) — append
-            lastTextContent += '\n\n' + thought.content
+          const messageId = (sdkMessage as { message?: { id?: string } }).message?.id
+          const alreadyStreamed = sdkMessage.type === 'assistant' && streamedTextResponse !== null &&
+            (streamedTextResponse.messageId === undefined || messageId === streamedTextResponse.messageId)
+          if (!alreadyStreamed) {
+            if (sdkMessage.type === 'assistant' && isStreamingTextBlock) {
+              console.warn(`[Agent][${conversationId}] Discarded unfinished streamed text block ${streamingTextBlockIndex}: superseded by a completed assistant response`)
+              isStreamingTextBlock = false
+              streamingTextBlockIndex = undefined
+              currentStreamingText = ''
+            }
+            if (hadSubstantiveToolSinceLastText || !lastTextContent) {
+              lastTextContent = thought.content
+              hadSubstantiveToolSinceLastText = false
+            } else {
+              lastTextContent += '\n\n' + thought.content
+            }
+            emitAgentEvent('agent:message', spaceId, conversationId, {
+              type: 'message',
+              content: lastTextContent,
+              isComplete: false
+            })
           }
-
-          // Send streaming update - frontend shows this during generation
-          emitAgentEvent('agent:message', spaceId, conversationId, {
-            type: 'message',
-            content: lastTextContent,
-            isComplete: false
-          })
         } else if (thought.type === 'tool_use') {
           // Mark substantive tool — breaks text continuity
           if (!isTransparentTool(thought.toolName || '')) {
@@ -1065,6 +1212,36 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
             preTokens: compactMetadata.pre_tokens
           })
         }
+      }
+
+      // A model request failed and the engine will send it again after a wait.
+      if (subtype === 'api_retry') {
+        const retry = parseApiRetryMessage(msg)
+        if (retry) {
+          console.warn(
+            `[Agent][${conversationId}] api_retry attempt=${retry.attempt}/${retry.maxRetries}` +
+            ` delay_ms=${retry.delayMs} status=${retry.errorStatus ?? 'none'} kind=${retry.errorKind}` +
+            ` reason="${(retry.errorMessage ?? '').slice(0, 200).replace(/"/g, "'")}"`
+          )
+          abandonStreamingAttempt()
+          beginApiRetry(sessionState, retry)
+        } else {
+          console.warn(`[Agent][${conversationId}] api_retry frame ignored: unexpected shape`)
+        }
+      }
+
+      // Halo SDK names the step limit here, just before its error_max_turns result.
+      if (subtype === 'max_turns_reached' && typeof msg.max_turns === 'number') {
+        maxTurnsLimit = msg.max_turns
+      }
+
+      // Session goal changed (engines with features.goal). A user-side change
+      // is echoed here once the engine hands it to the model.
+      if (subtype === 'goal_updated') {
+        const goal = (msg.goal ?? null) as Goal | null
+        const source: GoalChangeSource = msg.source === 'user' ? 'user' : 'agent'
+        console.log(`[Agent][${conversationId}] Goal updated by ${source}: ${goal ? goal.status : 'removed'}`)
+        emitAgentEvent('agent:goal-updated', spaceId, conversationId, { goal, source, seenByModel: true })
       }
 
       // Extract MCP server status and tools list from system message
@@ -1144,22 +1321,23 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
         capturedSessionId = sessionIdFromMsg as string
       }
 
-      // Check for error_during_execution (interrupted) vs real errors
-      // Note: Real API errors (is_error=true) are already handled by parseSDKMessage above
-      // which creates an error thought and triggers agent:error via the thought.type === 'error' branch
+      // Check for the step limit, error_during_execution (interrupted) and real errors.
+      // Real API errors (is_error=true) are already handled by parseSDKMessage above,
+      // which creates an error thought and triggers agent:error via the thought.type === 'error' branch.
+      // The step limit is told by its subtype alone: the engines flag it is_error,
+      // but it is a limit the turn ran into, not a failure (parseSDKMessage agrees).
       const isError = (sdkMessage as any).is_error === true
-      if (isError) {
-        const errors = (sdkMessage as any).errors as unknown[] | undefined
+      const errors = (sdkMessage as any).errors as unknown[] | undefined
+      if ((sdkMessage as any).subtype === 'error_max_turns') {
+        hadMaxTurnsReached = true
+        maxTurnsLimit ??= stepLimitFromErrors(errors)
+        console.log(`[Agent][${conversationId}] SDK result subtype=error_max_turns, num_turns=${(sdkMessage as any).num_turns}, limit=${maxTurnsLimit ?? 'unknown'} - session reached turn limit`)
+      } else if (isError) {
         console.log(`[Agent][${conversationId}] ⚠️ SDK error (is_error=${isError}, errors=${errors?.length || 0}): ${((sdkMessage as any).result || '').substring(0, 200)}`)
       } else if ((sdkMessage as any).subtype === 'error_during_execution') {
         // Mark as interrupted - will be used for empty response handling
         hadErrorDuringExecution = true
         console.log(`[Agent][${conversationId}] SDK result subtype=error_during_execution but is_error=false, errors=[] - marked as interrupted`)
-      } else if ((sdkMessage as any).subtype === 'error_max_turns') {
-        // Session hit the configured maxTurns limit - this is a graceful SDK termination,
-        // not an error. Track it so we can show a clear message instead of "empty response".
-        hadMaxTurnsReached = true
-        console.log(`[Agent][${conversationId}] SDK result subtype=error_max_turns, num_turns=${(sdkMessage as any).num_turns} - session reached turn limit`)
       }
 
       // Extract token usage from result message
@@ -1170,39 +1348,33 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
     }
   }
 
+  assertSessionActive()
+  deltas.flush()
+
+  // A retry still pending here never got its answer: the turn ended on the
+  // final failure or on a stop.
+  if (sessionState.apiRetry) {
+    console.log(`[Agent][${conversationId}] api_retry abandoned at turn end (attempt ${sessionState.apiRetry.state.attempt})`)
+    endApiRetry(sessionState)
+  }
+
   // ========== Stream End Handling ==========
   //
   // Error conditions (truth table):
   // | Case | hasContent | isInterrupted | hasErrorThought | wasAborted | reachedMaxTurns | Send error?      |
   // |------|------------|---------------|-----------------|------------|-----------------|------------------|
   // | 1a   | yes        | -             | -               | yes        | -               | stopped by user  |
-  // | 1b   | yes        | yes           | -               | no         | -               | interrupted      |
-  // | 2    | yes        | no            | -               | no         | -               | no               |
+  // | 1c   | yes        | -             | -               | no         | yes             | max turns notice |
+  // | 1b   | yes        | yes           | -               | no         | no              | interrupted      |
+  // | 2    | yes        | no            | -               | no         | no              | no               |
   // | 3    | no         | yes           | no              | no         | -               | interrupted      |
   // | 4    | no         | no            | no              | no         | no              | empty response   |
   // | 5    | no         | -             | yes             | -          | -               | no               |
   // | 6    | no         | -             | -               | yes        | -               | no               |
   // | 7    | no         | no            | no              | no         | yes             | max turns notice |
 
-  // Prefer lockedFinalContent (captured at result thought, immune to post-result stream mutations).
-  // Fall back to lastTextContent for interrupted streams that never reach a result thought,
-  // then to currentStreamingText for streams that ended mid-block without a text_block_stop.
-  const finalContent = lockedFinalContent || lastTextContent || currentStreamingText || ''
-  // Whitespace-only content is the repair placeholder injected by the
-  // openai-compat router when the provider returned an empty response. Treat
-  // it as empty for error reporting so the user still sees the empty-response
-  // notice — while the placeholder keeps the session transcript valid, so
-  // continuing the conversation works.
-  const hasMeaningfulContent = finalContent.trim().length > 0
-  const wasAborted = abortController.signal.aborted
-  const hasErrorThought = sessionState.thoughts.some((t: Thought) => t.type === 'error')
-  // Two independent interrupt reasons: SDK reported error_during_execution, or stream ended unexpectedly
-  const isInterrupted = !receivedResult || hadErrorDuringExecution
-
-  // Find the error thought for callers
-  const errorThought = hasErrorThought
-    ? sessionState.thoughts.find((t: Thought) => t.type === 'error')
-    : undefined
+  const result = readSnapshot()
+  const { finalContent, hasMeaningfulContent, wasAborted, hasErrorThought, isInterrupted, errorThought } = result
 
   // Log content source for debugging. Gate on meaningful content so the
   // repair placeholder (whitespace-only) is logged as "no content", matching
@@ -1221,22 +1393,6 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
     console.log(`[Agent][${conversationId}] Error thought present: ${errorThought?.content}`)
   }
 
-  // Build the result object
-  const result: StreamResult = {
-    finalContent,
-    hasMeaningfulContent,
-    thoughts: sessionState.thoughts,
-    tokenUsage,
-    capturedSessionId,
-    isInterrupted,
-    wasAborted,
-    hasErrorThought,
-    errorThought,
-    reachedMaxTurns: hadMaxTurnsReached,
-    firstEventReceived: firstEventFired,
-    drainTimedOut: wasAborted && drainStartTime !== null && !receivedResult,
-  }
-
   const turnDurationMs = Date.now() - t0
   if (isInterrupted || hasErrorThought || wasAborted) {
     const errorSummary = String((errorThought?.content as unknown) ?? '').slice(0, 300).replace(/"/g, "'")
@@ -1249,6 +1405,7 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
   // handle persistence externally, legacy callers like app-chat.ts use this)
   if (callbacks.onComplete) {
     callbacks.onComplete(result)
+    assertSessionActive()
   }
 
   // Emit agent:complete for legacy callers that don't use the consumer.
@@ -1267,12 +1424,14 @@ export async function processStream(params: ProcessStreamParams): Promise<Stream
     if (hasMeaningfulContent) {
       // Has content: user aborted shows friendly message, other interrupts show warning
       if (wasAborted) return 'Stopped by user.'
+      // What was written so far is not the whole answer — say why it stopped
+      if (hadMaxTurnsReached) return MAX_TURNS_NOTICE
       return isInterrupted ? 'Model response interrupted unexpectedly.' : null
     } else {
       // No content: skip if already has error thought or user aborted
       if (hasErrorThought || wasAborted) return null
       // Max turns is a graceful SDK limit, not a crash — show a clear actionable message
-      if (hadMaxTurnsReached) return 'Reached the maximum turn limit. Send a message to continue.'
+      if (hadMaxTurnsReached) return MAX_TURNS_NOTICE
       return isInterrupted
         ? 'Model response interrupted unexpectedly.'
         : `Unexpected empty response. ${FALLBACK_ERROR_HINT}`

@@ -625,7 +625,7 @@ export class CodexEventNormalizer {
   private emitTerminalError(message: string): any[] {
     const messages: any[] = []
     if (!this.messageOpen) messages.push(this.openMessage())
-    messages.push(...assistantWithBlocks([{ type: 'text', text: message }]))
+    messages.push(...assistantWithBlocks([{ type: 'text', text: message }], this.messageId))
     messages.push(...this.closeMessage('end_turn'))
     messages.push(this.createResult(true, message))
     this.terminal = true
@@ -638,7 +638,7 @@ export class CodexEventNormalizer {
 
   private openMessage(): any {
     this.messageOpen = true
-    this.messageId = `codex-msg-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    this.messageId = newMessageId()
     this.nextBlockIndex = 0
     this.items.clear()
     return streamEvent({
@@ -768,7 +768,7 @@ export class CodexEventNormalizer {
    *
    * Why per-block aggregate (vs one aggregate at message close):
    *   - tool_use must arrive BEFORE its tool_result for id-based linking in
-   *     `apps/runtime/session-store.convertEventsToMessages` (toolUseMap is
+   *     `apps/runtime/session-transcript.convertEventsToMessages` (toolUseMap is
    *     populated lazily as assistant messages arrive). Codex emits
    *     `userWithToolResult` immediately on item.completed; emitting the
    *     aggregate at message close would put tool_use AFTER tool_result and
@@ -799,7 +799,7 @@ export class CodexEventNormalizer {
       //
       // Known trade-off: app-chat.ts persists aggregate `assistant` events
       // to JSONL (stream_event is filtered out per app-chat.ts:581). With
-      // text suppressed here, session-store.convertEventsToMessages can no
+      // text suppressed here, session-transcript.convertEventsToMessages can no
       // longer reconstruct the bubble text for Codex digital-human chat
       // history replay. Mitigation paths if that bites:
       //   a) Stop filtering stream_event from JSONL for Codex sessions
@@ -811,7 +811,7 @@ export class CodexEventNormalizer {
       // The interactive bubble is the priority — replay can be addressed
       // separately without re-introducing the doubling.
       if (this.context.includePartialMessages) return []
-      return assistantWithBlocks([{ type: 'text', text: state.textSoFar }])
+      return assistantWithBlocks([{ type: 'text', text: state.textSoFar }], this.messageId)
     }
     if (blockKind === 'thinking' || blockKind === 'thinking-summary') {
       if (!state.textSoFar) return []
@@ -821,7 +821,7 @@ export class CodexEventNormalizer {
       // and other top-level `type:'assistant'` consumers would still see
       // double thinking blocks on replay).
       if (this.context.includePartialMessages) return []
-      return assistantWithBlocks([{ type: 'thinking', thinking: state.textSoFar }])
+      return assistantWithBlocks([{ type: 'thinking', thinking: state.textSoFar }], this.messageId)
     }
     if (blockKind === 'tool') {
       return assistantWithBlocks([{
@@ -829,7 +829,7 @@ export class CodexEventNormalizer {
         id: state.toolId,
         name: state.toolName,
         input: state.toolInput,
-      }])
+      }], this.messageId)
     }
     return []
   }
@@ -875,11 +875,19 @@ function streamEvent(event: any): any {
   return { type: 'stream_event', event }
 }
 
-function assistantWithBlocks(content: any[]): any[] {
+function newMessageId(): string {
+  return `codex-msg-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+/**
+ * An aggregate carries the id of the message it belongs to: consumers count a
+ * new id as a new model call and attach usage by the message_start id.
+ */
+function assistantWithBlocks(content: any[], messageId: string | null): any[] {
   return [{
     type: 'assistant',
     message: {
-      id: `codex-msg-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      id: messageId ?? newMessageId(),
       role: 'assistant',
       content,
     },

@@ -12,12 +12,20 @@ import {
   getSpaceWithPreferences as serviceGetSpaceWithPreferences,
   openSpaceFolder as serviceOpenSpaceFolder,
   updateSpace as serviceUpdateSpace,
-  reorderSpaces as serviceReorderSpaces
+  reorderSpaces as serviceReorderSpaces,
+  getSpacePreferences as serviceGetSpacePreferences,
+  updateSpacePreferences as serviceUpdateSpacePreferences,
+  getSpaceDir,
+  setSpaceWorkingDir,
+  workingDirChangeProblem,
 } from '../services/space.service'
-import { getAppManager } from '../apps/manager'
-import { listAvailableSkills } from '../apps/skill-discovery'
-import { listConversations } from '../services/conversation.service'
-import { countSpaceFiles } from '../services/artifact.service'
+import { getSpaceMemoryStatus as serviceGetSpaceMemoryStatus, consolidateSpaceMemoryNow } from '../services/memory-consolidation'
+import { copyStoredSessions, countSessionAcquisitions, invalidateSessionsForSpace, isSpaceBusy, retireWorkingDirs } from '../services/agent'
+import { rerootSpaceWatcher } from '../services/watcher-host.service'
+import { rerootSpaceCache } from '../services/artifact-cache.service'
+import { listPinnedWorkDirs, repointSpaceEnvironments } from '../apps/runtime'
+import { resolve } from 'path'
+import type { MemorySettings } from '../../shared/types/memory'
 
 export interface ControllerResponse<T = unknown> {
   success: boolean
@@ -130,6 +138,111 @@ export function updateSpace(
   }
 }
 
+/** Spaces whose working directory is being changed right now. */
+const changingWorkingDir = new Set<string>()
+
+const SPACE_BUSY = 'A reply, run or background task is still going in this workspace. Change the folder once it has finished, or stop it first.'
+
+const STARTED_WHILE_COPYING = 'A reply or run started in this workspace while its conversations were being copied. Try again.'
+
+/**
+ * Point a space at another working directory — its folder was moved, deleted,
+ * or chosen wrongly. Nothing may be written to the old folder once its
+ * sessions are copied, or the next turn in the new folder would miss it:
+ *   1. refused while anything runs in the space;
+ *   2. the engine's stored sessions are copied to the new folder's name, so
+ *      conversations keep their memory — before anything points there;
+ *   3. refused if any session of the space was asked for meanwhile, even one
+ *      that has finished again; from this check to the end nothing awaits;
+ *   4. the space record, then every environment its digital humans pinned;
+ *      from then on no session starts in the folders it left, so a turn that
+ *      read the old folder just before is refused instead of run there;
+ *   5. resident sessions rebuild; the file panel and file triggers watch the
+ *      new folder.
+ * Nothing in either folder is moved, created or deleted, and Halo's own data
+ * for the space stays where it is. The default space keeps its folder.
+ */
+export async function changeSpaceWorkingDir(spaceId: string, workingDir: unknown): Promise<ControllerResponse> {
+  if (typeof workingDir !== 'string') return { success: false, error: 'Choose a folder by its full path.' }
+  const problem = workingDirChangeProblem(spaceId, workingDir.trim())
+  if (problem) return { success: false, error: problem }
+  if (changingWorkingDir.has(spaceId)) return { success: false, error: 'This workspace’s folder is already being changed.' }
+  if (isSpaceBusy(spaceId)) return { success: false, error: SPACE_BUSY }
+  const acquisitions = countSessionAcquisitions(spaceId)
+
+  const target = resolve(workingDir.trim())
+  changingWorkingDir.add(spaceId)
+  try {
+    const previous = new Set([getSpaceDir(spaceId), ...listPinnedWorkDirs(spaceId)])
+    previous.delete(target)
+    let carried = 0
+    for (const dir of previous) carried += await copyStoredSessions(dir, target)
+    if (isSpaceBusy(spaceId)) return { success: false, error: SPACE_BUSY }
+    if (countSessionAcquisitions(spaceId) !== acquisitions) return { success: false, error: STARTED_WHILE_COPYING }
+
+    const updated = setSpaceWorkingDir(spaceId, target)
+    if (!updated) return { success: false, error: 'Space not found' }
+    const repointed = repointSpaceEnvironments(spaceId, target)
+    retireWorkingDirs(spaceId, previous, target)
+    invalidateSessionsForSpace(spaceId, 'working directory change')
+    rerootSpaceWatcher(spaceId, target)
+    rerootSpaceCache(spaceId, target)
+    console.log(
+      `[SpaceController] ${spaceId} works in ${target} now (was ${[...previous].join(', ') || 'the same'}): ` +
+      `${carried} stored session file(s) carried over, ${repointed} pinned environment(s) moved`
+    )
+    return { success: true, data: updated }
+  } catch (error: unknown) {
+    console.error(`[SpaceController] Changing the working directory of ${spaceId} failed:`, error)
+    return { success: false, error: (error as Error).message }
+  } finally {
+    changingWorkingDir.delete(spaceId)
+  }
+}
+
+export function getSpacePreferences(spaceId: string): ControllerResponse {
+  try {
+    return { success: true, data: serviceGetSpacePreferences(spaceId) }
+  } catch (error: unknown) {
+    return { success: false, error: (error as Error).message }
+  }
+}
+
+/** Only the known preference groups are taken from the caller. */
+export function updateSpacePreferences(
+  spaceId: string,
+  body: { layout?: { artifactRailExpanded?: boolean; chatWidth?: number }; memory?: MemorySettings }
+): ControllerResponse {
+  try {
+    const preferences: { layout?: typeof body.layout; memory?: MemorySettings } = {}
+    if (body.layout && typeof body.layout === 'object') preferences.layout = body.layout
+    if (body.memory && typeof body.memory === 'object') preferences.memory = body.memory
+    const space = serviceUpdateSpacePreferences(spaceId, preferences)
+    return space ? { success: true, data: space } : { success: false, error: 'Failed to update space preferences' }
+  } catch (error: unknown) {
+    return { success: false, error: (error as Error).message }
+  }
+}
+
+export async function getSpaceMemoryStatus(spaceId: string): Promise<ControllerResponse> {
+  try {
+    const status = await serviceGetSpaceMemoryStatus(spaceId)
+    return status ? { success: true, data: status } : { success: false, error: 'Space not found' }
+  } catch (error: unknown) {
+    return { success: false, error: (error as Error).message }
+  }
+}
+
+export function consolidateSpaceMemory(spaceId: string): ControllerResponse {
+  try {
+    const result = consolidateSpaceMemoryNow(spaceId)
+    console.log(`[Space] Memory consolidation requested for ${spaceId}: started=${result.started}${result.reason ? ` (${result.reason})` : ''}`)
+    return { success: true, data: result }
+  } catch (error: unknown) {
+    return { success: false, error: (error as Error).message }
+  }
+}
+
 /**
  * Persist a user-defined space ordering.
  */
@@ -150,80 +263,6 @@ export function forgetSpace(spaceId: string): ControllerResponse {
   try {
     const result = serviceForgetSpace(spaceId)
     return { success: result }
-  } catch (error: unknown) {
-    const err = error as Error
-    return { success: false, error: err.message }
-  }
-}
-
-export interface SpaceSummary {
-  spaceId: string
-  fileCount: number
-  digitalHumanCount: number
-  skillCount: number
-  mcpCount: number
-  globalSkillCount: number
-  globalMcpCount: number
-  conversationCount: number
-}
-
-/** Files worth surfacing on a card, not the exact count of a real project. */
-const SUMMARY_FILE_COUNT_CAP = 999
-const SUMMARY_FILE_SCAN_DEPTH = 2
-
-/**
- * One space's asset counts for the workspace management page's cards.
- * Pulls from four domains (apps manager, skill discovery, conversations,
- * artifacts) — deliberately lives here rather than in space.service.ts,
- * which owns only the space registry itself.
- */
-async function buildSpaceSummary(spaceId: string, isMissing: boolean): Promise<SpaceSummary> {
-  const manager = getAppManager()
-
-  const digitalHumanCount = manager
-    ? manager.listApps({ spaceId, type: 'automation' }).filter(a => a.status !== 'uninstalled').length
-    : 0
-
-  const mcpApps = manager ? manager.listEffectiveMcpApps(spaceId) : []
-  const mcpCount = mcpApps.filter(a => a.spaceId === spaceId).length
-  const globalMcpCount = mcpApps.filter(a => a.spaceId === null).length
-
-  const skills = listAvailableSkills(spaceId)
-  const skillCount = skills.filter(s => s.scope === 'space').length
-  const globalSkillCount = skills.filter(s => s.scope === 'global').length
-
-  const conversationCount = listConversations(spaceId).length
-
-  // A disconnected space's path doesn't resolve — skip the scan outright
-  // rather than block on an unavailable mount point.
-  let fileCount = 0
-  if (!isMissing) {
-    try {
-      fileCount = await countSpaceFiles(spaceId, SUMMARY_FILE_COUNT_CAP, SUMMARY_FILE_SCAN_DEPTH)
-    } catch (error) {
-      console.error(`[Space] Failed to count files for summary (${spaceId}):`, error)
-    }
-  }
-
-  return { spaceId, fileCount, digitalHumanCount, skillCount, mcpCount, globalSkillCount, globalMcpCount, conversationCount }
-}
-
-/**
- * Asset summaries for every space, for the workspace management page's
- * cards. One call, computed concurrently, so the page doesn't fan out a
- * request per card.
- *
- * listSpaces() omits the Halo temp space (it has its own getter), but the
- * management page renders a card for it too — without its summary that card
- * shows empty counts.
- */
-export async function listSpaceSummaries(): Promise<ControllerResponse> {
-  try {
-    const spaces = [getHaloSpace(), ...serviceListSpaces()]
-    const summaries = await Promise.all(
-      spaces.map(s => buildSpaceSummary(s.id, !!s.isMissing))
-    )
-    return { success: true, data: summaries }
   } catch (error: unknown) {
     const err = error as Error
     return { success: false, error: err.message }

@@ -1,58 +1,58 @@
 /**
- * Canvas Lifecycle Manager - Centralized BrowserView and Tab Management
- *
- * This class manages the lifecycle of BrowserViews and Canvas tabs in an
- * imperative, predictable manner. It replaces the complex useEffect-based
- * lifecycle management that was prone to race conditions and timing issues.
- *
- * Key responsibilities:
- * - Tab creation, switching, closing, and reordering
- * - BrowserView creation, showing, hiding, and destruction
- * - State synchronization with React via callbacks
- *
- * Content types and rendering:
- * - code/markdown/json/csv/text: Load content via IPC, render in React
- * - image: Use halo-file:// protocol (bypasses CSP in renderer)
- * - pdf: Use BrowserView with file:// (BrowserView has no cross-origin restrictions)
- * - browser: Use BrowserView with https:// URLs
- *
- * Protocol: halo-file://
- * - Custom protocol registered in main process (protocol.service.ts)
- * - Used by <img> tags in renderer to bypass CSP restrictions
- * - NOT used for BrowserView (BrowserView can access file:// directly)
- *
- * Design principles:
- * - Single source of truth for tab and view state
- * - Imperative control flow (no React side effects)
- * - React only handles UI rendering and event triggering
+ * Owns Canvas tabs and their resource budgets independently of React viewers.
+ * BrowserView API names are retained for compatibility; their pages are webview
+ * guests in a permanent host, and AI-owned guests outlive borrowed Canvas tabs.
  */
 
 import { api } from '../api'
 import i18n from '../i18n'
 import { isBinaryExtension } from '../constants/file-types'
+import type { ArtifactChangeBatchEvent } from '../../shared/types/artifact'
+import type { MemoryPressureLevel } from '../../shared/types/memory-pressure'
+import {
+  HIDDEN_CONTENT_BUDGET_BYTES,
+  MAX_LIVE_BROWSER_VIEWS,
+  MAX_OPEN_TABS,
+} from '../../shared/constants/canvas-budget'
+import { planCanvasBudget, type CanvasBudgetLimits } from './canvas-budget'
+import { holdArtifactSpace } from './artifact-space-holds'
+import type { ChangesViewMemory } from '../types/changes-view'
+import type { ReferenceLineRange } from '../../shared/types/content-reference'
 
 // ============================================
 // Types
 // ============================================
 
+/** What the tab list renders; a change to any other field is not the list's business. */
+const TAB_LIST_FIELDS = ['type', 'title', 'path', 'url', 'isDirty', 'isLoading', 'error'] as const
+
 /** Tab types whose viewer parses raw bytes rather than text (see TabState.bytes). */
 const DOCUMENT_TYPES = new Set(['xlsx', 'docx', 'pdf'])
 
-export type ContentType =
-  | 'code'
-  | 'markdown'
-  | 'html'
-  | 'image'
-  | 'pdf'
-  | 'text'
-  | 'json'
-  | 'csv'
-  | 'xlsx'
-  | 'docx'
-  | 'pptx'
-  | 'browser'
-  | 'terminal'
-  | 'team'
+export const CONTENT_TYPES = [
+  'code',
+  'markdown',
+  'html',
+  'image',
+  'pdf',
+  'text',
+  'json',
+  'csv',
+  'xlsx',
+  'docx',
+  'pptx',
+  'browser',
+  'terminal',
+  'team',
+  'goal',
+  'changes',
+] as const
+
+export type ContentType = (typeof CONTENT_TYPES)[number]
+
+export function isContentType(value: unknown): value is ContentType {
+  return (CONTENT_TYPES as readonly unknown[]).includes(value)
+}
 
 export interface BrowserState {
   isLoading: boolean
@@ -67,6 +67,73 @@ export interface BrowserState {
   blockedUrl?: string
 }
 
+/**
+ * Per-tab view memory a viewer writes as the user moves around (scroll offset)
+ * and reads back when it mounts again. Mutable on purpose and never notified:
+ * nothing renders from it, and every snapshot of a tab points at the same
+ * object, so a remounting viewer always reads the latest value.
+ */
+export interface TabViewState {
+  scrollPosition?: number
+  /** Where a changes tab was left; owned by the changes viewer. */
+  changes?: ChangesViewMemory
+}
+
+/**
+ * What a changes tab shows: the Git repositories of a space (`repoRoot` picks
+ * the one a new tab starts on), or the edits one AI reply made with its edit tools.
+ */
+export type ChangesSource =
+  | { kind: 'git'; spaceId: string; repoRoot?: string }
+  | { kind: 'message'; spaceId: string; conversationId: string; messageId: string; title: string; replyAt: number }
+
+/**
+ * A one-shot request to show a place in a tab's content (going back to what a
+ * reference points at). The viewer handles it once its content is in, then
+ * clears it with `consumeReveal`.
+ */
+export interface RevealRequest {
+  /** Differs on every request, so asking for the same place twice reveals it again. */
+  seq: number
+  range?: ReferenceLineRange
+  /** The text as it was, to find the place again when the content changed. */
+  quote?: string
+  /**
+   * The quote is rendered text (a Markdown preview passage), so it finds the
+   * place only in rendered content and `range` is approximate.
+   */
+  passage?: boolean
+  /**
+   * Asked from the composer, where the user goes on typing: the viewer shows
+   * the place without taking keyboard focus.
+   */
+  keepFocus?: boolean
+  /** A pending comment on the place, gone back to for editing: its card there takes the focus. */
+  commentId?: string
+  /** Changes view only: the file and the side of its diff. */
+  path?: string
+  side?: 'before' | 'after'
+  /** Changes view only: the sub-page to show. */
+  page?: 'overview'
+}
+
+export type RevealTarget = Omit<RevealRequest, 'seq'>
+
+export interface OpenFileOptions {
+  title?: string
+  reveal?: RevealTarget
+}
+
+function isSameChangesSource(a: ChangesSource, b: ChangesSource): boolean {
+  if (a.kind === 'git' && b.kind === 'git') return a.spaceId === b.spaceId
+  if (a.kind === 'message' && b.kind === 'message') return a.conversationId === b.conversationId && a.messageId === b.messageId
+  return false
+}
+
+/**
+ * One open tab. Immutable: every change replaces the object, so identity
+ * tells subscribers (and React memoization) whether anything changed.
+ */
 export interface TabState {
   id: string
   type: ContentType
@@ -83,27 +150,43 @@ export interface TabState {
   language?: string
   mimeType?: string
   isDirty: boolean
+  /**
+   * The file's text on disk as last seen while the tab has unsaved edits —
+   * what a revert restores and what an on-disk change is compared against.
+   * Held only while dirty.
+   */
+  savedContent?: string
+  /** The file changed on disk while the tab had unsaved edits; the user picks a side. */
+  diskConflict?: boolean
+  /** Content dropped to stay within the canvas budget; re-read when the tab is shown. */
+  contentUnloaded?: boolean
   isLoading: boolean
   error?: string
-  scrollPosition?: number
+  /** Shared by every snapshot of the tab; see TabViewState. */
+  view: TabViewState
   browserViewId?: string
   browserState?: BrowserState
   isEditMode?: boolean // For markdown tabs - switches between preview and editor
   terminalSessionId?: string // For terminal tabs - the pty session id
   /** Persistent Halo team rendered by the Team workbench. */
   teamId?: string
-  /**
-   * Whether the Canvas owns the BrowserView's lifecycle.
-   * true  — created via createBrowserView (openUrl/openPdf): destroy on close.
-   * false — attached via attachAIBrowserView: the AI drives a single view whose
-   *         WebContents outlives any tab, so closing detaches rather than
-   *         destroys. Destroying it would end the AI's live browser session.
-   */
+  /** Conversation whose goal the goal editor edits. */
+  goal?: { spaceId: string; conversationId: string }
+  /** What a changes tab shows. */
+  changes?: ChangesSource
+  /** A place to show once; see RevealRequest. */
+  reveal?: RevealRequest
+  /** False for borrowed AI pages: closing their tab must not end the AI session. */
   browserViewOwned?: boolean
 }
 
 // Callback types
-type TabsChangeCallback = (tabs: TabState[]) => void
+/** A tab as its opener describes it; the lifecycle adds the view memory. */
+type NewTab = Omit<TabState, 'view'>
+
+type TabListChangeCallback = (tabs: readonly TabState[]) => void
+type TabChangeCallback = (tab: TabState) => void
+type BudgetEvictionCallback = (event: { closedTabs: number; limit: number }) => void
 type ActiveTabChangeCallback = (tabId: string | null) => void
 type BrowserStateChangeCallback = (tabId: string, state: BrowserState) => void
 type OpenStateChangeCallback = (isOpen: boolean) => void
@@ -350,16 +433,46 @@ class CanvasLifecycle {
 
   // Track which space the current tabs belong to
   private currentSpaceId: string | null = null
+  /**
+   * Keeps the space's watcher alive while a tab shows one of its files, so
+   * open files refresh and detect disk conflicts even with the file tree closed.
+   */
+  private spaceHold: { spaceId: string; release: () => void } | null = null
 
   // Container bounds getter (set by BrowserViewer)
   private containerBoundsGetter: (() => DOMRect | null) | null = null
 
   // IPC listener cleanup
   private browserStateUnsubscribe: (() => void) | null = null
+  private browserPageGoneUnsubscribe: (() => void) | null = null
   private artifactChangedUnsubscribe: (() => void) | null = null
+  private memoryPressureUnsubscribe: (() => void) | null = null
+
+  private memoryPressure: MemoryPressureLevel = 'normal'
+  private applyingBudgets = false
+  /** A budget pass was asked for while one was running; run again when it ends. */
+  private budgetsDirty = false
+  /** Makes each created view id unique, so a replacement never collides with one still being destroyed. */
+  private viewGeneration = 0
+  /** At most one browser page creation per tab, including after an unexpected loss. */
+  private creatingViews = new Map<string, Promise<void>>()
+  /** Explicit close/eviction must never be mistaken for an unexpected lost page. */
+  private releasingViews = new Set<string>()
+  private budgetEvictionCallbacks: Set<BudgetEvictionCallback> = new Set()
+
+  /** Tab id -> activation sequence number; larger = used more recently. */
+  private lastActivated = new Map<string, number>()
+  private activationSeq = 0
+  private revealSeq = 0
+
+  /** Cached `getTabs()` result; cleared by any change. */
+  private tabsSnapshot: readonly TabState[] | null = null
+  /** The tabs as of the last tab-list notification (see getTabListSnapshot). */
+  private tabListSnapshot: readonly TabState[] = []
 
   // Callback subscriptions
-  private tabsChangeCallbacks: Set<TabsChangeCallback> = new Set()
+  private tabListChangeCallbacks: Set<TabListChangeCallback> = new Set()
+  private tabChangeCallbacks: Set<TabChangeCallback> = new Set()
   private activeTabChangeCallbacks: Set<ActiveTabChangeCallback> = new Set()
   private browserStateChangeCallbacks: Set<BrowserStateChangeCallback> = new Set()
   private openStateChangeCallbacks: Set<OpenStateChangeCallback> = new Set()
@@ -380,6 +493,16 @@ class CanvasLifecycle {
     confirmSingleClose: (sessionId: string) => Promise<boolean>
     disposeOnBulkClose: (sessionId: string) => Promise<void>
   } | null = null
+
+  /**
+   * Content type -> prompt shown before a user closes a tab of that type with
+   * unsaved changes. Registered by the domain that owns the editor; it resolves
+   * false to keep the tab open. Types with no guard close without asking.
+   */
+  private dirtyCloseGuards = new Map<ContentType, (tab: TabState) => Promise<boolean>>()
+
+  /** Content type -> reload for tabs whose content is neither a file nor a view. */
+  private refreshHandlers = new Map<ContentType, (tab: TabState) => Promise<void>>()
 
   // ============================================
   // Initialization
@@ -405,11 +528,9 @@ class CanvasLifecycle {
     this.browserStateUnsubscribe = api.onBrowserStateChange((data: unknown) => {
       const event = data as { viewId: string; state: BrowserState & { url?: string; title?: string } }
 
-      // Find the tab with this browserViewId
       for (const [tabId, tab] of this.tabs) {
         if (tab.browserViewId === event.viewId) {
-          // Update tab state
-          tab.browserState = {
+          const browserState: BrowserState = {
             isLoading: event.state.isLoading,
             canGoBack: event.state.canGoBack,
             canGoForward: event.state.canGoForward,
@@ -420,41 +541,29 @@ class CanvasLifecycle {
             blockedByPolicy: event.state.blockedByPolicy,
             blockedUrl: event.state.blockedUrl,
           }
-
-          // Update URL and title if changed
-          if (event.state.url && event.state.url !== tab.url) {
-            tab.url = event.state.url
-          }
-          if (event.state.title && event.state.title !== tab.title) {
-            tab.title = event.state.title
-          }
-
-          // Update isLoading at tab level too
-          if (event.state.isLoading !== undefined) {
-            tab.isLoading = event.state.isLoading
-          }
-
-          // Sync error to tab level (e.g. browser policy block during navigation)
-          tab.error = event.state.error
-
-          // Notify listeners
-          this.notifyTabsChange()
-          this.notifyBrowserStateChange(tabId, tab.browserState)
+          // The tab list hears about this only when a field it shows changed
+          // (title, loading, error) — a page's own churn stays on the
+          // browser-state channel its viewer subscribes to.
+          this.patchTab(tabId, {
+            browserState,
+            url: event.state.url || tab.url,
+            title: event.state.title || tab.title,
+            isLoading: event.state.isLoading ?? tab.isLoading,
+            // Sync error to tab level (e.g. browser policy block during navigation)
+            error: event.state.error,
+          })
+          this.notifyBrowserStateChange(tabId, browserState)
           break
         }
       }
     })
 
-    // Listen for file changes via existing artifact watcher, auto-refresh open tabs
-    this.artifactChangedUnsubscribe = api.onArtifactChanged((event) => {
-      if (event.type !== 'change') return
-      for (const [tabId, tab] of this.tabs) {
-        if (tab.path === event.path && !tab.isDirty) {
-          this.refreshTab(tabId)
-          break
-        }
-      }
-    })
+    this.browserPageGoneUnsubscribe = api.onBrowserPageGone(({ viewId, reason }) => this.handleBrowserPageGone(viewId, reason))
+    this.artifactChangedUnsubscribe = api.onArtifactChangedBatch((batch) => this.handleArtifactChanges(batch))
+
+    this.memoryPressureUnsubscribe = api.onMemoryPressure(({ level }) => this.setMemoryPressure(level))
+    // The event only reports changes; a reloaded renderer asks for the current level.
+    void api.getMemoryPressure().then(level => this.setMemoryPressure(level))
 
     console.log('[CanvasLifecycle] Initialized successfully')
   }
@@ -470,13 +579,21 @@ class CanvasLifecycle {
       this.browserStateUnsubscribe = null
     }
 
+    this.browserPageGoneUnsubscribe?.()
+    this.browserPageGoneUnsubscribe = null
+
     if (this.artifactChangedUnsubscribe) {
       this.artifactChangedUnsubscribe()
       this.artifactChangedUnsubscribe = null
     }
 
+    this.memoryPressureUnsubscribe?.()
+    this.memoryPressureUnsubscribe = null
+
     // Destroy all browser views
     this.closeAll()
+    this.spaceHold?.release()
+    this.spaceHold = null
 
     console.log('[CanvasLifecycle] Destroyed')
   }
@@ -485,8 +602,11 @@ class CanvasLifecycle {
    * Set the container bounds getter function
    * Called by BrowserViewer to provide DOM reference
    */
-  setContainerBoundsGetter(getter: () => DOMRect | null): void {
+  setContainerBoundsGetter(getter: () => DOMRect | null): () => void {
     this.containerBoundsGetter = getter
+    return () => {
+      if (this.containerBoundsGetter === getter) this.containerBoundsGetter = null
+    }
   }
 
   // ============================================
@@ -495,12 +615,15 @@ class CanvasLifecycle {
 
   /**
    * Open a file in the canvas
-   * Uses fast path for known extensions, backend detection for unknown ones
+   * Uses fast path for known extensions, backend detection for unknown ones.
+   * With `reveal`, the viewer shows that place once the content is in.
    */
-  async openFile(path: string, title?: string): Promise<string> {
+  async openFile(path: string, titleOrOptions?: string | OpenFileOptions): Promise<string> {
+    const { title, reveal } = typeof titleOrOptions === 'string' ? { title: titleOrOptions, reveal: undefined } : titleOrOptions ?? {}
     // Check if file is already open
     for (const [tabId, tab] of this.tabs) {
       if (tab.path === path) {
+        if (reveal) this.patchTab(tabId, { reveal: this.createRevealRequest(reveal) })
         this.setOpen(true)
         await this.switchTab(tabId)
         return tabId
@@ -535,8 +658,9 @@ class CanvasLifecycle {
             return ''
           }
 
-          // Use backend-detected content type
-          type = info.contentType as ContentType
+          // A type this renderer has no viewer for (e.g. from a newer main
+          // process) opens as plain text rather than as a blank pane.
+          type = isContentType(info.contentType) ? info.contentType : 'text'
           language = info.language
         }
       } catch (error) {
@@ -545,16 +669,14 @@ class CanvasLifecycle {
       }
     }
 
-    // PDF files are opened via BrowserView (Chromium native PDF renderer) on
-    // desktop. Remote clients have no BrowserView — fall through to a content
-    // tab whose base64 bytes are rendered by the pdfjs-based PdfViewer.
+    // Desktop uses Chromium's native PDF viewer; remote clients load bytes for pdfjs.
     if (type === 'pdf' && !api.isRemoteMode()) {
       return this.openPdf(path, title)
     }
 
     // Create new tab
     const tabId = generateTabId()
-    const tab: TabState = {
+    const tab: NewTab = {
       id: tabId,
       type,
       title: title || getFileName(path),
@@ -562,11 +684,10 @@ class CanvasLifecycle {
       language,
       isDirty: false,
       isLoading: true,
+      ...(reveal ? { reveal: this.createRevealRequest(reveal) } : {}),
     }
 
-    this.tabs.set(tabId, tab)
-    this.setOpen(true)
-    this.notifyTabsChange()
+    this.addTab(tab)
 
     // Switch to new tab
     await this.switchTab(tabId)
@@ -577,17 +698,31 @@ class CanvasLifecycle {
     return tabId
   }
 
-  /**
-   * Open a PDF file using BrowserView (Chromium native PDF renderer)
-   * Note: BrowserView can access file:// directly, no need for halo-file://
-   */
+  /** A reveal request for `target`, distinct from every earlier one. */
+  createRevealRequest(target: RevealTarget): RevealRequest {
+    this.revealSeq += 1
+    return { ...target, seq: this.revealSeq }
+  }
+
+  /** Shows `target` in an open tab, activating it. */
+  async revealInTab(tabId: string, target: RevealTarget): Promise<void> {
+    if (!this.tabs.has(tabId)) return
+    this.patchTab(tabId, { reveal: this.createRevealRequest(target) })
+    this.setOpen(true)
+    await this.switchTab(tabId)
+  }
+
+  /** The viewer handled the reveal request `seq`; a newer request is kept. */
+  consumeReveal(tabId: string, seq: number): void {
+    if (this.tabs.get(tabId)?.reveal?.seq === seq) this.patchTab(tabId, { reveal: undefined })
+  }
+
   private async openPdf(path: string, title?: string): Promise<string> {
     const tabId = generateTabId()
-    // BrowserView has no cross-origin restrictions, use file:// directly
-    // Encode path to handle non-ASCII characters and spaces
+    // Native PDF guests navigate directly to the file; the app never reads its bytes.
     const pdfUrl = `file://${encodeURI(path)}`
 
-    const tab: TabState = {
+    const tab: NewTab = {
       id: tabId,
       type: 'pdf',
       title: title || getFileName(path),
@@ -602,11 +737,8 @@ class CanvasLifecycle {
       },
     }
 
-    this.tabs.set(tabId, tab)
-    this.setOpen(true)
-    this.notifyTabsChange()
+    this.addTab(tab)
 
-    // Switch to new tab (this will create the BrowserView)
     await this.switchTab(tabId)
 
     return tabId
@@ -624,8 +756,7 @@ class CanvasLifecycle {
     // Images use halo-file:// protocol directly (no content loading needed).
     // pptx has no in-canvas renderer, so its placeholder needs no bytes either.
     if (type === 'image' || type === 'pptx') {
-      tab.isLoading = false
-      this.notifyTabsChange()
+      this.patchTab(tabId, { isLoading: false })
       return
     }
 
@@ -636,36 +767,32 @@ class CanvasLifecycle {
         if (!response.success || !response.data) {
           throw new Error(response.error || 'Failed to read file')
         }
-        tab.bytes = response.data
-        tab.isLoading = false
-        tab.error = undefined
-        this.notifyTabsChange()
+        this.patchTab(tabId, { bytes: response.data, isLoading: false, error: undefined })
         return
       }
 
       const response = await api.readArtifactContent(path)
 
       // Tab might have been closed during async operation
-      if (!this.tabs.has(tabId)) return
+      const current = this.tabs.get(tabId)
+      if (!current) return
 
       if (response.success && response.data) {
         const data = response.data as { content: string; mimeType?: string }
-        tab.content = data.content
-        tab.mimeType = data.mimeType
-        tab.isLoading = false
-        tab.error = undefined
+        if (current.isDirty) {
+          // The user started editing while this read was in flight.
+          if (data.content !== current.savedContent) {
+            this.patchTab(tabId, { savedContent: data.content, diskConflict: true })
+          }
+          return
+        }
+        this.patchTab(tabId, { content: data.content, mimeType: data.mimeType, isLoading: false, error: undefined })
       } else {
         throw new Error(response.error || 'Failed to read file')
       }
     } catch (error) {
-      const tab = this.tabs.get(tabId)
-      if (tab) {
-        tab.isLoading = false
-        tab.error = (error as Error).message
-      }
+      this.patchTab(tabId, { isLoading: false, error: (error as Error).message })
     }
-
-    this.notifyTabsChange()
   }
 
   /**
@@ -697,7 +824,7 @@ class CanvasLifecycle {
     // Only show loading for real HTTP(S) URLs — about:blank / file: load instantly
     const needsLoading = url.startsWith('http://') || url.startsWith('https://')
     const tabId = generateTabId()
-    const tab: TabState = {
+    const tab: NewTab = {
       id: tabId,
       type: 'browser',
       title: displayTitle,
@@ -711,19 +838,24 @@ class CanvasLifecycle {
       },
     }
 
-    this.tabs.set(tabId, tab)
-    this.setOpen(true)
-    this.notifyTabsChange()
+    this.addTab(tab)
 
-    // Switch to new tab (this will create the BrowserView)
     await this.switchTab(tabId)
 
     return tabId
   }
 
-  /**
-   * Attach an existing AI Browser BrowserView to the Canvas
-   */
+  /** Navigation survives a viewer unmount while its guest is still being created. */
+  async navigateBrowserTab(tabId: string, url: string): Promise<void> {
+    const tab = this.tabs.get(tabId)
+    if (!tab || (tab.type !== 'browser' && tab.type !== 'pdf')) return
+    if (!tab.browserViewId) await this.createBrowserView(tabId, 'about:blank')
+    const current = this.tabs.get(tabId)
+    if (!current?.browserViewId) return
+    await api.navigateBrowserView(current.browserViewId, url)
+  }
+
+  /** Borrows an AI page without changing its owner or guest identity. */
   async attachAIBrowserView(viewId: string, url: string, title?: string): Promise<string> {
     // Check if this view is already attached
     for (const [tabId, tab] of this.tabs) {
@@ -746,7 +878,7 @@ class CanvasLifecycle {
 
     // Create tab with existing browserViewId
     const tabId = generateTabId()
-    const tab: TabState = {
+    const tab: NewTab = {
       id: tabId,
       type: 'browser',
       title: displayTitle,
@@ -754,7 +886,7 @@ class CanvasLifecycle {
       isDirty: false,
       isLoading: false, // Already loaded by AI
       browserViewId: viewId, // Reference to existing view
-      browserViewOwned: false, // AI singleton — detach on close, do not destroy
+      browserViewOwned: false, // AI-driven view — detach on close, do not destroy
       browserState: {
         isLoading: false,
         canGoBack: false,
@@ -762,9 +894,7 @@ class CanvasLifecycle {
       },
     }
 
-    this.tabs.set(tabId, tab)
-    this.setOpen(true)
-    this.notifyTabsChange()
+    this.addTab(tab)
 
     // Switch to new tab (will show existing view)
     await this.switchTab(tabId)
@@ -774,11 +904,14 @@ class CanvasLifecycle {
 
   /**
    * Open a terminal session in the canvas. Terminal tabs render in React
-   * (TerminalViewer) — no BrowserView. Dedups by session id.
+   * (TerminalViewer). Dedups by session id. With `reveal`,
+   * the viewer shows that output once its replay is in.
    */
-  async openTerminal(sessionId: string, title?: string): Promise<string> {
+  async openTerminal(sessionId: string, title?: string, options: { reveal?: RevealTarget } = {}): Promise<string> {
+    const reveal = options.reveal ? this.createRevealRequest(options.reveal) : undefined
     for (const [tabId, tab] of this.tabs) {
       if (tab.type === 'terminal' && tab.terminalSessionId === sessionId) {
+        if (reveal) this.patchTab(tabId, { reveal })
         this.setOpen(true)
         await this.switchTab(tabId)
         return tabId
@@ -786,18 +919,17 @@ class CanvasLifecycle {
     }
 
     const tabId = generateTabId()
-    const tab: TabState = {
+    const tab: NewTab = {
       id: tabId,
       type: 'terminal',
       title: title || 'Terminal',
       terminalSessionId: sessionId,
       isDirty: false,
       isLoading: false,
+      ...(reveal ? { reveal } : {}),
     }
 
-    this.tabs.set(tabId, tab)
-    this.setOpen(true)
-    this.notifyTabsChange()
+    this.addTab(tab)
     await this.switchTab(tabId)
     return tabId
   }
@@ -813,7 +945,7 @@ class CanvasLifecycle {
     }
 
     const tabId = generateTabId()
-    const tab: TabState = {
+    const tab: NewTab = {
       id: tabId,
       type: 'team',
       title: title || i18n.t('Team'),
@@ -822,19 +954,78 @@ class CanvasLifecycle {
       isLoading: false,
     }
 
-    this.tabs.set(tabId, tab)
-    this.setOpen(true)
-    this.notifyTabsChange()
+    this.addTab(tab)
     await this.switchTab(tabId)
     return tabId
+  }
+
+  /** Open the goal editor for a conversation, reusing its tab if one is open. */
+  async openGoal(spaceId: string, conversationId: string): Promise<string> {
+    for (const [tabId, tab] of this.tabs) {
+      if (tab.type === 'goal' && tab.goal?.conversationId === conversationId) {
+        this.setOpen(true)
+        await this.switchTab(tabId)
+        return tabId
+      }
+    }
+
+    const tabId = generateTabId()
+    const tab: NewTab = {
+      id: tabId,
+      type: 'goal',
+      title: i18n.t('Goal'),
+      goal: { spaceId, conversationId },
+      isDirty: false,
+      isLoading: false,
+    }
+
+    this.addTab(tab)
+    await this.switchTab(tabId)
+    return tabId
+  }
+
+  /**
+   * Open the changes view for `source`, reusing its tab: one per space for Git,
+   * one per reply for the edits a reply made.
+   */
+  async openChanges(source: ChangesSource, options: { reveal?: RevealTarget } = {}): Promise<string> {
+    const reveal = options.reveal ? this.createRevealRequest(options.reveal) : undefined
+    for (const [tabId, tab] of this.tabs) {
+      if (tab.type === 'changes' && tab.changes && isSameChangesSource(tab.changes, source)) {
+        if (reveal) this.patchTab(tabId, { reveal })
+        this.setOpen(true)
+        await this.switchTab(tabId)
+        return tabId
+      }
+    }
+
+    const tabId = generateTabId()
+    const tab: NewTab = {
+      id: tabId,
+      type: 'changes',
+      title: source.kind === 'message' ? `${i18n.t('Changes')} · ${source.title}` : i18n.t('Changes'),
+      changes: source,
+      reveal,
+      isDirty: false,
+      isLoading: false,
+    }
+
+    this.addTab(tab)
+    await this.switchTab(tabId)
+    return tabId
+  }
+
+  /** Rename a tab, e.g. when what it shows is renamed elsewhere. */
+  setTabTitle(tabId: string, title: string): void {
+    if (this.tabs.get(tabId)?.title === title) return
+    this.patchTab(tabId, { title })
   }
 
   /** Update a terminal tab's title (from lifecycle title events). */
   setTerminalTitle(sessionId: string, title: string): void {
     for (const [, tab] of this.tabs) {
       if (tab.type === 'terminal' && tab.terminalSessionId === sessionId) {
-        tab.title = title
-        this.notifyTabsChange()
+        this.patchTab(tab.id, { title })
         break
       }
     }
@@ -850,7 +1041,7 @@ class CanvasLifecycle {
     language?: string
   ): Promise<string> {
     const tabId = generateTabId()
-    const tab: TabState = {
+    const tab: NewTab = {
       id: tabId,
       type,
       title,
@@ -860,9 +1051,7 @@ class CanvasLifecycle {
       isLoading: false,
     }
 
-    this.tabs.set(tabId, tab)
-    this.setOpen(true)
-    this.notifyTabsChange()
+    this.addTab(tab)
 
     await this.switchTab(tabId)
 
@@ -885,13 +1074,71 @@ class CanvasLifecycle {
   }
 
   /**
+   * Register the prompt asked before a dirty tab of `type` is closed by the
+   * user, one tab at a time or all at once. Returns an unsubscribe function.
+   * Space-switch teardown never asks.
+   */
+  setDirtyCloseGuard(type: ContentType, guard: (tab: TabState) => Promise<boolean>): () => void {
+    this.dirtyCloseGuards.set(type, guard)
+    return () => {
+      if (this.dirtyCloseGuards.get(type) === guard) this.dirtyCloseGuards.delete(type)
+    }
+  }
+
+  /**
+   * An AI owner ended the page. Owned Canvas pages instead follow the general
+   * browser page-loss event so they can recover independently of AI sessions.
+   */
+  async closeTabsOfGoneView(viewId: string): Promise<void> {
+    const stale = [...this.tabs.values()].filter(tab => tab.browserViewId === viewId && !tab.browserViewOwned)
+    for (const tab of stale) await this.closeTab(tab.id)
+  }
+
+  private handleBrowserPageGone(viewId: string, reason: 'closed' | 'lost'): void {
+    if (this.releasingViews.has(viewId)) return
+    for (const tab of this.tabs.values()) {
+      if (tab.browserViewId !== viewId || !tab.browserViewOwned) continue
+      if (reason === 'closed') {
+        void this.closeTab(tab.id).catch(error => {
+          console.error('[CanvasLifecycle] Closing a browser tab failed:', viewId, error)
+        })
+        continue
+      }
+      const browserState: BrowserState = { isLoading: true, canGoBack: false, canGoForward: false }
+      this.patchTab(tab.id, {
+        browserViewId: undefined,
+        browserViewOwned: undefined,
+        browserState,
+        error: undefined,
+        isLoading: true,
+      })
+      this.notifyBrowserStateChange(tab.id, browserState)
+      console.warn('[CanvasLifecycle] Browser page lost; releasing its tab attachment:', viewId)
+      void this.restoreLostBrowserPage(tab.id).catch(error => {
+        console.error('[CanvasLifecycle] Restoring a lost browser page failed:', viewId, error)
+      })
+    }
+  }
+
+  private async restoreLostBrowserPage(tabId: string): Promise<void> {
+    await this.creatingViews.get(tabId)
+    const tab = this.tabs.get(tabId)
+    if (!tab || (tab.type !== 'browser' && tab.type !== 'pdf') || tab.browserViewId || this.activeTabId !== tabId || !this.isOpen) return
+    await this.createBrowserView(tabId, tab.url || 'about:blank')
+  }
+
+  /**
    * Close a tab
    */
   async closeTab(tabId: string): Promise<void> {
     const tab = this.tabs.get(tabId)
     if (!tab) return
 
-    console.log(`[CanvasLifecycle] Closing tab: ${tabId}`)
+    const dirtyGuard = tab.isDirty ? this.dirtyCloseGuards.get(tab.type) : undefined
+    if (dirtyGuard && !(await dirtyGuard(tab))) {
+      console.log(`[CanvasLifecycle] Close of dirty tab ${tabId} cancelled by user`)
+      return
+    }
 
     // Terminal tabs: defer to the close policy for the underlying pty (keep in
     // background / terminate / cancel). A cancel aborts the whole close.
@@ -909,6 +1156,8 @@ class CanvasLifecycle {
 
     // Remove tab
     this.tabs.delete(tabId)
+    this.tabsSnapshot = null
+    this.lastActivated.delete(tabId)
 
     // If closing active tab, switch to another tab
     if (this.activeTabId === tabId) {
@@ -922,14 +1171,33 @@ class CanvasLifecycle {
       }
     }
 
-    this.notifyTabsChange()
+    this.notifyTabListChange()
+  }
+
+  /** Register how tabs of `type` reload on Refresh. Returns an unsubscribe function. */
+  setRefreshHandler(type: ContentType, handler: (tab: TabState) => Promise<void>): () => void {
+    this.refreshHandlers.set(type, handler)
+    return () => {
+      if (this.refreshHandlers.get(type) === handler) this.refreshHandlers.delete(type)
+    }
   }
 
   /**
-   * Close all tabs
+   * Close all tabs. `confirmDirty` is for a close the user asked for: each
+   * dirty tab with a guard asks first, and one "keep" cancels the whole close.
    */
-  async closeAll(): Promise<void> {
-    console.log('[CanvasLifecycle] Closing all tabs')
+  async closeAll(options?: { confirmDirty?: boolean }): Promise<void> {
+    if (options?.confirmDirty) {
+      for (const tab of [...this.tabs.values()]) {
+        const dirtyGuard = tab.isDirty ? this.dirtyCloseGuards.get(tab.type) : undefined
+        if (!dirtyGuard || !this.tabs.has(tab.id)) continue
+        await this.switchTab(tab.id)
+        if (!(await dirtyGuard(tab))) {
+          console.log(`[CanvasLifecycle] Close all cancelled by user at dirty tab ${tab.id}`)
+          return
+        }
+      }
+    }
 
     // Tear down each tab's underlying resource. Browser/pdf views go by
     // ownership (see releaseBrowserView). Terminals defer to the bulk disposal
@@ -948,17 +1216,15 @@ class CanvasLifecycle {
     await Promise.all(terminalDisposals)
 
     this.tabs.clear()
+    this.tabsSnapshot = null
+    this.lastActivated.clear()
     this.activeTabId = null
     this.setOpen(false)
 
-    this.notifyTabsChange()
+    this.notifyTabListChange()
     this.notifyActiveTabChange()
   }
 
-  /**
-   * Switch to a specific tab (CORE METHOD)
-   * Handles hiding previous BrowserView and showing/creating new one
-   */
   async switchTab(tabId: string): Promise<void> {
     const tab = this.tabs.get(tabId)
     if (!tab) {
@@ -966,39 +1232,122 @@ class CanvasLifecycle {
       return
     }
 
-    console.log(`[CanvasLifecycle] Switching to tab: ${tabId}`)
-
     const previousTabId = this.activeTabId
     const previousTab = previousTabId ? this.tabs.get(previousTabId) : null
 
-    // 1. Publish the new active tab before the hide await, so a caller that
-    // arrives mid-switch reads where we are going rather than where we were.
-    // The hide below targets the previous tab by captured id, so it is unaffected.
+    // Publish before awaiting hide so overlapping switches see the new target.
     this.activeTabId = tabId
+    this.lastActivated.set(tabId, ++this.activationSeq)
 
-    // 2. Hide previous BrowserView if it exists (browser or pdf types)
     const prevNeedsBrowserView = previousTab?.type === 'browser' || previousTab?.type === 'pdf'
     if (prevNeedsBrowserView && previousTab.browserViewId && previousTabId !== tabId) {
-      console.log(`[CanvasLifecycle] Hiding previous BrowserView: ${previousTab.browserViewId}`)
       await api.hideBrowserView(previousTab.browserViewId)
     }
 
-    // 3. Create a BrowserView for browser/pdf tabs that lack one. Showing is
-    // deliberately left out: this runs before notifyActiveTabChange(), so
-    // containerBoundsGetter still resolves against the outgoing tab's DOM.
-    // BrowserViewer positions the view after React commits the new active tab.
+    // The outgoing viewer still owns the bounds; the new viewer presents after commit.
     const needsBrowserView = tab.type === 'browser' || tab.type === 'pdf'
     if (needsBrowserView && !tab.browserViewId) {
-      // Don't await - let it load in background, UI switches immediately,
-      // loading state updates via IPC events
-      console.log(`[CanvasLifecycle] Creating new BrowserView for tab: ${tabId}`)
+      // Creation must not delay the tab switch; navigation state arrives by event.
       this.createBrowserView(tabId, tab.url || 'about:blank').catch(err => {
-        console.error(`[CanvasLifecycle] Failed to create BrowserView for tab ${tabId}:`, err)
+        console.error(`[CanvasLifecycle] Failed to create browser page for tab ${tabId}:`, err)
       })
     }
 
-    // 4. Notify React
+    // Restore content released by the hidden-tab budget.
+    if (tab.contentUnloaded && tab.path) {
+      this.patchTab(tabId, { contentUnloaded: false, isLoading: true, error: undefined })
+      void this.loadFileContent(tabId, tab.path, tab.type)
+    }
+
     this.notifyActiveTabChange()
+
+    void this.applyBudgets()
+  }
+
+  // ============================================
+  // Resource Budgets
+  // ============================================
+
+  /**
+   * Keep hidden tabs within the canvas budgets. Under critical memory
+   * pressure nothing hidden keeps content or a live browser view.
+   */
+  private async applyBudgets(): Promise<void> {
+    if (this.applyingBudgets) {
+      this.budgetsDirty = true
+      return
+    }
+    this.applyingBudgets = true
+    try {
+      do {
+        this.budgetsDirty = false
+        await this.applyBudgetsOnce()
+      } while (this.budgetsDirty)
+    } finally {
+      this.applyingBudgets = false
+    }
+  }
+
+  private async applyBudgetsOnce(): Promise<void> {
+    const critical = this.memoryPressure === 'critical'
+    const limits: CanvasBudgetLimits = {
+      maxOpenTabs: MAX_OPEN_TABS,
+      maxLiveBrowserViews: critical ? 0 : MAX_LIVE_BROWSER_VIEWS,
+      hiddenContentBytes: critical ? 0 : HIDDEN_CONTENT_BUDGET_BYTES,
+    }
+    const plan = planCanvasBudget(this.getTabs(), this.activeTabId, this.lastActivated, limits)
+
+    let closed = 0
+    for (const tabId of plan.close) {
+      if (await this.closeTabForBudget(tabId)) closed++
+    }
+    for (const tabId of plan.unloadContent) {
+      // Re-checked here: earlier awaits in this pass may have let the user switch to or edit it.
+      const tab = this.tabs.get(tabId)
+      if (!tab || tabId === this.activeTabId || tab.isDirty || tab.contentUnloaded) continue
+      this.patchTab(tabId, { content: undefined, bytes: undefined, contentUnloaded: true })
+    }
+    for (const tabId of plan.releaseView) {
+      // Re-checked here: earlier awaits in this pass may have let the user switch to it.
+      const tab = this.tabs.get(tabId)
+      if (!tab?.browserViewId || !tab.browserViewOwned || tabId === this.activeTabId) continue
+      // Detach first: a switch to this tab while the view is being destroyed
+      // then sees no view and creates a fresh one (the url stays on the tab).
+      this.patchTab(tabId, { browserViewId: undefined, browserViewOwned: undefined })
+      await this.releaseBrowserView(tab)
+    }
+    if (closed > 0) {
+      console.log(`[CanvasLifecycle] Closed ${closed} least recently used tab(s) over the ${MAX_OPEN_TABS}-tab limit`)
+      this.budgetEvictionCallbacks.forEach(cb => cb({ closedTabs: closed, limit: MAX_OPEN_TABS }))
+    }
+  }
+
+  /**
+   * Closes a tab the budget planned to close, unless the user switched to or
+   * edited it while this pass awaited. A browser view is detached before it is
+   * released, so a switch during the release recreates the view and the tab
+   * stays open. Returns whether the tab was closed.
+   */
+  private async closeTabForBudget(tabId: string): Promise<boolean> {
+    const untouched = () => {
+      const tab = this.tabs.get(tabId)
+      return !!tab && tabId !== this.activeTabId && !tab.isDirty
+    }
+    if (!untouched()) return false
+    const tab = this.tabs.get(tabId)!
+    if (tab.browserViewId) {
+      this.patchTab(tabId, { browserViewId: undefined, browserViewOwned: undefined })
+      await this.releaseBrowserView(tab)
+      if (!untouched()) return false
+    }
+    await this.closeTab(tabId)
+    return !this.tabs.has(tabId)
+  }
+
+  setMemoryPressure(level: MemoryPressureLevel): void {
+    if (this.memoryPressure === level) return
+    this.memoryPressure = level
+    if (level === 'critical') void this.applyBudgets()
   }
 
   /**
@@ -1046,48 +1395,52 @@ class CanvasLifecycle {
     tabsArray.splice(toIndex, 0, removed)
 
     this.tabs = new Map(tabsArray)
-    this.notifyTabsChange()
+    this.tabsSnapshot = null
+    this.notifyTabListChange()
   }
 
   // ============================================
-  // BrowserView Lifecycle
+  // Browser Page Lifecycle
   // ============================================
 
-  /**
-   * Create a new BrowserView
-   */
-  private async createBrowserView(tabId: string, url: string): Promise<void> {
+  private createBrowserView(tabId: string, url: string): Promise<void> {
+    // A second request (double click, the AI and the user at once, a retry)
+    // joins the first: two creations would leave one view no tab references.
+    const inFlight = this.creatingViews.get(tabId)
+    if (inFlight) return inFlight
+    const creation = this.createBrowserViewOnce(tabId, url).finally(() => this.creatingViews.delete(tabId))
+    this.creatingViews.set(tabId, creation)
+    return creation
+  }
+
+  private async createBrowserViewOnce(tabId: string, url: string): Promise<void> {
     const tab = this.tabs.get(tabId)
     if (!tab) return
 
-    const viewId = `browser-${tabId}`
-    console.log(`[CanvasLifecycle] Creating BrowserView: ${viewId} for URL: ${url}`)
-
+    const viewId = `browser-${tabId}-${++this.viewGeneration}`
     try {
       const result = await api.createBrowserView(viewId, url)
 
-      // Tab might have been closed during async operation
-      if (!this.tabs.has(tabId)) {
-        console.log(`[CanvasLifecycle] Tab closed during BrowserView creation, destroying view`)
-        await api.destroyBrowserView(viewId)
+      // The tab was closed, or got a view another way, while this one was
+      // being created: nothing would ever reference it, so it goes now.
+      const current = this.tabs.get(tabId)
+      if (!current || (current.browserViewId && current.browserViewId !== viewId)) {
+        if (result.success) {
+          await api.destroyBrowserView(viewId)
+        }
         return
       }
 
       if (result.success) {
-        tab.browserViewId = viewId
-        tab.browserViewOwned = true
-        this.notifyTabsChange()
+        this.patchTab(tabId, { browserViewId: viewId, browserViewOwned: true })
+        void this.applyBudgets()
 
-        // Show the view
-        await this.showBrowserView(viewId)
+        // Creation may finish after the user switched away from this tab.
+        if (this.activeTabId === tabId && this.isOpen) await this.showBrowserView(viewId)
       } else if ((result as { code?: string }).code === 'BROWSER_POLICY_BLOCKED') {
-        // Initial URL blocked by browser policy — no BrowserView exists yet.
-        // Surface the same blocked state as navigation blocks so the policy
-        // overlay (and its "allow and retry" action) covers this entry too.
-        console.warn(`[CanvasLifecycle] BrowserView creation blocked by policy: ${url}`)
-        tab.error = result.error
-        tab.isLoading = false
-        tab.browserState = {
+        // No guest exists yet; the policy overlay still needs to offer allow-and-retry.
+        console.warn('[CanvasLifecycle] Browser page creation blocked by policy:', viewId)
+        const browserState: BrowserState = {
           isLoading: false,
           canGoBack: false,
           canGoForward: false,
@@ -1095,27 +1448,20 @@ class CanvasLifecycle {
           blockedByPolicy: true,
           blockedUrl: url,
         }
-        this.notifyTabsChange()
-        this.notifyBrowserStateChange(tabId, tab.browserState)
+        this.patchTab(tabId, { error: result.error, isLoading: false, browserState })
+        this.notifyBrowserStateChange(tabId, browserState)
       } else {
-        console.error(`[CanvasLifecycle] Failed to create BrowserView: ${result.error}`)
-        tab.error = result.error || 'Failed to create browser view'
-        tab.isLoading = false
-        this.notifyTabsChange()
+        console.error(`[CanvasLifecycle] Failed to create browser page ${viewId}: ${result.error}`)
+        this.patchTab(tabId, { error: result.error || 'Failed to create browser view', isLoading: false })
       }
     } catch (error) {
-      console.error(`[CanvasLifecycle] Exception creating BrowserView:`, error)
-      const tab = this.tabs.get(tabId)
-      if (tab) {
-        tab.error = (error as Error).message
-        tab.isLoading = false
-        this.notifyTabsChange()
-      }
+      console.error('[CanvasLifecycle] Browser page creation failed:', viewId, error)
+      this.patchTab(tabId, { error: (error as Error).message, isLoading: false })
     }
   }
 
   /**
-   * Retry a tab whose BrowserView creation was blocked by browser policy
+   * Retry a tab whose page creation was blocked by browser policy
    * (no view exists yet, so browser:navigate cannot be used). Called by the
    * policy-block overlay after the user allowlisted the blocked host.
    */
@@ -1125,16 +1471,10 @@ class CanvasLifecycle {
     const url = tab.browserState?.blockedUrl
     if (!url) return
 
-    tab.error = undefined
-    tab.browserState = undefined
-    tab.isLoading = true
-    this.notifyTabsChange()
+    this.patchTab(tabId, { error: undefined, browserState: undefined, isLoading: true })
     await this.createBrowserView(tabId, url)
   }
 
-  /**
-   * Show a BrowserView at the container position
-   */
   private async showBrowserView(viewId: string): Promise<void> {
     if (!this.containerBoundsGetter) {
       console.warn('[CanvasLifecycle] No container bounds getter set, deferring showBrowserView')
@@ -1148,13 +1488,6 @@ class CanvasLifecycle {
       return
     }
 
-    console.log(`[CanvasLifecycle] Showing BrowserView: ${viewId} at`, {
-      x: Math.round(bounds.left),
-      y: Math.round(bounds.top),
-      width: Math.round(bounds.width),
-      height: Math.round(bounds.height),
-    })
-
     await api.showBrowserView(viewId, {
       x: Math.round(bounds.left),
       y: Math.round(bounds.top),
@@ -1163,25 +1496,22 @@ class CanvasLifecycle {
     })
   }
 
-  /**
-   * Hide a BrowserView
-   */
   private async hideBrowserView(viewId: string): Promise<void> {
-    console.log(`[CanvasLifecycle] Hiding BrowserView: ${viewId}`)
     await api.hideBrowserView(viewId)
   }
 
-  /**
-   * Destroy a BrowserView
-   */
   private async destroyBrowserView(viewId: string): Promise<void> {
-    console.log(`[CanvasLifecycle] Destroying BrowserView: ${viewId}`)
-    await api.hideBrowserView(viewId)
-    await api.destroyBrowserView(viewId)
+    this.releasingViews.add(viewId)
+    try {
+      await api.hideBrowserView(viewId)
+      await api.destroyBrowserView(viewId)
+    } finally {
+      this.releasingViews.delete(viewId)
+    }
   }
 
   /**
-   * Give up a tab's BrowserView, destroying it only if the Canvas owns it.
+   * Give up a tab's browser page, destroying it only if the Canvas owns it.
    *
    * The single place both close paths go through, so a tab can never be
    * removed one way and leak (or kill) its view the other way.
@@ -1192,15 +1522,9 @@ class CanvasLifecycle {
       await this.destroyBrowserView(tab.browserViewId)
       return
     }
-    console.log(`[CanvasLifecycle] Detaching BrowserView: ${tab.browserViewId}`)
     await this.hideBrowserView(tab.browserViewId)
   }
 
-  /**
-   * Update bounds of active BrowserView (called on resize)
-   * Uses resizeBrowserView instead of showBrowserView to avoid
-   * expensive addBrowserView calls during animation
-   */
   async updateActiveBounds(): Promise<void> {
     if (!this.activeTabId) return
 
@@ -1212,9 +1536,7 @@ class CanvasLifecycle {
   }
 
   /**
-   * Show and position the active BrowserView. The only entry point that does so:
-   * BrowserViewer calls it once mounted, which is the earliest moment the
-   * container it is positioned against exists.
+   * The viewer calls this after mounting, when its presentation surface exists.
    */
   async ensureActiveBrowserViewShown(): Promise<void> {
     if (!this.activeTabId) return
@@ -1222,15 +1544,10 @@ class CanvasLifecycle {
     const tab = this.tabs.get(this.activeTabId)
     const hasBrowserView = (tab?.type === 'browser' || tab?.type === 'pdf') && tab.browserViewId
     if (hasBrowserView) {
-      // Use showBrowserView which adds the view to the window
       await this.showBrowserView(tab.browserViewId!)
     }
   }
 
-  /**
-   * Resize a BrowserView (without re-adding to window)
-   * More efficient than showBrowserView for continuous updates
-   */
   private async resizeBrowserView(viewId: string): Promise<void> {
     if (!this.containerBoundsGetter) return
 
@@ -1245,9 +1562,6 @@ class CanvasLifecycle {
     })
   }
 
-  /**
-   * Hide active BrowserView (called when canvas is hidden)
-   */
   async hideActiveBrowserView(): Promise<void> {
     if (!this.activeTabId) return
 
@@ -1259,8 +1573,7 @@ class CanvasLifecycle {
   }
 
   /**
-   * Hide all BrowserViews (called when leaving SpacePage)
-   * Keeps tabs in memory, just hides the native views
+   * Leaving the space page parks guests while retaining their tabs and owners.
    */
   async hideAllBrowserViews(): Promise<void> {
     for (const [, tab] of this.tabs) {
@@ -1276,6 +1589,66 @@ class CanvasLifecycle {
   // ============================================
 
   /**
+   * Brings open tabs in line with files rewritten on disk. A clean tab
+   * re-reads in place; a tab with unsaved edits is never overwritten — it is
+   * checked for a real divergence and, if so, flagged for the user to resolve.
+   */
+  handleArtifactChanges(batch: ArtifactChangeBatchEvent): void {
+    let changed: Set<string> | null = null
+    if (!batch.resync) {
+      for (const change of batch.changes) {
+        // Atomic writers (temp file + rename) surface as 'add' for the open path.
+        if (change.type === 'change' || change.type === 'add') (changed ??= new Set()).add(change.path)
+      }
+      if (!changed) return
+    }
+    for (const [tabId, tab] of this.tabs) {
+      if (!tab.path || (changed && !changed.has(tab.path))) continue
+      // An unloaded tab re-reads when shown anyway.
+      if (tab.contentUnloaded) continue
+      if (tab.isDirty) void this.checkDiskConflict(tabId)
+      else void this.refreshTab(tabId)
+    }
+  }
+
+  private async checkDiskConflict(tabId: string): Promise<void> {
+    const path = this.tabs.get(tabId)?.path
+    if (!path) return
+    const response = await api.readArtifactContent(path)
+    const tab = this.tabs.get(tabId)
+    if (!tab?.isDirty || !response.success || !response.data) return
+    const disk = (response.data as { content: string }).content
+    // Our own save echoing back through the watcher is not a conflict.
+    if (disk === tab.savedContent) return
+    this.patchTab(tabId, { savedContent: disk, diskConflict: true })
+  }
+
+  /**
+   * Settles an on-disk change against unsaved edits: 'disk' discards the edits
+   * for the file's current text, 'mine' keeps them (a save then overwrites).
+   */
+  resolveDiskConflict(tabId: string, keep: 'disk' | 'mine'): void {
+    if (!this.tabs.get(tabId)?.diskConflict) return
+    if (keep === 'disk') {
+      this.revertTabContent(tabId)
+      return
+    }
+    this.patchTab(tabId, { diskConflict: false })
+  }
+
+  /** Drops unsaved edits, restoring the file's text as last seen on disk. */
+  revertTabContent(tabId: string): void {
+    const tab = this.tabs.get(tabId)
+    if (!tab?.isDirty) return
+    this.patchTab(tabId, {
+      content: tab.savedContent ?? tab.content,
+      savedContent: undefined,
+      diskConflict: false,
+      isDirty: false,
+    })
+  }
+
+  /**
    * Refresh tab content
    */
   async refreshTab(tabId: string): Promise<void> {
@@ -1287,12 +1660,16 @@ class CanvasLifecycle {
       // Reload browser/PDF view
       await api.browserReload(tab.browserViewId!)
     } else if (tab.path) {
-      // Reload file content
-      tab.isLoading = true
-      tab.error = undefined
-      this.notifyTabsChange()
+      // A tab already showing the file re-reads in place — the viewer stays
+      // mounted and swaps the text (keeping scroll) instead of flashing a
+      // loading state and rebuilding.
+      if (tab.content === undefined && tab.bytes === undefined) {
+        this.patchTab(tabId, { isLoading: true, error: undefined })
+      }
 
       await this.loadFileContent(tabId, tab.path, tab.type)
+    } else {
+      await this.refreshHandlers.get(tab.type)?.(tab)
     }
   }
 
@@ -1301,11 +1678,12 @@ class CanvasLifecycle {
    */
   updateTabContent(tabId: string, content: string): void {
     const tab = this.tabs.get(tabId)
-    if (tab) {
-      tab.content = content
-      tab.isDirty = true
-      this.notifyTabsChange()
-    }
+    if (!tab) return
+    this.patchTab(tabId, {
+      content,
+      isDirty: true,
+      savedContent: tab.isDirty ? tab.savedContent : tab.content,
+    })
   }
 
   /**
@@ -1313,13 +1691,13 @@ class CanvasLifecycle {
    */
   markTabSaved(tabId: string, content?: string): void {
     const tab = this.tabs.get(tabId)
-    if (tab) {
-      if (content !== undefined) {
-        tab.content = content
-      }
-      tab.isDirty = false
-      this.notifyTabsChange()
-    }
+    if (!tab) return
+    this.patchTab(tabId, {
+      content: content ?? tab.content,
+      isDirty: false,
+      savedContent: undefined,
+      diskConflict: false,
+    })
   }
 
   /**
@@ -1327,10 +1705,7 @@ class CanvasLifecycle {
    */
   saveScrollPosition(tabId: string, position: number): void {
     const tab = this.tabs.get(tabId)
-    if (tab) {
-      tab.scrollPosition = position
-      // No need to notify for scroll position updates
-    }
+    if (tab) tab.view.scrollPosition = position
   }
 
   /**
@@ -1338,21 +1713,14 @@ class CanvasLifecycle {
    */
   toggleEditMode(tabId: string): void {
     const tab = this.tabs.get(tabId)
-    if (tab && tab.type === 'markdown') {
-      tab.isEditMode = !tab.isEditMode
-      this.notifyTabsChange()
-    }
+    if (tab && tab.type === 'markdown') this.patchTab(tabId, { isEditMode: !tab.isEditMode })
   }
 
   /**
    * Set edit mode for a tab
    */
   setEditMode(tabId: string, editMode: boolean): void {
-    const tab = this.tabs.get(tabId)
-    if (tab) {
-      tab.isEditMode = editMode
-      this.notifyTabsChange()
-    }
+    this.patchTab(tabId, { isEditMode: editMode })
   }
 
   // ============================================
@@ -1368,8 +1736,6 @@ class CanvasLifecycle {
     // Can't open if no tabs
     if (open && this.tabs.size === 0) return
 
-    console.log(`[CanvasLifecycle] Setting open: ${open}`)
-
     this.isOpen = open
     this.isTransitioning = true
 
@@ -1380,6 +1746,13 @@ class CanvasLifecycle {
     }
 
     this.notifyOpenStateChange()
+
+    const activeTabId = this.activeTabId
+    if (open && activeTabId) {
+      void this.restoreLostBrowserPage(activeTabId).catch(error => {
+        console.error('[CanvasLifecycle] Restoring the expanded browser page failed:', activeTabId, error)
+      })
+    }
 
     // Clear transitioning after animation
     setTimeout(() => {
@@ -1399,8 +1772,19 @@ class CanvasLifecycle {
   // State Queries
   // ============================================
 
-  getTabs(): TabState[] {
-    return Array.from(this.tabs.values())
+  /** Current tabs in display order. */
+  getTabs(): readonly TabState[] {
+    this.tabsSnapshot ??= Array.from(this.tabs.values())
+    return this.tabsSnapshot
+  }
+
+  /**
+   * The tabs as of the last tab-list change — a stable array for the tab
+   * strip. Fields the strip does not show (content, bytes, browser state) may
+   * be older than `getTab()`.
+   */
+  getTabListSnapshot(): readonly TabState[] {
+    return this.tabListSnapshot
   }
 
   getTab(tabId: string): TabState | undefined {
@@ -1456,27 +1840,71 @@ class CanvasLifecycle {
         // let the next space inherit the previous one's tabs.
         console.error('[CanvasLifecycle] Space-switch teardown failed, dropping tabs:', err)
         this.tabs.clear()
+        this.tabsSnapshot = null
+        this.lastActivated.clear()
         this.activeTabId = null
         this.setOpen(false)
-        this.notifyTabsChange()
+        this.notifyTabListChange()
         this.notifyActiveTabChange()
       }
       return true
     }
 
     this.currentSpaceId = spaceId
+    this.syncSpaceHold()
     return false
+  }
+
+  // ============================================
+  // Tab State Updates
+  // ============================================
+
+  private addTab(tab: NewTab): void {
+    this.tabs.set(tab.id, { ...tab, view: {} })
+    this.tabsSnapshot = null
+    this.setOpen(true)
+    this.notifyTabListChange()
+  }
+
+  /**
+   * Replace a tab with an updated copy. Tab-list subscribers hear about it
+   * only when a field the list shows changed; per-tab subscribers always do.
+   */
+  private patchTab(tabId: string, patch: Partial<Omit<TabState, 'id' | 'view'>>): void {
+    const previous = this.tabs.get(tabId)
+    if (!previous) return
+    const next: TabState = { ...previous, ...patch }
+    this.tabs.set(tabId, next)
+    this.tabsSnapshot = null
+    this.tabChangeCallbacks.forEach(cb => cb(next))
+    if (TAB_LIST_FIELDS.some(field => previous[field] !== next[field])) this.notifyTabListChange()
   }
 
   // ============================================
   // Event Subscriptions
   // ============================================
 
-  onTabsChange(callback: TabsChangeCallback): () => void {
-    this.tabsChangeCallbacks.add(callback)
+  /**
+   * Tabs added, removed or reordered, or a field the tab list shows changed
+   * (see TAB_LIST_FIELDS). Content, bytes and browser state do not fire it.
+   */
+  onTabListChange(callback: TabListChangeCallback): () => void {
+    this.tabListChangeCallbacks.add(callback)
     // Immediately call with current state
     callback(this.getTabs())
-    return () => this.tabsChangeCallbacks.delete(callback)
+    return () => this.tabListChangeCallbacks.delete(callback)
+  }
+
+  /** Tabs were closed to stay within the open-tab limit. */
+  onBudgetEviction(callback: BudgetEvictionCallback): () => void {
+    this.budgetEvictionCallbacks.add(callback)
+    return () => this.budgetEvictionCallbacks.delete(callback)
+  }
+
+  /** Any change to one tab, with its new snapshot. */
+  onTabChange(callback: TabChangeCallback): () => void {
+    this.tabChangeCallbacks.add(callback)
+    return () => this.tabChangeCallbacks.delete(callback)
   }
 
   onActiveTabChange(callback: ActiveTabChangeCallback): () => void {
@@ -1502,9 +1930,27 @@ class CanvasLifecycle {
   // Notification Helpers
   // ============================================
 
-  private notifyTabsChange(): void {
-    const tabs = this.getTabs()
-    this.tabsChangeCallbacks.forEach(cb => cb(tabs))
+  private notifyTabListChange(): void {
+    this.tabsSnapshot = null
+    this.tabListSnapshot = this.getTabs()
+    const tabs = this.tabListSnapshot
+    this.syncSpaceHold()
+    this.tabListChangeCallbacks.forEach(cb => cb(tabs))
+  }
+
+  private syncSpaceHold(): void {
+    let wanted: string | null = null
+    if (this.currentSpaceId) {
+      for (const tab of this.tabs.values()) {
+        if (tab.path) {
+          wanted = this.currentSpaceId
+          break
+        }
+      }
+    }
+    if (this.spaceHold?.spaceId === wanted) return
+    this.spaceHold?.release()
+    this.spaceHold = wanted ? { spaceId: wanted, release: holdArtifactSpace(wanted) } : null
   }
 
   private notifyActiveTabChange(): void {
@@ -1528,4 +1974,4 @@ export const canvasLifecycle = new CanvasLifecycle()
 canvasLifecycle.initialize()
 
 // Export types for external use
-export type { TabsChangeCallback, ActiveTabChangeCallback, BrowserStateChangeCallback, OpenStateChangeCallback }
+export type { TabListChangeCallback, TabChangeCallback, BudgetEvictionCallback, ActiveTabChangeCallback, BrowserStateChangeCallback, OpenStateChangeCallback }

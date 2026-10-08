@@ -88,7 +88,9 @@
 12. **Production logging is required.**
     - See the `halo-logging` skill for the full standard: silent failures must
       log (what/why), long-lived links must self-report state not just
-      events, distributed modules need a one-command diagnostics export.
+      events, distributed modules need a one-command diagnostics export, and
+      hot paths (stream/IPC events, per tool call/request, render) emit no
+      production logs.
 
 13. **Chat turn-level features must cover every chat entry point.**
     - Cross-cutting turn behavior (images/attachments, thinking, context injection, message assembly) must live in a shared module under `services/agent/` (the `message-utils.ts` / `image-attachments.ts` pattern); entry points only add thin wiring.
@@ -105,8 +107,16 @@
     - Never modify `ImChannelManager`, `dispatch-inbound.ts`, or any existing provider when adding support.
     - Never introduce provider-specific branches (`if (type === 'xxx')`) in generic code paths — put the logic in a provider method.
     - Never bypass the `InboundMessage` / `ReplyHandle` contract; providers must normalize all upward traffic to it.
+    - Outbound text arrives at any length. A provider whose platform caps one message states that cap once and sends through `im-channels/message-parts.ts` (ordered `(i/n)` parts); generic code never shortens a reply for it.
     - Brand-specific IPC files (`ipc/wecom-bot.ts`, etc.) only expose unique setup/auth flows (QR login, token refresh). Generic channel operations go in `ipc/im-channels.ts` / `ipc/im-sessions.ts`.
     - See `ARCHITECTURE.md §22` for the full contract and recipe.
+
+15. **Performance and scale rules are architecture, not polish.**
+    - Before touching a hot path (streaming render, IPC/WS events, file watching, Canvas
+      viewers, engine sessions, crash recovery, federation sync, any cache), read
+      `references/performance-and-scale.md`.
+    - Guard tests in `tests/unit/architecture/` enforce the automatable rules. A failing guard
+      means fix the code; never widen an allowlist to get green.
 
 ## 2) Fast Task Router
 
@@ -121,12 +131,12 @@
 | Change execution/trigger/escalation/activity | `src/main/apps/runtime/service.ts` | `runtime/execute.ts`, `runtime/report-tool.ts`, `runtime/store.ts`, `tests/unit/apps/runtime/*` |
 | Change scheduling behavior | `src/main/platform/scheduler/index.ts` | `scheduler/schedule.ts`, `scheduler/store.ts`, `tests/unit/platform/scheduler/*` |
 | Add event source/filter behavior | `src/main/platform/event/*` | `src/main/bootstrap/extended.ts` |
-| Change memory behavior/tools | `src/main/platform/memory/index.ts` | `memory/tools.ts`, `memory/prompt.ts`, `tests/unit/platform/memory/*` |
+| Change memory behavior | `src/main/platform/memory/index.ts` | `memory/prompt.ts`, `memory/guard.ts`, `tests/unit/platform/memory/*` |
 | Change agent engine (session / stream / prompt / subagent / permissions / MCP) | **Read `src/main/services/agent/DESIGN.md` first**, then jump to named file | Co-edits depend on the exact concern — see DESIGN.md routing |
 | Change digital-team coordination (send/wait/blackboard/orchestration) | **Read `src/main/apps/runtime/federation/DESIGN.md` first**, then `src/main/apps/runtime/team/*` | `apps/team/store.ts`, `tests/unit/apps/runtime/team/*`; kernel stays transport-free |
 | Change cross-node offices (join/presence/wake/replication/feeds/gateway) | **Read `src/main/apps/runtime/federation/DESIGN.md` + `log/DESIGN.md` first** | `manager.ts`/`coordinator.ts`/`ctrl-feed.ts`/`session-feed.ts`, `apps/federation/*`, `tests/unit/apps/runtime/federation/*`; then the cluster tier (§5) |
 | Change what a NON-OWNER caller may make a digital human do (IM guest / teammate) | `src/shared/apps/capability-policy.ts` (vocabulary) + `src/main/apps/runtime/capability-policy.ts` (enforcement) | ONE call site in `apps/runtime/app-chat.ts` (`applyCapabilityPolicy`); the per-call gate + owner's record is `apps/runtime/delegation-gate.ts`; the UI is `components/capability/CapabilityPolicyFields.tsx`, used by BOTH settings screens. Never fork the two scenarios. |
-| Change how strictly a borrowed team turn reads silence, or where a request counts as coming from | **Read `src/main/apps/runtime/team/DESIGN.md` § "How strictly a borrowed turn reads silence" first** | `TeamTriggerContext.external` is stamped ONLY at a node boundary (`federation/session-deps.ts withExternalOrigin`, `http/routes/team.routes.ts`), propagated by `team-tools`/`message-bus`, and made sticky per session by `team/external-origin.ts`. A new path that starts a team turn must answer where it came from, or it defaults to "the owner started it". |
+| Change how strictly a borrowed team turn reads silence, or where a request counts as coming from | **Read `src/main/apps/runtime/team/DESIGN.md` § "How strictly a borrowed turn reads silence" first** | `TeamTriggerContext.external` is stamped ONLY at a node boundary (`federation/session-deps.ts withExternalOrigin`, `http/routes/team.routes.ts`, and `apps/runtime/dispatch-inbound.ts` for a guest of a team-fronted IM chat), propagated by `team-tools`/`message-bus`, and made sticky per session by `team/external-origin.ts`. A new path that starts a team turn must answer where it came from, or it defaults to "the owner started it". |
 | **Add a chat turn-level feature** (attachments, thinking, context injection, ...) | Shared module under `services/agent/` first | Then wire EVERY entry point per hard rule 13: `send-message.ts`, `apps/runtime/app-chat.ts`, `apps/runtime/execute.ts` |
 | **Support a new IM platform** | New file: `src/main/apps/runtime/im-channels/<brand>.provider.ts` | Register in `runtime/index.ts`, extend `ImChannelType` in `shared/types/im-channel.ts`. **Do NOT touch `manager.ts` / `dispatch-inbound.ts`.** Only add `ipc/<brand>.ts` if the brand has unique setup/auth flow. |
 | Change generic IM channel lifecycle / session mgmt | `src/main/apps/runtime/im-channels/manager.ts` / `dispatch-inbound.ts` | `ipc/im-channels.ts`, `ipc/im-sessions.ts`, `shared/types/im-channel.ts`. Must remain provider-agnostic. |

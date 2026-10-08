@@ -14,9 +14,10 @@
  * The SDK (unstable_v2_createSession) is mocked -- we don't spawn real CC processes.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { randomUUID } from 'crypto'
 import path from 'path'
+import fs from 'fs'
 
 // ============================================
 // Mocks for transitive dependencies
@@ -55,7 +56,7 @@ vi.mock('../../../../src/main/services/agent/sdk-config', () => ({
     sdkModel: 'test-model',
     displayModel: 'Test Model',
   }),
-  buildBaseSdkOptions: vi.fn().mockReturnValue({
+  buildUserSessionSdkOptions: vi.fn().mockReturnValue({
     model: 'test-model',
     cwd: '/tmp/test',
     maxTurns: 999,
@@ -71,6 +72,7 @@ vi.mock('../../../../src/main/foundation/config.service', () => ({
   getConfig: vi.fn().mockReturnValue({}),
   getTempSpacePath: vi.fn().mockReturnValue('/tmp/halo-test/temp'),
   getHaloDir: vi.fn(() => path.join(globalThis.__HALO_TEST_DIR__, '.halo')),
+  resolveClaudeConfigDir: vi.fn(() => path.join(globalThis.__HALO_TEST_DIR__, 'claude-config')),
   onNetworkConfigChange: vi.fn(),
   onAgentConfigChange: vi.fn(),
 }))
@@ -137,7 +139,7 @@ vi.mock('../../../../src/main/services/email-mcp', () => ({
 
 // Mock session-manager (imports electron transitively)
 vi.mock('../../../../src/main/services/agent/session-manager', () => ({
-  getOrCreateV2Session: vi.fn(),
+  acquireV2Session: vi.fn(),
   migrateSessionIfNeeded: vi.fn(),
   createSessionState: vi.fn(() => ({ thoughts: [], abortController: new AbortController(), spaceId: '', conversationId: '' })),
 }))
@@ -171,6 +173,7 @@ vi.mock('../../../../src/main/services/agent/events', () => ({
 // Mock resolved-sdk (report-tool.ts imports tool/createSdkMcpServer from here)
 vi.mock('../../../../src/main/services/agent/resolved-sdk', () => ({
   createSession: vi.fn(),
+  getActiveEngine: () => null,
   tool: vi.fn((name: string, description: string, schema: unknown, handler: unknown) => ({
     name,
     description,
@@ -199,6 +202,13 @@ vi.mock('../../../../src/main/apps/runtime/execute', () => ({
   })),
 }))
 
+// The holiday calendar is downloaded in real use; tests say what kind of day it is.
+const workdayCalendar = vi.hoisted(() => ({ status: 'workday' as 'workday' | 'day_off' | 'not_covered' }))
+vi.mock('../../../../src/main/services/workday-calendar', () => ({
+  refreshWorkdayCalendar: vi.fn(async () => {}),
+  workdayStatusOn: vi.fn(async () => workdayCalendar.status),
+}))
+
 import { createDatabaseManager } from '../../../../src/main/platform/store/database-manager'
 import type { DatabaseManager } from '../../../../src/main/platform/store/types'
 import { ActivityStore } from '../../../../src/main/apps/runtime/store'
@@ -212,6 +222,7 @@ import {
 } from '../../../../src/main/apps/manager/migrations'
 import { Semaphore } from '../../../../src/main/apps/runtime/concurrency'
 import { buildAppSystemPrompt, buildInitialMessage, buildMemorySection, buildEscalationResumeMessage } from '../../../../src/main/apps/runtime/prompt'
+import { buildIdentityFragments } from '../../../../src/main/apps/runtime/prompt/identity'
 import { _resetTlonRegistry, createKB, bindToApp } from '../../../../src/main/services/tlon/service'
 import {
   AppNotRunnableError,
@@ -220,10 +231,14 @@ import {
   RunExecutionError,
 } from '../../../../src/main/apps/runtime/errors'
 import { createAppRuntimeService } from '../../../../src/main/apps/runtime/service'
+import { initScheduler, resetSchedulerForTest } from '../../../../src/main/platform/scheduler'
+import { openSessionWriter } from '../../../../src/main/apps/runtime/session-store'
+import { getSpace } from '../../../../src/main/services/space.service'
 import { broadcastToAll } from '../../../../src/main/http/websocket'
 import { sendToRenderer } from '../../../../src/main/foundation/window.service'
 import { executeRun } from '../../../../src/main/apps/runtime/execute'
 import { notifyAppEvent } from '../../../../src/main/services/notification.service'
+import { refreshWorkdayCalendar, workdayStatusOn } from '../../../../src/main/services/workday-calendar'
 import { createReportToolServer } from '../../../../src/main/apps/runtime/report-tool'
 import type {
   AutomationRun,
@@ -1259,16 +1274,45 @@ describe('Prompt Builder', () => {
       expect(prompt).toContain('App Instructions')
     })
 
+    it('lets a digital human answer as its App Instructions say: it runs on Halo, it is not Halo', () => {
+      const prompt = buildAppSystemPrompt({
+        appId: 'test-app-id',
+        appSpec: createTestSpec({ system_prompt: 'You are Mia, the after-sales assistant of Acme.' }),
+        memoryInstructions: '',
+        triggerContext: 'Scheduled',
+        workDir: '/tmp/test',
+      })
+
+      expect(prompt).not.toMatch(/^You are Halo, /m)
+      expect(prompt).toContain('You run on Halo, which gives you remote access, file management, and built-in AI browser capabilities.')
+      expect(prompt).toContain('You are Mia, the after-sales assistant of Acme.')
+      // Tools, environment and safety still come from Halo.
+      expect(prompt).toContain('Platform:')
+      expect(prompt).toContain('IMPORTANT: You must NEVER generate or guess URLs')
+    })
+
+    it('gives a digital human chat the same opening', () => {
+      const [base] = buildIdentityFragments({
+        appId: 'test-app-id',
+        appSpec: createTestSpec({ system_prompt: 'You are Mia, the after-sales assistant of Acme.' }),
+        memoryInstructions: '',
+        workDir: '/tmp/test',
+      })
+
+      expect(base).not.toMatch(/^You are Halo, /m)
+      expect(base).toContain('You run on Halo, which gives you remote access, file management, and built-in AI browser capabilities.')
+    })
+
     it('should include memory instructions when provided', () => {
       const prompt = buildAppSystemPrompt({
         appId: 'test-app-id',
         appSpec: createTestSpec(),
-        memoryInstructions: '## Memory\nUse memory_read to recall state.',
+        memoryInstructions: '## Memory\nRead relevant memory files.',
         triggerContext: 'Manual',
         workDir: '/tmp/test',
       })
 
-      expect(prompt).toContain('memory_read')
+      expect(prompt).toContain('Read relevant memory files.')
     })
 
     it('should always include reporting rules', () => {
@@ -1399,39 +1443,39 @@ describe('Prompt Builder', () => {
     })
   })
 
-  describe('buildInitialMessage', () => {
-    /** Minimal no-memory snapshot — buildInitialMessage requires one. */
-    const memorySnapshot = {
-      exists: false,
+  const memorySectionBase = {
+      layout: {
+        file: '/tmp/test-memory.md',
+        dataDir: '/tmp/memory',
+        topicsDir: '/tmp/memory/topics',
+        runDir: '/tmp/memory/run',
+        archiveDir: '/tmp/memory/archive',
+        snapshotsDir: '/tmp/memory/.snapshots',
+        consolidationDir: '/tmp/memory/.consolidation',
+        stateFile: '/tmp/memory/.state.json',
+      },
+      // Template default, not an empty memory: the two content cases below
+      // need a `false` here to reach the branches that render inlined content.
+      blank: false,
       totalLines: 0,
       sizeBytes: 0,
       firstSection: null,
+      nowBytes: 0,
       headers: [],
       fullContent: null,
-      archiveFiles: [],
-      archiveTotalCount: 0,
-      compactionArchiveCount: 0,
-      memoryFilePath: '/tmp/test-memory.md',
-      memoryArchiveDir: '/tmp/memory/run',
-      lastModified: null,
-      rawContent: null,
+      topics: { root: '/tmp/memory/topics', children: [], topicCount: 0, totalBytes: 0, truncated: false },
+      runTotalCount: 0,
+      archiveCount: 0,
     }
 
-    const selfInstance = {
-      id: 'aaaabbbb',
-      kind: 'run' as const,
-      origin: 'schedule',
-      startedAt: Date.now(),
-    }
-    const liveInstances: never[] = []
+  describe('buildInitialMessage', () => {
+    const memorySnapshot = { ...memorySectionBase, exists: false }
 
     it('should include trigger context', () => {
       const msg = buildInitialMessage({
         memorySnapshot,
         triggerContext: 'Scheduled run at 14:30',
         appName: 'Price Monitor',
-        selfInstance,
-        liveInstances,
       })
 
       expect(msg).toContain('Scheduled run at 14:30')
@@ -1443,8 +1487,6 @@ describe('Prompt Builder', () => {
         memorySnapshot,
         triggerContext: 'Manual trigger',
         appName: 'Price Monitor',
-        selfInstance,
-        liveInstances,
         userConfig: { productUrl: 'https://example.com', threshold: 100 },
       })
 
@@ -1458,8 +1500,6 @@ describe('Prompt Builder', () => {
         memorySnapshot,
         triggerContext: 'Manual trigger',
         appName: 'Price Monitor',
-        selfInstance,
-        liveInstances,
         userConfig: {},
       })
 
@@ -1471,11 +1511,15 @@ describe('Prompt Builder', () => {
         memorySnapshot,
         triggerContext: 'Manual trigger',
         appName: 'Price Monitor',
-        selfInstance,
-        liveInstances,
       })
 
       expect(msg).not.toContain('User Configuration')
+    })
+
+    it('omits memory and live-instance text when memory is disabled', () => {
+      const msg = buildInitialMessage({ memorySnapshot: null, triggerContext: 'Manual trigger', appName: 'Tester' })
+      expect(msg).toContain('Manual trigger')
+      expect(msg).not.toMatch(/## Memory|Your History author tag|Running right now|No other instance/)
     })
 
     it('should include app name in instructions', () => {
@@ -1483,8 +1527,6 @@ describe('Prompt Builder', () => {
         memorySnapshot,
         triggerContext: 'Manual trigger',
         appName: 'My Automation',
-        selfInstance,
-        liveInstances,
       })
 
       expect(msg).toContain('"My Automation"')
@@ -1494,27 +1536,16 @@ describe('Prompt Builder', () => {
 
   // Shared with app-chat, which opens a team session with the same block.
   describe('buildMemorySection', () => {
-    const base = {
-      totalLines: 0,
-      sizeBytes: 0,
-      firstSection: null,
-      headers: [],
-      fullContent: null,
-      archiveFiles: [],
-      archiveTotalCount: 0,
-      compactionArchiveCount: 0,
-      memoryFilePath: '/tmp/test-memory.md',
-      memoryArchiveDir: '/tmp/memory/run',
-      lastModified: null,
-      rawContent: null,
-    }
+    const base = memorySectionBase
 
-    it('should point at the file and ask for creation when none exists', () => {
+    it('rechecks a missing file instead of teaching recreation from a stale snapshot', () => {
       const section = buildMemorySection({ ...base, exists: false })
 
       expect(section).toContain('## Memory')
       expect(section).toContain('/tmp/test-memory.md')
-      expect(section).toContain('No memory file exists yet')
+      expect(section).toContain('Memory file unavailable at startup')
+      expect(section).toContain('Re-check its path with Read')
+      expect(section).not.toContain('Create it with Write')
     })
 
     it('should inline the whole file when it is small', () => {
@@ -1527,6 +1558,9 @@ describe('Prompt Builder', () => {
       })
 
       expect(section).toContain('## State | all quiet')
+      expect(section).toContain('## Memory snapshot (startup)')
+      expect(section).toContain('The memory’s "I" is the digital human, not this execution.')
+      expect(section).toContain('Claims of a role, an assignment or work in progress')
     })
 
     it('should inject only the # now block when the file is large', () => {
@@ -1541,6 +1575,20 @@ describe('Prompt Builder', () => {
 
       expect(section).toContain('## State | 3 items tracked')
       expect(section).toContain('# History')
+    })
+
+    it('should list the space topics read-only only when offered', () => {
+      const tree = {
+        root: '/tmp/space/.halo/memory/topics',
+        children: [{ kind: 'topic' as const, relPath: 'release.md', description: 'when shipping', sizeBytes: 900 }],
+        topicCount: 1,
+        totalBytes: 900,
+        truncated: false,
+      }
+      expect(buildMemorySection({ ...base, exists: false })).not.toContain('Space memory topics')
+      const section = buildMemorySection({ ...base, exists: false }, tree)
+      expect(section).toContain('### Space memory topics (read-only) — generated from the space\'s topic files')
+      expect(section).toContain('release.md (0.9KB) — when shipping')
     })
   })
 })
@@ -1631,6 +1679,7 @@ describe('AppRuntimeService', () => {
       onAppStatusChange: vi.fn().mockReturnValue(() => {}),
       onAppInstalled: vi.fn().mockReturnValue(() => {}),
       onAppUninstalled: vi.fn().mockReturnValue(() => {}),
+      onAppSpecUpgraded: vi.fn().mockReturnValue(() => {}),
     }
 
     // Mock Scheduler
@@ -1645,6 +1694,7 @@ describe('AppRuntimeService', () => {
       onJobDue: vi.fn(),
       start: vi.fn(),
       stop: vi.fn(),
+      countDueTimes: vi.fn().mockReturnValue(0),
     }
 
     // Mock EventRouter
@@ -1743,7 +1793,8 @@ describe('AppRuntimeService', () => {
       await service.activate(appId)
 
       expect(mockBackground.registerKeepAliveReason).toHaveBeenCalledWith(
-        `automation-apps-active:${appId}`
+        `automation-apps-active:${appId}`,
+        { ttlMs: Infinity }
       )
     })
 
@@ -1910,6 +1961,43 @@ describe('AppRuntimeService', () => {
       expect(mockScheduler.removeJob).toHaveBeenCalled()
       expect(unsubFn).toHaveBeenCalled()
       expect(keepAliveDisposer).toHaveBeenCalled()
+    })
+
+    it('holds the space file watcher while a file subscription is active', async () => {
+      const appId = randomUUID()
+      const fileWatch = { retain: vi.fn(), release: vi.fn() }
+      const app = {
+        id: appId,
+        specId: 'test-app',
+        spaceId: 'space-001',
+        spec: createTestSpec({
+          subscriptions: [{ id: 'watch', source: { type: 'file', config: { pattern: '*.md' } } }],
+        }),
+        status: 'active' as const,
+        userConfig: {},
+        userOverrides: {},
+        permissions: { granted: [], denied: [] },
+        installedAt: Date.now(),
+      }
+      mockAppManager.getApp.mockReturnValue(app)
+
+      const service = createAppRuntimeService({
+        store, appManager: mockAppManager, scheduler: mockScheduler, eventRouter: mockEventRouter,
+        memory: mockMemory, background: mockBackground, getSpacePath: () => '/tmp/test-space', fileWatch,
+      })
+      await service.activate(appId)
+      expect(fileWatch.retain).toHaveBeenCalledWith('space-001', `automation:${appId}`)
+
+      // Dropping the file subscription releases the hold without deactivating.
+      mockAppManager.getApp.mockReturnValue({
+        ...app,
+        spec: createTestSpec({ subscriptions: [{ id: 'sched', source: { type: 'schedule', config: { every: '30m' } } }] }),
+      })
+      service.syncAppSubscriptions(appId)
+      expect(fileWatch.release).toHaveBeenCalledWith('space-001', `automation:${appId}`)
+
+      await service.deactivate(appId)
+      expect(fileWatch.release).toHaveBeenCalledTimes(1)
     })
 
     it('should be safe to deactivate non-activated app', async () => {
@@ -2453,6 +2541,451 @@ describe('AppRuntimeService', () => {
     })
   })
 
+  // A run's first message is its trigger and the digital human's own memory.
+  // Pasting excerpts of every IM chat into it cost hundreds of thousands of
+  // tokens per run for a digital human with many chats.
+  describe('IM chats stay out of a run’s first message', () => {
+    const chatText = 'What were sales yesterday?'
+    let testAppId: string
+
+    beforeEach(() => {
+      vi.mocked(executeRun).mockClear()
+      testAppId = randomUUID()
+      const spacePath = path.join(globalThis.__HALO_TEST_DIR__, 'space-im')
+      vi.mocked(getSpace).mockReturnValue({ path: spacePath } as ReturnType<typeof getSpace>)
+      const chat = openSessionWriter(spacePath, testAppId, 'chat-wecom-bot-group-g1')
+      chat.writeTrigger(chatText)
+      chat.writeEvent({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Sales were up 3%.' }] } })
+      mockAppManager.getApp.mockReturnValue({
+        id: testAppId,
+        status: 'active',
+        spec: createTestSpec(),
+        userConfig: {},
+        userOverrides: {},
+        spaceId: 'space-im',
+      })
+    })
+
+    afterEach(() => {
+      vi.mocked(getSpace).mockReturnValue(null)
+    })
+
+    /**
+     * The runtime is handed this digital human's IM sessions the way it was
+     * once wired to read them; a run must still not carry them.
+     */
+    function serviceWithImSessions() {
+      const imSessionRegistry = {
+        getAllSessions: () => [{ appId: testAppId, channel: 'wecom-bot', chatType: 'group', chatId: 'g1', displayName: 'Sales group' }],
+      }
+      return createAppRuntimeService({
+        store,
+        appManager: mockAppManager,
+        scheduler: mockScheduler,
+        eventRouter: mockEventRouter,
+        memory: mockMemory,
+        background: mockBackground,
+        getSpacePath: () => '/tmp/test-space',
+        imSessionRegistry,
+      } as unknown as Parameters<typeof createAppRuntimeService>[0])
+    }
+
+    function firstMessage(): string {
+      return vi.mocked(executeRun).mock.calls[0][0].trigger.description
+    }
+
+    it('leaves them out of a manual run', async () => {
+      await serviceWithImSessions().triggerManually(testAppId)
+
+      expect(firstMessage()).toMatch(/^Manually triggered run for "test-automation"\. Time: \S+$/)
+      expect(firstMessage()).not.toContain(chatText)
+    })
+
+    it('leaves them out of a scheduled run', async () => {
+      serviceWithImSessions()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      await onJobDue({
+        id: `${testAppId}:daily`,
+        schedule: { kind: 'every', every: '1h' },
+        metadata: { appId: testAppId, subscriptionId: 'daily' },
+      })
+
+      expect(firstMessage()).toMatch(/^Scheduled run for "test-automation" — subscription "daily" \(every 1h\)\. Time: \S+$/)
+      expect(firstMessage()).not.toContain(chatText)
+    })
+  })
+
+  describe('which subscription started a run', () => {
+    let testAppId: string
+
+    beforeEach(() => {
+      vi.mocked(executeRun).mockClear()
+      testAppId = randomUUID()
+      mockAppManager.getApp.mockReturnValue({
+        id: testAppId,
+        status: 'active',
+        spec: createTestSpec({
+          subscriptions: [
+            { id: 'morning-report', source: { type: 'schedule', config: { cron: '0 9 * * *' } } },
+            { source: { type: 'schedule', config: { cron: '0 18 * * *' } } },
+            { id: 'inbox-files', source: { type: 'file', config: { pattern: '*.md' } } },
+          ],
+        }),
+        userConfig: {},
+        userOverrides: {},
+        spaceId: 'space-001',
+      })
+    })
+
+    const description = () => vi.mocked(executeRun).mock.calls.at(-1)?.[0].trigger.description
+
+    it('names each schedule by its id, or by its place when it has none', async () => {
+      createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      await onJobDue({ id: `${testAppId}:morning-report`, schedule: { kind: 'cron', cron: '0 9 * * *' }, metadata: { appId: testAppId, subscriptionId: 'morning-report' } })
+      expect(description()).toMatch(/^Scheduled run for "test-automation" — subscription "morning-report" \(cron: 0 9 \* \* \*\)\. Time: \S+$/)
+
+      await onJobDue({ id: `${testAppId}:1`, schedule: { kind: 'cron', cron: '0 18 * * *' }, metadata: { appId: testAppId, subscriptionId: '1' } })
+      expect(description()).toMatch(/^Scheduled run for "test-automation" — subscription #2 \(cron: 0 18 \* \* \*\)\. Time: \S+$/)
+    })
+
+    it('names the event subscription that fired', async () => {
+      const service = createService()
+      await service.activate(testAppId)
+      const [, handler] = mockEventRouter.on.mock.calls[0]
+
+      await handler({ type: 'file.changed', payload: { path: 'notes.md' } })
+
+      expect(description()).toMatch(/^Triggered by event "file\.changed" for "test-automation" — subscription "inbox-files"\. Time: \S+$/)
+    })
+  })
+
+  describe('a schedule limited to mainland China working days', () => {
+    let appId: string
+    const job = () => ({ id: `${appId}:daily`, schedule: { kind: 'cron', cron: '0 9 * * *' }, metadata: { appId, subscriptionId: 'daily' } })
+
+    function install(config: Record<string, unknown>): void {
+      const spec = createTestSpec({ subscriptions: [{ id: 'daily', source: { type: 'schedule', config } }] } as Partial<AppSpec>)
+      mockAppManager.getApp.mockReturnValue({ id: appId, status: 'active', spec, userConfig: {}, userOverrides: {}, spaceId: 'space-001' })
+      dbManager.getAppDatabase().prepare(`
+        INSERT INTO installed_apps (id, spec_id, space_id, spec_json, status, user_config_json, user_overrides_json, permissions_json, installed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(appId, `spec-${appId}`, 'space-001', JSON.stringify(spec), 'active', '{}', '{}', '{"granted":[],"denied":[]}', Date.now())
+    }
+
+    beforeEach(() => {
+      vi.mocked(executeRun).mockClear()
+      vi.mocked(workdayStatusOn).mockClear()
+      vi.mocked(refreshWorkdayCalendar).mockClear()
+      appId = randomUUID()
+      install({ cron: '0 9 * * *', workday_calendar: true })
+    })
+
+    afterEach(() => {
+      workdayCalendar.status = 'workday'
+    })
+
+    it('does not start on a day off, and leaves nothing on the timeline', async () => {
+      workdayCalendar.status = 'day_off'
+      createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      expect(await onJobDue(job())).toBe('skipped')
+      expect(executeRun).not.toHaveBeenCalled()
+      expect(store.getEntriesForApp(appId)).toEqual([])
+    })
+
+    it('runs on a day the calendar counts as a working day', async () => {
+      workdayCalendar.status = 'workday'
+      createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      await onJobDue(job())
+
+      expect(executeRun).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not start on a day the calendar does not cover, and says so once that day', async () => {
+      workdayCalendar.status = 'not_covered'
+      createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      expect(await onJobDue(job())).toBe('skipped')
+      expect(await onJobDue(job())).toBe('skipped')
+
+      expect(executeRun).not.toHaveBeenCalled()
+      const entries = store.getEntriesForApp(appId)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({ type: 'run_skipped', content: { status: 'skipped', workdayCalendarGap: true } })
+    })
+
+    it('reads a calendar check that fails as an uncovered day, not as a failing schedule', async () => {
+      vi.mocked(workdayStatusOn).mockRejectedValueOnce(new Error('calendar copy is broken'))
+      const quiet = vi.spyOn(console, 'error').mockImplementation(() => {})
+      createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      expect(await onJobDue(job())).toBe('skipped')
+      quiet.mockRestore()
+      expect(executeRun).not.toHaveBeenCalled()
+      expect(store.getEntriesForApp(appId)).toEqual([expect.objectContaining({ content: expect.objectContaining({ workdayCalendarGap: true }) })])
+    })
+
+    it('leaves no calendar note for a digital human that would not run anyway', async () => {
+      workdayCalendar.status = 'not_covered'
+      mockAppManager.getApp.mockReturnValue({ ...mockAppManager.getApp(appId), status: 'paused' })
+      createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      expect(await onJobDue(job())).toBe('skipped')
+      expect(workdayStatusOn).not.toHaveBeenCalled()
+      expect(store.getEntriesForApp(appId)).toEqual([])
+    })
+
+    it('leaves a schedule without the option to its own times', async () => {
+      appId = randomUUID()
+      install({ cron: '0 9 * * *' })
+      workdayCalendar.status = 'not_covered'
+      createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+
+      await onJobDue(job())
+
+      expect(workdayStatusOn).not.toHaveBeenCalled()
+      expect(executeRun).toHaveBeenCalledTimes(1)
+    })
+
+    it('fetches the calendar when such a digital human is switched on', async () => {
+      await createService().activate(appId)
+
+      expect(refreshWorkdayCalendar).toHaveBeenCalled()
+    })
+  })
+
+  describe('token usage of a run', () => {
+    it('shows what the model processed on the run’s latest entry', async () => {
+      const appId = randomUUID()
+      mockAppManager.getApp.mockReturnValue({ id: appId, status: 'active', spec: createTestSpec(), userConfig: {}, userOverrides: {}, spaceId: 'space-001' })
+      dbManager.getAppDatabase().prepare(`
+        INSERT INTO installed_apps (id, spec_id, space_id, spec_json, status, user_config_json, user_overrides_json, permissions_json, installed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(appId, 'test-app', 'space-001', JSON.stringify(createTestSpec()), 'active', '{}', '{}', '{"granted":[],"denied":[]}', Date.now())
+      const tokenUsage = { inputTokens: 120, outputTokens: 80, cacheReadTokens: 9000, cacheCreationTokens: 300 }
+      vi.mocked(executeRun).mockImplementationOnce(async () => {
+        store.insertRun({ runId: 'run-usage', appId, sessionKey: 'sk-usage', status: 'running', triggerType: 'manual', startedAt: 1 })
+        return { appId, runId: 'run-usage', sessionKey: 'sk-usage', outcome: 'useful', startedAt: 1, finishedAt: 2, durationMs: 1, tokensUsed: 200, tokenUsage }
+      })
+
+      await createService().triggerManually(appId)
+
+      const [latest] = store.getEntriesForRun('run-usage')
+      expect(latest.content.tokenUsage).toEqual(tokenUsage)
+    })
+  })
+
+  describe('pausing a person after repeated failures', () => {
+    it('names the latest failure in the note it leaves', async () => {
+      const appId = randomUUID()
+      mockAppManager.getApp.mockReturnValue({ id: appId, status: 'active', spec: createTestSpec(), userConfig: {}, userOverrides: {}, spaceId: 'space-001' })
+      dbManager.getAppDatabase().prepare(`
+        INSERT INTO installed_apps (id, spec_id, space_id, spec_json, status, user_config_json, user_overrides_json, permissions_json, installed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(appId, 'test-app', 'space-001', JSON.stringify(createTestSpec()), 'active', '{}', '{}', '{"granted":[],"denied":[]}', Date.now())
+      for (let n = 0; n < 4; n++) {
+        store.insertRun({ runId: `failed-${n}`, appId, sessionKey: `sk-${n}`, status: 'running', triggerType: 'schedule', startedAt: 1000 + n })
+        store.completeRun(`failed-${n}`, { status: 'error', finishedAt: 1000 + n, durationMs: 1, errorMessage: 'earlier failure' })
+      }
+      vi.mocked(executeRun).mockImplementationOnce(async () => {
+        store.insertRun({ runId: 'failed-latest', appId, sessionKey: 'sk-latest', status: 'running', triggerType: 'manual', startedAt: 2000 })
+        store.completeRun('failed-latest', { status: 'error', finishedAt: 2001, durationMs: 1, errorMessage: 'API Error: 529 overloaded' })
+        return { appId, runId: 'failed-latest', sessionKey: 'sk-latest', outcome: 'error', startedAt: 2000, finishedAt: 2001, durationMs: 1, errorMessage: 'API Error: 529 overloaded' }
+      })
+
+      await createService().triggerManually(appId)
+
+      expect(mockAppManager.updateStatus).toHaveBeenCalledWith(appId, 'error', {
+        errorMessage: 'Auto-disabled after 5 consecutive failed runs. Latest: API Error: 529 overloaded',
+      })
+    })
+  })
+
+  describe('runs past the transcript retention', () => {
+    let testAppId: string
+    let spacePath: string
+
+    beforeEach(() => {
+      vi.mocked(executeRun).mockClear()
+      testAppId = randomUUID()
+      spacePath = path.join(globalThis.__HALO_TEST_DIR__, `space-retention-${testAppId}`)
+      mockAppManager.getApp.mockReturnValue({
+        id: testAppId, status: 'active', spec: createTestSpec(), userConfig: {}, userOverrides: {}, spaceId: 'space-001',
+      })
+      dbManager.getAppDatabase().prepare(`
+        INSERT INTO installed_apps (id, spec_id, space_id, spec_json, status, user_config_json, user_overrides_json, permissions_json, installed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(testAppId, 'test-app', 'space-001', JSON.stringify(createTestSpec()), 'active', '{}', '{}', '{"granted":[],"denied":[]}', Date.now())
+    })
+
+    /** `count` finished runs, oldest first, each with a transcript written through the session store. */
+    function seedFinishedRuns(count: number): string[] {
+      const ids: string[] = []
+      for (let n = 0; n < count; n++) {
+        const runId = `old-run-${n}`
+        store.insertRun({
+          runId, appId: testAppId, sessionKey: `sk-${n}`, status: 'running', triggerType: 'schedule', startedAt: 1_000_000 + n,
+          environment: { spaceId: 'space-001', spacePath, workDir: spacePath, memoryDir: spacePath },
+        })
+        store.completeRun(runId, { status: 'error', finishedAt: 1_000_000 + n, durationMs: 1 })
+        store.updateRunSessionId(runId, `engine-${n}`)
+        openSessionWriter(spacePath, testAppId, runId).writeTrigger('go')
+        ids.push(runId)
+      }
+      return ids
+    }
+
+    const transcriptOf = (runId: string) => path.join(spacePath, '.halo', 'apps', testAppId, 'runs', `${runId}.jsonl`)
+
+    it('clears the oldest run’s process and engine session when one of the person’s runs ends', async () => {
+      const [oldest, next] = seedFinishedRuns(201)
+      const engineSession = path.join(globalThis.__HALO_TEST_DIR__, 'claude-config', 'projects', spacePath.replace(/[^a-zA-Z0-9]/g, '-'), 'engine-0.jsonl')
+      fs.mkdirSync(path.dirname(engineSession), { recursive: true })
+      fs.writeFileSync(engineSession, '{}\n')
+      const service = createService()
+
+      await service.triggerManually(testAppId)
+
+      expect(fs.existsSync(transcriptOf(oldest))).toBe(false)
+      expect(fs.existsSync(engineSession)).toBe(false)
+      expect(store.getRun(oldest)?.transcriptClearedAt).toEqual(expect.any(Number))
+      expect(fs.existsSync(transcriptOf(next))).toBe(true)
+    })
+
+    it('refuses to continue a run whose process was cleared, by Continue or by a follow-up', async () => {
+      const [oldest] = seedFinishedRuns(1)
+      store.markTranscriptCleared(oldest)
+      const service = createService()
+
+      await expect(service.continueFailedRun(testAppId, oldest)).rejects.toThrow('cleared under the retention rule')
+      await expect(service.injectIntoRun(testAppId, oldest, 'try again')).rejects.toThrow('cleared under the retention rule')
+      expect(executeRun).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('a run that outlasts its scheduled times', () => {
+    const T0 = Date.UTC(2026, 9, 6, 9, 0, 0)
+    const MIN = 60_000
+    let testAppId: string
+
+    beforeEach(() => {
+      vi.mocked(executeRun).mockClear()
+      testAppId = randomUUID()
+      const spec = createTestSpec({
+        subscriptions: [{ id: 'quarter-hour', source: { type: 'schedule', config: { every: '15m' } } }],
+      })
+      mockAppManager.getApp.mockReturnValue({
+        id: testAppId, status: 'active', spec, userConfig: {}, userOverrides: {}, spaceId: 'space-001',
+      })
+      dbManager.getAppDatabase().prepare(`
+        INSERT INTO installed_apps (id, spec_id, space_id, spec_json, status, user_config_json, user_overrides_json, permissions_json, installed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(testAppId, 'test-app', 'space-001', JSON.stringify(spec), 'active', '{}', '{}', '{"granted":[],"denied":[]}', T0)
+      vi.useFakeTimers({ now: T0, toFake: ['Date'] })
+    })
+
+    afterEach(async () => {
+      await resetSchedulerForTest()
+      vi.useRealTimers()
+    })
+
+    async function activatedOnRealScheduler() {
+      const scheduler = await initScheduler({ db: dbManager })
+      const service = createAppRuntimeService({
+        store,
+        appManager: mockAppManager,
+        scheduler,
+        eventRouter: mockEventRouter,
+        memory: mockMemory,
+        background: mockBackground,
+        getSpacePath: () => '/tmp/test-space',
+      })
+      await service.activate(testAppId)
+      return service
+    }
+
+    /** The next run records its row the way executeRun does, and lasts `minutes`. */
+    function nextRunLasts(minutes: number, runId = 'run-long') {
+      vi.mocked(executeRun).mockImplementationOnce(async (opts: any) => {
+        const startedAt = Date.now()
+        store.insertRun({ runId, appId: testAppId, sessionKey: `sk-${runId}`, status: 'running', triggerType: opts.trigger.type, startedAt })
+        opts.onRunStarted?.({ runId, sessionKey: `sk-${runId}`, startedAt })
+        vi.setSystemTime(startedAt + minutes * MIN)
+        return { appId: testAppId, runId, sessionKey: `sk-${runId}`, outcome: 'useful', startedAt, finishedAt: Date.now(), durationMs: minutes * MIN }
+      })
+    }
+
+    it('says on the run’s entry how many scheduled times it ran past: 09:00–09:50 skips 09:15, 09:30 and 09:45', async () => {
+      const service = await activatedOnRealScheduler()
+      nextRunLasts(50)
+
+      await service.triggerManually(testAppId)
+
+      const [latest] = store.getEntriesForRun('run-long')
+      expect(latest.content.skippedSchedules).toBe(3)
+    })
+
+    it('says nothing when no scheduled time came due during the run', async () => {
+      const service = await activatedOnRealScheduler()
+      nextRunLasts(10)
+
+      await service.triggerManually(testAppId)
+
+      const [latest] = store.getEntriesForRun('run-long')
+      expect(latest.content.skippedSchedules).toBeUndefined()
+    })
+
+    it('tells the scheduler a stopped run did not fail, so its next time is neither backed off nor counted toward disabling it', async () => {
+      const service = createService()
+      const onJobDue = mockScheduler.onJobDue.mock.calls[0][1]
+      const job = { id: `${testAppId}:quarter-hour`, schedule: { kind: 'every', every: '15m' }, metadata: { appId: testAppId, subscriptionId: 'quarter-hour' } }
+      vi.mocked(executeRun).mockImplementationOnce(async (opts: any) => {
+        const startedAt = Date.now()
+        store.insertRun({ runId: 'run-stopped', appId: testAppId, sessionKey: 'sk-stopped', status: 'running', triggerType: 'schedule', startedAt })
+        opts.onRunStarted?.({ runId: 'run-stopped', sessionKey: 'sk-stopped', startedAt })
+        await service.stopRun(testAppId, 'run-stopped')
+        return { appId: testAppId, runId: 'run-stopped', sessionKey: 'sk-stopped', outcome: 'error', startedAt, finishedAt: startedAt, durationMs: 0, errorMessage: 'Stopped before reporting results' }
+      })
+
+      expect(await onJobDue(job)).toBe('noop')
+
+      // A run that failed on its own is still an error to the scheduler.
+      vi.mocked(executeRun).mockImplementationOnce(async () => ({
+        appId: testAppId, runId: 'run-failed', sessionKey: 'sk-failed', outcome: 'error', startedAt: T0, finishedAt: T0, durationMs: 0, errorMessage: 'model unavailable',
+      }))
+      expect(await onJobDue(job)).toBe('error')
+    })
+
+    it('counts a continued run’s running time from the continuation, not from the run’s first start', async () => {
+      const service = createService()
+      const yesterday = T0 - 24 * 60 * MIN
+      store.insertRun({ runId: 'run-old', appId: testAppId, sessionKey: 'sk-old', status: 'running', triggerType: 'schedule', startedAt: yesterday })
+      store.completeRun('run-old', { status: 'error', finishedAt: yesterday + MIN, durationMs: MIN, errorMessage: 'Stopped before reporting results' })
+      store.updateRunSessionId('run-old', 'cc-session-old')
+      let runningAtMs: number | undefined
+      vi.mocked(executeRun).mockImplementationOnce(async (opts: any) => {
+        opts.onRunStarted?.({ runId: 'run-old', sessionKey: 'sk-old', startedAt: Date.now() })
+        runningAtMs = service.getAppState(testAppId)?.runningAtMs
+        return { appId: testAppId, runId: 'run-old', sessionKey: 'sk-old', outcome: 'useful', startedAt: Date.now(), finishedAt: Date.now(), durationMs: 0 }
+      })
+
+      await service.continueFailedRun(testAppId, 'run-old')
+      await vi.waitFor(() => expect(runningAtMs).toBeDefined())
+
+      expect(runningAtMs).toBe(T0)
+    })
+  })
+
   describe('desktop notification on run completion (notificationLevel)', () => {
     let testAppId: string
 
@@ -2618,6 +3151,18 @@ describe('AppRuntimeService', () => {
       expect(executeRun).not.toHaveBeenCalled()
     })
 
+    it('marks only the desktop Run once as watchable', async () => {
+      seedApp()
+      const service = createService()
+
+      await service.startManually(testAppId, { watchable: true })
+      expect(vi.mocked(executeRun).mock.calls[0][0].trigger).toMatchObject({ type: 'manual', watchable: true })
+
+      vi.mocked(executeRun).mockClear()
+      await service.startManually(testAppId)
+      expect(vi.mocked(executeRun).mock.calls[0][0].trigger.watchable).toBeUndefined()
+    })
+
     it('still resolves when the run ends without ever reporting a start', async () => {
       seedApp()
       const service = createService()
@@ -2711,6 +3256,42 @@ describe('AppRuntimeService', () => {
     })
   })
 
+  describe('app status publishing', () => {
+    const inactiveApp = (id: string) => ({
+      id, status: 'paused', userConfig: {}, userOverrides: {}, permissions: { granted: [], denied: [] },
+    })
+
+    it('skips a publish whose state equals the last one sent, and re-announces after uninstall', () => {
+      const appId = randomUUID()
+      mockAppManager.getApp.mockReturnValue(inactiveApp(appId))
+      createService()
+      const onStatus = mockAppManager.onAppStatusChange.mock.calls[0][0]
+      const onUninstalled = mockAppManager.onAppUninstalled.mock.calls[0][0]
+      const statusSends = () => vi.mocked(sendToRenderer).mock.calls.filter(([ch]) => ch === 'app:status_changed').length
+      vi.mocked(sendToRenderer).mockClear()
+
+      onStatus(appId, 'active', 'paused')
+      onStatus(appId, 'active', 'paused')
+      expect(statusSends()).toBe(1)
+
+      onUninstalled({ id: appId })
+      onStatus(appId, 'active', 'paused')
+      expect(statusSends()).toBe(2)
+    })
+
+    it('getAllAppStates reuses a recently computed state instead of re-querying', () => {
+      const appId = randomUUID()
+      mockAppManager.getApp.mockReturnValue(inactiveApp(appId))
+      mockAppManager.listApps.mockReturnValue([{ id: appId }])
+      const service = createService()
+      const spy = vi.spyOn(service, 'getAppState')
+
+      service.getAllAppStates()
+      service.getAllAppStates()
+      expect(spy).toHaveBeenCalledTimes(1)
+    })
+  })
+
   // Every client caches the installed-App list, so both transports have to be
   // told when that list gains or loses a member.
   describe('installed-App list announcements', () => {
@@ -2727,6 +3308,120 @@ describe('AppRuntimeService', () => {
       onUninstalled({ id: 'app-gone' })
       expect(sendToRenderer).toHaveBeenCalledWith('app:list_changed', { appId: 'app-gone', change: 'uninstalled' })
       expect(broadcastToAll).toHaveBeenCalledWith('app:list_changed', { appId: 'app-gone', change: 'uninstalled' })
+    })
+  })
+
+  describe('uninstall cleanup', () => {
+    it('deactivates the app when an uninstall reaches it without a prior deactivate', async () => {
+      const appId = randomUUID()
+      const app = {
+        id: appId,
+        specId: 'test-app',
+        spaceId: 'space-001',
+        spec: createTestSpec(),
+        status: 'active' as const,
+        userConfig: {},
+        userOverrides: {},
+        permissions: { granted: [], denied: [] },
+        installedAt: Date.now(),
+      }
+      mockAppManager.getApp.mockReturnValue(app)
+      const service = createService()
+      await service.activate(appId)
+      mockScheduler.removeJob.mockClear()
+
+      mockAppManager.onAppUninstalled.mock.calls[0][0](app, 'space-deleted')
+      await new Promise(resolve => setImmediate(resolve))
+
+      expect(mockScheduler.removeJob).toHaveBeenCalled()
+    })
+  })
+
+  // Every upgrade path ends in the manager's upgradeSpec; the runtime's part is
+  // to reschedule the app and to tell the user what kept their version.
+  describe('author upgrades', () => {
+    const outcome = (kept: string[], editsKnown = true) => ({ fromVersion: '1.2.0', toVersion: '1.3.0', kept, editsKnown })
+
+    function installedApp(): string {
+      const appId = randomUUID()
+      dbManager.getAppDatabase().prepare(`
+        INSERT INTO installed_apps (id, spec_id, space_id, spec_json, status, user_config_json, user_overrides_json, permissions_json, installed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(appId, `spec-${appId}`, 'space-001', JSON.stringify(createTestSpec()), 'active', '{}', '{}', '{"granted":[],"denied":[]}', Date.now())
+      return appId
+    }
+
+    function upgraded(appId: string, kept: string[], editsKnown = true): void {
+      mockAppManager.onAppSpecUpgraded.mock.calls[0][0](appId, outcome(kept, editsKnown))
+    }
+
+    it('reschedules the app and leaves a note naming what kept the user’s version', () => {
+      const appId = installedApp()
+      const service = createService()
+      const sync = vi.spyOn(service, 'syncAppSubscriptions')
+      vi.mocked(sendToRenderer).mockClear()
+
+      upgraded(appId, ['system_prompt', 'subscriptions'], false)
+
+      expect(sync).toHaveBeenCalledWith(appId)
+      const [note] = store.getEntriesForApp(appId)
+      expect(note).toMatchObject({
+        type: 'milestone',
+        content: { upgrade: outcome(['system_prompt', 'subscriptions'], false), source: { kind: 'upgrade', appId } },
+      })
+      expect(sendToRenderer).toHaveBeenCalledWith('app:activity_entry:new', expect.objectContaining({ appId }))
+    })
+
+    it('leaves no note when the upgrade applied in full', () => {
+      const appId = installedApp()
+      createService()
+
+      upgraded(appId, [])
+
+      expect(store.getEntriesForApp(appId)).toEqual([])
+    })
+
+    describe('adoptAuthorVersion', () => {
+      it('switches only fields the note kept, records them on the note and publishes it again', () => {
+        const appId = installedApp()
+        const service = createService()
+        upgraded(appId, ['system_prompt', 'subscriptions'])
+        const [note] = store.getEntriesForApp(appId)
+        mockAppManager.adoptAuthorVersion = vi.fn(() => ['system_prompt'])
+        const sync = vi.spyOn(service, 'syncAppSubscriptions')
+        vi.mocked(sendToRenderer).mockClear()
+
+        const updated = service.adoptAuthorVersion(appId, note.id, ['system_prompt', 'icon'])
+
+        expect(mockAppManager.adoptAuthorVersion).toHaveBeenCalledWith(appId, ['system_prompt'])
+        expect(updated.content.upgrade?.adopted).toEqual(['system_prompt'])
+        expect(store.getEntry(note.id)?.content.upgrade?.adopted).toEqual(['system_prompt'])
+        expect(sync).not.toHaveBeenCalled()
+        expect(sendToRenderer).toHaveBeenCalledWith('app:activity_entry:new', expect.objectContaining({ appId }))
+      })
+
+      it('reschedules the app when its run times switched', () => {
+        const appId = installedApp()
+        const service = createService()
+        upgraded(appId, ['subscriptions'])
+        const [note] = store.getEntriesForApp(appId)
+        mockAppManager.adoptAuthorVersion = vi.fn(() => ['subscriptions'])
+        const sync = vi.spyOn(service, 'syncAppSubscriptions')
+
+        service.adoptAuthorVersion(appId, note.id, ['subscriptions'])
+
+        expect(sync).toHaveBeenCalledWith(appId)
+      })
+
+      it('refuses a note that is not this app’s upgrade note', () => {
+        const appId = installedApp()
+        const service = createService()
+        upgraded(appId, ['system_prompt'])
+        const [note] = store.getEntriesForApp(appId)
+
+        expect(() => service.adoptAuthorVersion(randomUUID(), note.id, ['system_prompt'])).toThrow()
+        expect(() => service.adoptAuthorVersion(appId, 'missing', ['system_prompt'])).toThrow()
+      })
     })
   })
 

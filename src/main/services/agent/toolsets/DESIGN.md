@@ -12,15 +12,15 @@ enter context only while it is enabled. Disabled toolsets cost one summary line.
 
 ## 2) Model (uniform across all engines)
 
-- **One mechanism, no runtime hot-swap.** The complete in-process MCP set (always-on
-  web-search / halo-apps, the broker meta server, and currently-enabled toolsets)
+- **One mechanism, no runtime hot-swap.** The complete in-process MCP set (the base
+  toolset — web-search / halo-docs / halo-apps, the broker meta server, and currently-enabled toolsets)
   is seeded at **session creation** via creation-time options. Enabling/disabling a
   toolset schedules a **session rebuild**, so the new set is seeded at the next
   session creation — the same deferral machinery as a credentials change.
 - **The AI never enables a toolset itself.** Tools are frozen per turn by the CC
   subprocess, so a mid-turn open would be unusable that turn and the model would
   waste steps probing for it. Instead the AI calls `request_toolset`, which asks
-  the user to flip the switch (and highlights it in the input "Tools" menu). Once
+  the user to flip the switch (and highlights it in the composer's "+" panel). Once
   the user enables it, the session rebuilds and its tools are available from the
   next message.
 - **Resident cost** = the single `request_toolset` meta tool, whose description
@@ -42,6 +42,7 @@ SDK path is no longer used.
 | `types.ts` | `ToolsetDefinition`, scope, status, event types |
 | `registry.ts` | The catalog. **Adding a toolset = one entry here** |
 | `state.ts` | Per-conversation open-set; write-through persisted on the conversation record |
+| `base.ts` | `buildBaseToolset`: the servers every user-facing session starts from (web-search, halo-docs, halo-apps while digital humans are enabled). Space chat (via the broker), digital-human chat and automation start from it and exclude explicitly. Imported directly, not through the barrel (the barrel loads the registry). See §6 |
 | `broker.ts` | Builds the creation-time MCP record (`buildCreationTimeServers`); `openToolset`/`closeToolset` (user toggle → persist + schedule rebuild); `requestToolset` (AI → user, emits `toolsets:requested`); emits `toolsets:changed`. Rebuild via an injected invalidator (DI seam, avoids a cycle with session-manager) |
 | `meta-server.ts` | The resident `request_toolset` MCP server (disabled-toolset awareness lives in its tool description) |
 | `capability-index.ts` | `buildToolsetSection`: enabled-toolset usage guides for the system prompt |
@@ -84,21 +85,39 @@ to the model-pin stamp. Only user toggles update the seed (AI requests never ope
 toolset; a restore must not rewrite it). Seeding happens **only at creation** — never
 in `getOpenToolsets` hydration — so reopening an old (empty) conversation stays empty.
 Unknown ids in the seed are dropped on hydrate, so no filtering is needed at stamp time.
-On first run, before any user toggle has written `config.lastToolsets`, `createConversation`
-seeds `FIRST_RUN_DEFAULT_TOOLSETS` (currently `['ai-browser']`) so the browser is on out of
-the box; once the user toggles anything, `config.lastToolsets` (including an empty set = all
-off) is authoritative.
+Before any user toggle has written `config.lastToolsets`, `createConversation` seeds
+`DEFAULT_TOOLSETS` (`shared/constants/toolsets.ts`, currently `ai-browser` + `halo-team`);
+once the user toggles anything, `config.lastToolsets` (including an empty set = all off) is
+authoritative. When a toolset later joins the defaults, `applyNewToolsetDefaultsOnDisk`
+(foundation/config, at startup) adds it to an existing `lastToolsets` exactly once and records
+it in `config.toolsetDefaultsSeen`, so a user who then turns it off keeps it off. The renderer
+reads the same constant: the composer's "+" button surfaces only toolsets enabled beyond it.
 
 ## 5) `request_toolset` UX
 
 `requestToolset` (broker) emits `toolsets:requested`; the renderer
-(`App.tsx` → `toolsets.store.applyRequestedEvent` → `ToolsetControls`) opens the
-"Tools" menu and pulse-highlights the requested switch. The meta-server tool
-returns guidance so the AI tells the user which toolset to enable, then stops.
+(`App.tsx` → `toolsets.store.applyRequestedEvent` → `useComposerToolsets`) opens the
+composer's "+" panel and highlights the requested switch in its Capabilities group.
+It does so at once, also while the turn that asked is still running: the panel then
+holds only the Capabilities group, and a switch flipped there takes effect from the
+user's next message, since the session rebuild waits for the turn to end. Nothing
+is added to the running turn.
+The meta-server tool returns guidance so the AI tells the user which toolset to
+enable, then stops.
 
 ## 6) Automation (digital humans)
 
-Automation does NOT use this broker or the meta server. Enabled toolsets are
+**Base toolset.** `base.ts` is the one part shared with the broker: every entry
+builds its record from `buildBaseToolset` and takes servers OUT, with the reason at
+its call site, rather than listing them itself — so a new base server reaches every
+entry by default. Current exclusions: automation runs and disposable team members
+get no `halo-apps`. Never in the base: `halo-conversations` (its own switch per
+entry kind) and anything granted per conversation or permission (browser,
+terminal, OCR, email, Halo API, memory, report, notify, team tools, person
+context, IM file send). `tests/unit/services/agent/entry-capability-matrix.test.ts`
+pins what each entry ends up with.
+
+Beyond that base, automation does NOT use this broker or the meta server. Enabled toolsets are
 **app permissions** resolved via `resolvePermission(app, '<id>')` in
 `apps/runtime/execute.ts` + `app-chat.ts`, seeded into the run's static MCP set at
 creation, and their usage guides appended in `prompt.ts` / `prompt/identity.ts`.
@@ -145,9 +164,9 @@ record, so the user's enabled set survives.
 1. Implement the in-process MCP server under `services/<feature>/`.
 2. Add one `registerToolset({ id, displayName, summary, usageGuide, isAvailable,
    createServer })` entry in `registry.ts`.
-3. Interactive: meta tools, system-prompt section, renderer "Tools" menu, and
-   persistence all derive from the registry. Add the renderer icon in
-   `components/chat/ToolsetControls.tsx`.
+3. Interactive: meta tools, system-prompt section, the composer's Capabilities
+   group, and persistence all derive from the registry. Add the renderer icon,
+   label and one-line description in `components/chat/composer-menu/toolset-display.tsx`.
 4. Automation (optional): add a `resolvePermission` gate + MCP injection in
    `apps/runtime/execute.ts` and `app-chat.ts`, a usage-guide append in
    `prompt.ts` / `prompt/identity.ts`, and a toggle in `AppConfigPanel.tsx`.

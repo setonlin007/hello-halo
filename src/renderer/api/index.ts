@@ -27,6 +27,9 @@ import { storeApi } from './store.api'
 import { tlonApi } from './tlon.api'
 import { eventsApi } from './events.api'
 import { taskApi } from './task.api'
+import { canvasApi } from './canvas.api'
+import { gitApi } from './git.api'
+import { codeReviewApi } from './code-review.api'
 
 /**
  * Unified api object — drop-in replacement for window.halo, transport-agnostic.
@@ -53,6 +56,9 @@ export const api = {
   ...tlonApi,
   ...eventsApi,
   ...taskApi,
+  ...canvasApi,
+  ...gitApi,
+  ...codeReviewApi,
 }
 
 // Export type for the API

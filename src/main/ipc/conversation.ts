@@ -6,6 +6,8 @@ import {
   listConversations,
   createConversation,
   getConversation,
+  getConversationFrom,
+  withImageFiles,
   updateConversation,
   deleteConversation,
   addMessage,
@@ -31,9 +33,9 @@ export function registerConversationHandlers(): void {
     },
 
     // Create a new conversation
-    createConversation: async (spaceId: string, title?: string) => {
+    createConversation: async (spaceId: string, title?: string, reasoningEffort?: unknown, options?: { ephemeral?: boolean }) => {
       try {
-        const conversation = createConversation(spaceId, title)
+        const conversation = createConversation(spaceId, title, reasoningEffort, { ephemeral: options?.ephemeral === true })
         return { success: true, data: conversation }
       } catch (error: unknown) {
         const err = error as Error
@@ -42,10 +44,14 @@ export function registerConversationHandlers(): void {
     },
 
     // Get a specific conversation
-    getConversation: async (spaceId: string, conversationId: string) => {
+    getConversation: async (spaceId: string, conversationId: string, options?: { fromMessageId?: string }) => {
       try {
-        const conversation = getConversation(spaceId, conversationId)
-        return { success: true, data: conversation }
+        const conversation = options?.fromMessageId
+          ? getConversationFrom(spaceId, conversationId, options.fromMessageId)
+          : getConversation(spaceId, conversationId)
+        if (!conversation) return { success: false, error: 'Conversation not found' }
+        // The desktop renderer loads stored images by file URL (remote clients get them inline).
+        return { success: true, data: withImageFiles(spaceId, conversation) }
       } catch (error: unknown) {
         const err = error as Error
         return { success: false, error: err.message }

@@ -31,6 +31,8 @@ import type { StreamResult } from '../../services/agent/stream-processor'
 import type { TurnSink } from '../../services/agent/turn-sink'
 import type { ImageAttachment } from '../../services/agent/types'
 import type { ProgressEvent } from '../../../shared/types/inbound-message'
+import type { TranscriptProvenance } from '../../../shared/types/transcript'
+import type { ContentReference } from '../../../shared/types/content-reference'
 import { parseAppChatKey } from '../../../shared/apps/im-keys'
 import { classifySessionSource, LOCAL_SESSION_CHANNEL } from '../../../shared/types/im-channel'
 import { getImSessionRegistry } from './im-session-registry'
@@ -38,8 +40,10 @@ import { getActiveImChannelManager } from './im-channels'
 import { ReplyTextAccumulator } from './reply-accumulator'
 import { ProgressEventParser } from './progress-formatter'
 import { TurnCutPoint } from './escalation-cut'
-import { openSessionWriter, saveChatSessionId, type SessionWriter } from './session-store'
+import { openSessionWriter, saveChatSessionId, type RecordedPush, type SessionWriter } from './session-store'
+import { AppChatTurnInterrupted, turnEndingOf, withTurnEndingNote, type AppChatTurnEnding } from './turn-ending'
 import { stopGeneration } from '../../services/agent/control'
+import { listResidentSessions } from '../../services/agent'
 
 // ============================================
 // Types
@@ -48,7 +52,11 @@ import { stopGeneration } from '../../services/agent/control'
 /** Per-round callbacks supplied by whoever sent the message. */
 export interface AppChatRoundHooks {
   onProgress?(event: ProgressEvent): void
-  onReply?(finalContent: string): void
+  /**
+   * The turn's answer. `ending` says it stopped short (the step limit, or cut
+   * off) — then `finalContent` is what was written, possibly nothing.
+   */
+  onReply?(finalContent: string, ending?: AppChatTurnEnding): void
   onMessageAccepted?(): void
 }
 
@@ -137,6 +145,11 @@ class AppChatSink implements TurnSink {
    * and an unclaimed turn is proof of liveness just the same.
    */
   private turnRunning = false
+  /**
+   * Pushes that came while a turn was running, written when it ends: the
+   * record keeps a turn's lines together, and reading it back relies on that.
+   */
+  private heldPushes: RecordedPush[] = []
 
   constructor(
     private readonly appId: string,
@@ -175,6 +188,7 @@ class AppChatSink implements TurnSink {
         if (this.current === round) this.current = null
         resolve()
         this.armTurnStartDeadline()
+        emitRoundChange(this.conversationId)
       },
     }
   }
@@ -191,8 +205,28 @@ class AppChatSink implements TurnSink {
   }
 
   /** Persist a user message to the transcript ahead of the turn it triggers. */
-  writeUserMessage(text: string, images?: ImageAttachment[], teamOrigin?: Pick<TeamTriggerContext, 'kind' | 'correlationId'>): void {
-    this.getWriter()?.writeTrigger(text, images, teamOrigin)
+  writeUserMessage(
+    text: string,
+    images?: ImageAttachment[],
+    teamOrigin?: Pick<TeamTriggerContext, 'kind' | 'correlationId'>,
+    provenance?: TranscriptProvenance,
+    references?: ContentReference[]
+  ): void {
+    this.getWriter()?.writeTrigger(text, images, teamOrigin, provenance, references)
+  }
+
+  /** Record a message the digital human pushed to this chat outside its turns (chat-record). */
+  writePush(push: RecordedPush): void {
+    if (this.turnRunning) {
+      this.heldPushes.push({ ...push, at: push.at ?? new Date().toISOString() })
+      return
+    }
+    this.getWriter()?.writePush(push)
+  }
+
+  /** A message failed before the engine created a turn to checkpoint. */
+  writePreInitFailure(error: Error): void {
+    this.getWriter()?.writeEvent({ type: 'turn_snapshot', content: '', thoughts: [], error: error.message })
   }
 
   /**
@@ -214,6 +248,7 @@ class AppChatSink implements TurnSink {
     // The engine is producing again; whatever is still queued is waiting on
     // this turn rather than on a session that will never answer.
     this.clearTurnStartDeadline()
+    emitRoundChange(this.conversationId)
   }
 
   onRawMessage(sdkMessage: unknown): void {
@@ -237,7 +272,7 @@ class AppChatSink implements TurnSink {
     // granular for JSONL (hundreds per response) and the engine adapters are
     // required to ALSO emit aggregate top-level `assistant`/`user` envelopes
     // (see services/agent/codex/event-normalizer.ts → aggregateBlock). The
-    // aggregates are what session-store.convertEventsToMessages reconstructs
+    // aggregates are what session-transcript.convertEventsToMessages reconstructs
     // the chat history from. Engine-specific persistence gates here are a
     // protocol-conformance smell; if a future engine needs them, fix the engine
     // adapter, not this consumer.
@@ -270,37 +305,45 @@ class AppChatSink implements TurnSink {
       this.completeTurn(result)
     } finally {
       this.turnRunning = false
+      this.writeHeldPushes()
       // Anything still queued is owed a turn of its own from here.
       this.armTurnStartDeadline()
+      emitRoundChange(this.conversationId)
     }
   }
 
-  onTurnError(error: Error): void {
-    const round = this.takeCurrentRound()
-    round?.reject(error)
-    this.turnRunning = false
-    this.armTurnStartDeadline()
+  onTurnError(error: Error, _turnStarted?: boolean, partial?: StreamResult): void {
+    try {
+      if (partial) this.persistPartial(partial, error.message)
+    } finally {
+      const round = this.takeCurrentRound()
+      round?.reject(error)
+      this.turnRunning = false
+      this.writeHeldPushes()
+      this.armTurnStartDeadline()
+      emitRoundChange(this.conversationId)
+    }
   }
 
   private completeTurn(result: StreamResult): void {
     this.persistSessionId(result)
 
-    // Read the reply from the raw SDK messages rather than processStream's
-    // lastTextContent, which is subject to the dual-path pollution documented
-    // in stream-processor.ts.
+    // Raw aggregates define delivery independently of the live UI's streaming state.
     const accumulated = this.turn.accumulator.getReply()
     const replyContent = accumulated || result.finalContent
+    const ending = turnEndingOf(result)
 
     const round = this.takeCurrentRound()
     console.log(
       `[AppChat][${this.appId}] Turn complete (${round ? 'solicited' : 'autonomous'}): ` +
       `content=${replyContent.length} chars` +
       `${accumulated ? ' (from SDK message)' : ' (from streamResult)'}, ` +
-      `thoughts=${result.thoughts.length}, tokens=${result.tokenUsage ? 'yes' : 'no'}`
+      `thoughts=${result.thoughts.length}, tokens=${result.tokenUsage ? 'yes' : 'no'}` +
+      `${ending ? `, ended=${ending.kind}` : ''}`
     )
 
     if (!round) {
-      this.deliverAutonomous(replyContent)
+      this.deliverAutonomous(replyContent, ending)
       return
     }
 
@@ -309,42 +352,62 @@ class AppChatSink implements TurnSink {
     // terminates a streaming IM session. Whether the placeholder is shown or
     // replaced with a notice is the bridge's decision, not ours.
     if (replyContent) {
-      try {
-        round.hooks.onReply?.(replyContent)
-      } catch (err) {
-        console.error(`[AppChat][${this.appId}] onReply callback error:`, err)
-      }
-      round.resolve()
+      this.reply(round, replyContent, ending)
       return
     }
 
     // No content and the turn did not end cleanly: surface it as a failed round
     // so the caller can close out its transport. A user-initiated stop is not a
-    // failure — the caller already tore its transport down.
+    // failure — the caller already tore its transport down. A cut-off turn says
+    // so in a way its caller can tell from a model error.
     if (!result.wasAborted && (result.hasErrorThought || result.isInterrupted)) {
-      round.reject(new Error(result.errorThought?.content || 'The model response was interrupted.'))
+      round.reject(result.hasErrorThought
+        ? new Error(result.errorThought?.content || 'The model response was interrupted.')
+        : new AppChatTurnInterrupted())
       return
     }
 
+    // The step limit came before any text: the reply is that it stopped.
+    if (ending) {
+      this.reply(round, '', ending)
+      return
+    }
     round.resolve()
   }
 
-  onConsumerStopped(): void {
-    this.turnRunning = false
-    this.clearTurnStartDeadline()
-    const pending = this.takeCurrentRound()
-    pending?.reject(new Error('Chat session ended before the reply completed.'))
-    while (this.queue.length > 0) {
-      const round = this.queue.shift()!
-      if (round.settled) continue
-      round.settled = true
-      round.reject(new Error('Chat session ended before the message was processed.'))
+  private reply(round: Round, content: string, ending: AppChatTurnEnding | undefined): void {
+    try {
+      if (ending) round.hooks.onReply?.(content, ending)
+      else round.hooks.onReply?.(content)
+    } catch (err) {
+      console.error(`[AppChat][${this.appId}] onReply callback error:`, err)
+    }
+    round.resolve()
+  }
+
+  onConsumerStopped(partial?: StreamResult): void {
+    try {
+      if (partial) this.persistPartial(partial, 'Chat session ended before the reply completed.')
+    } finally {
+      this.turnRunning = false
+      this.writeHeldPushes()
+      this.clearTurnStartDeadline()
+      const pending = this.takeCurrentRound()
+      pending?.reject(new Error('Chat session ended before the reply completed.'))
+      while (this.queue.length > 0) {
+        const round = this.queue.shift()!
+        if (round.settled) continue
+        round.settled = true
+        round.reject(new Error('Chat session ended before the message was processed.'))
+      }
+      emitRoundChange(this.conversationId)
     }
   }
 
-  /** Drop the sink's timer so a discarded sink cannot outlive its conversation. */
+  /** Drop the sink's timer and held pushes so a discarded sink cannot outlive its conversation. */
   dispose(): void {
     this.clearTurnStartDeadline()
+    this.heldPushes = []
   }
 
   // ── Internals ──────────────────────────────────────────
@@ -375,6 +438,7 @@ class AppChatSink implements TurnSink {
       round.reject(new Error(NO_RESPONSE_MESSAGE))
       // Whatever is behind it is owed a turn on the same terms.
       this.armTurnStartDeadline()
+      emitRoundChange(this.conversationId)
     }, TURN_START_TIMEOUT_MS)
 
     // Never a reason to hold the process open.
@@ -416,6 +480,10 @@ class AppChatSink implements TurnSink {
     return round
   }
 
+  private writeHeldPushes(): void {
+    for (const push of this.heldPushes.splice(0)) this.getWriter()?.writePush(push)
+  }
+
   private getWriter(): SessionWriter | undefined {
     if (!this.writerOpened) {
       this.writerOpened = true
@@ -424,6 +492,17 @@ class AppChatSink implements TurnSink {
         : undefined
     }
     return this.writer
+  }
+
+  private persistPartial(partial: StreamResult, error: string): void {
+    this.persistSessionId(partial)
+    this.getWriter()?.writeEvent({
+      type: 'turn_snapshot',
+      content: partial.hasMeaningfulContent ? partial.finalContent : '',
+      thoughts: partial.thoughts,
+      tokenUsage: partial.tokenUsage,
+      error,
+    })
   }
 
   private persistSessionId(result: StreamResult): void {
@@ -442,11 +521,13 @@ class AppChatSink implements TurnSink {
   /**
    * Deliver a turn nobody is waiting for. Native and HTTP sessions need nothing:
    * the transcript plus the agent:* events already reached the client. An IM
-   * chat has no live listener, so the text is pushed to it.
+   * chat has no live listener, so the text is pushed to it — noting a stop
+   * short, since nobody asked and nothing else would tell.
    */
-  private deliverAutonomous(replyContent: string): void {
-    const text = replyContent.trim()
-    if (!text) return
+  private deliverAutonomous(replyContent: string, ending: AppChatTurnEnding | undefined): void {
+    const written = replyContent.trim()
+    if (!written) return
+    const text = ending ? withTurnEndingNote(written, ending) : written
 
     const parsed = parseAppChatKey(this.conversationId)
     if (!parsed || classifySessionSource(parsed.channel) !== 'im') return
@@ -482,6 +563,40 @@ class AppChatSink implements TurnSink {
  * queued against that conversation.
  */
 const sinks = new Map<string, AppChatSink>()
+const lastUsedAt = new Map<string, number>()
+
+/** A sink idle this long, with no round and no resident session, is released. */
+export const SINK_IDLE_RELEASE_MS = 60 * 60 * 1000
+const SINK_SWEEP_INTERVAL_MS = 10 * 60 * 1000
+let lastSweepAt = 0
+
+/**
+ * Release sinks of conversations nobody has touched for an hour. A sink is only
+ * released when it has no round in flight and its conversation holds no
+ * resident session (whose consumer writes into it); the next message builds a
+ * fresh one, as after a history wipe.
+ */
+export function sweepIdleAppChatSinks(
+  hasResidentSession: (conversationId: string) => boolean,
+  now = Date.now(),
+): number {
+  let released = 0
+  for (const [conversationId, sink] of sinks) {
+    if (now - (lastUsedAt.get(conversationId) ?? 0) < SINK_IDLE_RELEASE_MS) continue
+    if (sink.hasActiveRound() || hasResidentSession(conversationId)) continue
+    disposeAppChatSink(conversationId)
+    released += 1
+  }
+  return released
+}
+
+function maybeSweep(now: number): void {
+  if (now - lastSweepAt < SINK_SWEEP_INTERVAL_MS) return
+  lastSweepAt = now
+  const resident = new Set(listResidentSessions().map(s => s.conversationId))
+  const released = sweepIdleAppChatSinks(id => resident.has(id), now)
+  if (released > 0) console.log(`[AppChat] Released ${released} idle chat sink(s); ${sinks.size} remain`)
+}
 
 export function getAppChatSink(params: {
   appId: string
@@ -489,6 +604,9 @@ export function getAppChatSink(params: {
   runId: string
   spacePath: string
 }): AppChatSink {
+  const now = Date.now()
+  maybeSweep(now)
+  lastUsedAt.set(params.conversationId, now)
   const existing = sinks.get(params.conversationId)
   if (existing) return existing
 
@@ -511,6 +629,31 @@ export function hasActiveAppChatRound(conversationId: string): boolean {
   return sinks.get(conversationId)?.hasActiveRound() ?? false
 }
 
+const roundChangeListeners = new Set<(conversationId: string) => void>()
+
+/**
+ * Be told whenever a conversation's turn starts, or one of its rounds settles or
+ * is dropped — the moments its "awaiting an answer" state can change.
+ *
+ * @returns unsubscribe
+ */
+export function onAppChatRoundChange(listener: (conversationId: string) => void): () => void {
+  roundChangeListeners.add(listener)
+  return () => {
+    roundChangeListeners.delete(listener)
+  }
+}
+
+function emitRoundChange(conversationId: string): void {
+  for (const listener of Array.from(roundChangeListeners)) {
+    try {
+      listener(conversationId)
+    } catch (err) {
+      console.error(`[AppChat] Round change listener failed for ${conversationId}:`, err)
+    }
+  }
+}
+
 /** Conversations that currently have a round in flight. */
 export function getConversationsWithActiveRound(): string[] {
   const ids: string[] = []
@@ -527,6 +670,7 @@ export function getConversationsWithActiveRound(): string[] {
 export function disposeAppChatSink(conversationId: string): void {
   sinks.get(conversationId)?.dispose()
   sinks.delete(conversationId)
+  lastUsedAt.delete(conversationId)
 }
 
 export type { AppChatSink }

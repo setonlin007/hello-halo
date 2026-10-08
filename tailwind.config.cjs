@@ -42,12 +42,17 @@ module.exports = {
         },
         'surface-hover': 'hsl(var(--surface-hover))',
         'subtle-foreground': 'hsl(var(--subtle-foreground))',
+        'faint-foreground': 'hsl(var(--faint-foreground))',
         'accent-on-dark': 'hsl(var(--accent-on-dark))',
         // Halo brand colors
         'halo-glow': 'hsl(var(--halo-glow))',
         'halo-success': 'hsl(var(--halo-success))',
         'halo-warning': 'hsl(var(--halo-warning))',
         'halo-error': 'hsl(var(--halo-error))',
+        // Diff text and line backgrounds (see globals.css)
+        'diff-add': 'hsl(var(--diff-add) / <alpha-value>)',
+        'diff-del': 'hsl(var(--diff-del) / <alpha-value>)',
+        'diff-mod': 'hsl(var(--diff-mod) / <alpha-value>)',
 
         // App type accent colors
         'app-skill': 'hsl(var(--app-skill))',
@@ -69,6 +74,9 @@ module.exports = {
         fast: '120ms',
         DEFAULT: '160ms',
         slow: '240ms',
+      },
+      maxWidth: {
+        chat: 'var(--chat-reading-width)',
       },
       // GitHub-like typography customization
       typography: ({ theme }) => ({

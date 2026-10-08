@@ -43,7 +43,9 @@ import type {
   OAuthSourceConfig,
   OAuthStartResult,
   OAuthCompleteResult,
-  AISourceUserInfo
+  AISourceUserInfo,
+  CodexCatalogEntry,
+  ModelCatalogCache
 } from '../../../../shared/types'
 import { CHATGPT_PROVIDER_ID } from '../../../../shared/constants'
 import {
@@ -52,7 +54,6 @@ import {
   CODEX_SUBSCRIPTION_MODELS,
   CODEX_DEFAULT_MODEL
 } from '../../../../shared/constants/codex-models'
-import { setCodexModelCapabilities } from '../../../openai-compat-router/server/codex-capabilities'
 
 // ============================================================================
 // Constants (openai/codex — the release named by CODEX_CLI_VERSION)
@@ -164,6 +165,20 @@ function readAccountId(idToken: string | undefined, accessToken?: string): strin
     const claims = payload?.[JWT_CLAIM_PATH] as { chatgpt_account_id?: string } | undefined
     const accountId = claims?.chatgpt_account_id
     if (typeof accountId === 'string' && accountId) return accountId
+  }
+  return ''
+}
+
+function readAccountIdentity(idToken: string | undefined, accessToken?: string): string {
+  const accountId = readAccountId(idToken, accessToken)
+  if (!accountId) return ''
+  for (const token of [idToken, accessToken]) {
+    const claims = decodeJwtPayload(token)?.[JWT_CLAIM_PATH] as {
+      chatgpt_user_id?: string
+      user_id?: string
+    } | undefined
+    const userId = claims?.chatgpt_user_id || claims?.user_id
+    if (typeof userId === 'string' && userId) return JSON.stringify([userId, accountId])
   }
   return ''
 }
@@ -321,19 +336,64 @@ interface TokenSet {
   refreshToken: string
 }
 
-/** The fields of the catalog this provider reads, per `ModelInfo` on the wire. */
-interface CatalogModel {
-  slug: string
-  display_name?: string
-  /** `list` is what the picker shows; `hide` and `none` are filtered out. */
-  visibility?: string
-  priority?: number
-  /** `["text", "image"]` when the model accepts images. */
-  input_modalities?: string[]
-  /** The model's real context window, which Halo has no other way to learn. */
-  context_window?: number
-  supports_reasoning_summary_parameter?: boolean
-  use_responses_lite?: boolean
+type CatalogModel = CodexCatalogEntry
+
+/**
+ * Effort names from `supported_reasoning_levels`: `{ effort }` presets on the
+ * wire, plain strings once cached. Undefined when absent or empty.
+ */
+function normalizeReasoningLevels(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const levels = value
+    .map((item) => typeof item === 'string' ? item : (item as { effort?: unknown } | null)?.effort)
+    .filter((effort): effort is string => typeof effort === 'string' && !!effort)
+  return levels.length > 0 ? levels : undefined
+}
+
+function normalizeCatalog(value: unknown): CatalogModel[] {
+  if (!Array.isArray(value)) throw new Error('Invalid model catalog')
+  return value.map((entry: unknown) => {
+    if (!entry || typeof entry !== 'object') throw new Error('Invalid catalog entry')
+    const raw = entry as Record<string, unknown>
+    if (typeof raw.slug !== 'string' || !raw.slug.trim()) throw new Error('Invalid model slug')
+    const model: CatalogModel = { slug: raw.slug }
+    for (const key of ['display_name', 'visibility'] as const) {
+      if (typeof raw[key] === 'string') model[key] = raw[key]
+    }
+    for (const key of ['priority', 'context_window'] as const) {
+      if (typeof raw[key] === 'number' && Number.isFinite(raw[key])) model[key] = raw[key]
+    }
+    for (const key of ['supports_reasoning_summary_parameter', 'use_responses_lite'] as const) {
+      if (typeof raw[key] === 'boolean') model[key] = raw[key]
+    }
+    if (Array.isArray(raw.input_modalities) && raw.input_modalities.every((item) => typeof item === 'string')) {
+      model.input_modalities = raw.input_modalities
+    }
+    const reasoningLevels = normalizeReasoningLevels(raw.supported_reasoning_levels)
+    if (reasoningLevels) model.supported_reasoning_levels = reasoningLevels
+    return model
+  })
+}
+
+function cachedCatalog(config: OAuthSourceConfig): CatalogModel[] {
+  const cache = config.modelCatalogCache
+  if (cache?.provider === 'chatgpt' && cache.version === 1) {
+    try {
+      return normalizeCatalog(cache.entries)
+    } catch {
+      console.warn('[ChatGPT] Invalid catalog cache, using stored model metadata')
+    }
+  }
+  // Legacy snapshots cannot recover hidden entries; retain their known metadata until a successful fetch.
+  return (config.availableModels ?? []).map((slug) => ({
+    slug,
+    display_name: config.modelNames?.[slug] ?? slug,
+    visibility: 'list',
+    context_window: config.modelCapabilities?.[slug]?.contextWindow,
+    input_modalities: config.modelVision?.[slug] === undefined
+      ? undefined
+      : config.modelVision[slug] ? ['text', 'image'] : ['text']
+  }))
 }
 
 /**
@@ -405,13 +465,11 @@ function mergeCatalog(remote: CatalogModel[]): CatalogModel[] {
     .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))
 }
 
-/**
- * Tell the manager the fetch produced nothing usable, so it keeps the models
- * already stored instead of writing an empty list over them. The manager returns
- * on `degraded` before reading anything else, so this carries nothing else.
- */
-function degradedCatalog(): Partial<AISourcesConfig> {
-  return { [CHATGPT_PROVIDER_ID]: { degraded: true } } as unknown as Partial<AISourcesConfig>
+function degradedCatalog(config: OAuthSourceConfig): Partial<AISourcesConfig> {
+  const overlay = cachedCatalog(config)
+  return {
+    [CHATGPT_PROVIDER_ID]: { ...toModelOptions(mergeCatalog(overlay)), degraded: true, catalogReconciled: true }
+  } as unknown as Partial<AISourcesConfig>
 }
 
 class ChatGPTProvider implements OAuthAISourceProvider {
@@ -425,6 +483,14 @@ class ChatGPTProvider implements OAuthAISourceProvider {
    */
   private conf(config: AISourcesConfig): OAuthSourceConfig | undefined {
     return (config as unknown as Record<string, OAuthSourceConfig | undefined>)[CHATGPT_PROVIDER_ID]
+  }
+
+  private routingAccountId(config: OAuthSourceConfig): string {
+    return config.accountId || readAccountId(undefined, config.accessToken) || config.user?.uid || ''
+  }
+
+  getAccountId(config: AISourcesConfig): string | null {
+    return readAccountIdentity(undefined, this.conf(config)?.accessToken) || null
   }
 
   // ── Configuration ──────────────────────────────────────────────────────────
@@ -452,15 +518,23 @@ class ChatGPTProvider implements OAuthAISourceProvider {
       return null
     }
 
+    const model = c.model || CODEX_DEFAULT_MODEL
+    const capability = c.modelCatalogCache?.entries.find(entry => entry.slug === model)
     return {
+      sourceId: c.sourceId,
+      codexModelCapabilities: capability ? {
+        reasoningSummary: capability.supports_reasoning_summary_parameter !== false,
+        responsesLite: capability.use_responses_lite === true,
+        reasoningLevels: capability.supported_reasoning_levels
+      } : undefined,
       url: RESPONSES_URL,
       key: c.accessToken,
-      model: c.model || CODEX_DEFAULT_MODEL,
+      model,
       apiType: 'responses',
       // The Codex backend only serves streamed responses.
       forceStream: true,
       adapterId: CODEX_ADAPTER_ID,
-      headers: { ...this.backendHeaders(c.accessToken, c.user?.uid || ''), 'Accept': 'text/event-stream' }
+      headers: { ...this.backendHeaders(c.accessToken, this.routingAccountId(c)), 'Accept': 'text/event-stream' }
     }
   }
 
@@ -490,15 +564,18 @@ class ChatGPTProvider implements OAuthAISourceProvider {
   private async catalogOrFallback(
     accessToken: string,
     accountId: string
-  ): Promise<ReturnType<typeof toModelOptions>> {
+  ): Promise<ReturnType<typeof toModelOptions> & { modelCatalogCache?: ModelCatalogCache; degraded?: boolean }> {
     try {
       const catalog = await this.fetchCatalog(accessToken, accountId)
-      if (catalog.length > 0) return toModelOptions(mergeCatalog(catalog))
+      if (catalog.length > 0) return {
+        ...toModelOptions(mergeCatalog(catalog)),
+        modelCatalogCache: this.catalogCache(catalog)
+      }
       console.warn('[ChatGPT] Catalog came back empty, using the shipped list')
     } catch (error) {
       console.warn('[ChatGPT] Catalog fetch failed, using the shipped list:', error)
     }
-    return toModelOptions(mergeCatalog([]))
+    return { ...toModelOptions(mergeCatalog([])), degraded: true }
   }
 
   /**
@@ -524,8 +601,8 @@ class ChatGPTProvider implements OAuthAISourceProvider {
       throw new Error(`HTTP ${response.status}: ${errorText.slice(0, 200)}`)
     }
 
-    const body = await response.json() as { models?: CatalogModel[] }
-    const raw = body.models || []
+    const body = await response.json() as { models?: unknown }
+    const raw = normalizeCatalog(body?.models)
 
     // Log the whole overlay, not the merged result: "why is model X missing" is
     // answered by what the backend sent, and once it is merged into the shipped
@@ -534,10 +611,6 @@ class ChatGPTProvider implements OAuthAISourceProvider {
       '[ChatGPT] Catalog overlay:',
       raw.map((m) => `${m.slug}:${m.visibility ?? 'unspecified'}`).join(', ') || '(none)'
     )
-
-    // The adapter shapes the request from these; they must be recorded even for
-    // models the picker hides, since a hidden one can still be selected by config.
-    setCodexModelCapabilities(raw)
 
     return raw
   }
@@ -558,14 +631,15 @@ class ChatGPTProvider implements OAuthAISourceProvider {
     return this.conf(config)?.user || null
   }
 
-  /**
-   * Rebuild this account's list by merging the backend's overlay onto the
-   * shipped catalog.
-   *
-   * A failed fetch answers `degraded` instead of an empty list: the manager
-   * reads that as "keep what is stored", so an offline launch or a transient
-   * backend error does not wipe the picker down to nothing.
-   */
+  private catalogCache(entries: CatalogModel[]): ModelCatalogCache {
+    return { provider: 'chatgpt', version: 1, fetchedAt: new Date().toISOString(), entries }
+  }
+
+  getOfflineConfig(config: AISourcesConfig): Partial<AISourcesConfig> {
+    return degradedCatalog(this.conf(config) ?? { loggedIn: false, model: '', availableModels: [] })
+  }
+
+  /** Failed refreshes still apply the current shipped catalog to the last known overlay. */
   async refreshConfig(config: AISourcesConfig): Promise<ProviderResult<Partial<AISourcesConfig>>> {
     const c = this.conf(config)
     if (!c?.accessToken) {
@@ -573,19 +647,24 @@ class ChatGPTProvider implements OAuthAISourceProvider {
     }
 
     try {
-      const catalog = await this.fetchCatalog(c.accessToken, c.user?.uid || '')
+      const catalog = await this.fetchCatalog(c.accessToken, this.routingAccountId(c))
       if (catalog.length === 0) {
-        console.warn('[ChatGPT] Catalog came back empty, keeping stored models')
-        return { success: true, data: degradedCatalog() }
+        console.warn('[ChatGPT] Catalog came back empty, using cached overlay')
+        return { success: true, data: degradedCatalog(c) }
       }
 
       return {
         success: true,
-        data: { [CHATGPT_PROVIDER_ID]: { ...c, ...toModelOptions(mergeCatalog(catalog)) } } as unknown as Partial<AISourcesConfig>
+        data: {
+          [CHATGPT_PROVIDER_ID]: {
+            ...toModelOptions(mergeCatalog(catalog)),
+            modelCatalogCache: this.catalogCache(catalog)
+          }
+        } as unknown as Partial<AISourcesConfig>
       }
     } catch (error) {
-      console.warn('[ChatGPT] Catalog fetch failed, keeping stored models:', error)
-      return { success: true, data: degradedCatalog() }
+      console.warn('[ChatGPT] Catalog fetch failed, using cached overlay:', error)
+      return { success: true, data: degradedCatalog(c) }
     }
   }
 
@@ -686,11 +765,13 @@ class ChatGPTProvider implements OAuthAISourceProvider {
 
       console.log('[ChatGPT] Exchanging authorization code for tokens')
       const tokens = await this.exchangeCode(code, pending)
+      if (pendingAuth !== pending) throw new Error('Authorization cancelled')
 
       const accountId = readAccountId(tokens.idToken, tokens.accessToken)
       if (!accountId) {
         throw new Error('access token carries no ChatGPT account id')
       }
+      const uid = readAccountIdentity(tokens.idToken, tokens.accessToken)
       const email = readEmail(tokens.idToken)
       const expiresAt = readExpiresAt(tokens.accessToken)
 
@@ -699,27 +780,34 @@ class ChatGPTProvider implements OAuthAISourceProvider {
       // refresh. The shipped constant stands in only when the backend cannot be
       // reached — a failed fetch must not fail a login that already succeeded.
       const models = await this.catalogOrFallback(tokens.accessToken, accountId)
+      if (pendingAuth !== pending) throw new Error('Authorization cancelled')
 
       const result: OAuthCompleteResult & {
         _tokenData: { accessToken: string; refreshToken: string; expiresAt: number; uid: string }
+        _accountId: string
         _availableModels: string[]
         _modelNames: Record<string, string>
         _modelCapabilities?: Record<string, { contextWindow?: number }>
         _modelVision?: Record<string, boolean>
+        _modelCatalogCache?: ModelCatalogCache
+        _catalogDegraded?: boolean
         _defaultModel: string
       } = {
         success: true,
-        user: { name: email || 'ChatGPT', uid: accountId },
+        user: { name: email || 'ChatGPT', uid },
         _tokenData: {
           accessToken: tokens.accessToken,
           refreshToken: tokens.refreshToken,
           expiresAt,
-          uid: accountId
+          uid
         },
+        _accountId: accountId,
         _availableModels: models.availableModels,
         _modelNames: models.modelNames,
         _modelCapabilities: models.modelCapabilities,
         _modelVision: models.modelVision,
+        _modelCatalogCache: models.modelCatalogCache,
+        _catalogDegraded: models.degraded,
         _defaultModel: CODEX_DEFAULT_MODEL
       }
 
@@ -732,8 +820,13 @@ class ChatGPTProvider implements OAuthAISourceProvider {
         error: error instanceof Error ? error.message : 'Failed to complete login'
       }
     } finally {
-      this.cleanupPending()
+      this.cleanupPending(pending)
     }
+  }
+
+  async cancelLogin(): Promise<ProviderResult<void>> {
+    this.cleanupPending()
+    return { success: true }
   }
 
   async refreshToken(): Promise<ProviderResult<void>> {
@@ -794,7 +887,8 @@ class ChatGPTProvider implements OAuthAISourceProvider {
           client_id: CLIENT_ID,
           grant_type: 'refresh_token',
           refresh_token: c.refreshToken
-        })
+        }),
+        signal: AbortSignal.timeout(30_000)
       })
 
       if (!response.ok) {
@@ -832,27 +926,27 @@ class ChatGPTProvider implements OAuthAISourceProvider {
   }
 
   /**
-   * Drop the pending flow and revoke the credential upstream.
+   * Revoke this account's credential without cancelling a pending login.
    *
    * Revocation is best effort: the CLI also treats a failed revoke as
    * non-fatal and clears local state regardless, and the manager deletes the
    * source either way.
    */
   async logout(config?: AISourcesConfig): Promise<ProviderResult<void>> {
-    this.cleanupPending()
-
     const refreshToken = config ? this.conf(config)?.refreshToken : undefined
     if (refreshToken) {
       try {
-        await proxyFetch(REVOKE_URL, {
+        const response = await proxyFetch(REVOKE_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             token: refreshToken,
             token_type_hint: 'refresh_token',
             client_id: CLIENT_ID
-          })
+          }),
+          signal: AbortSignal.timeout(15_000)
         })
+        if (!response.ok) console.warn(`[ChatGPT] Token revoke rejected (continuing): status=${response.status}`)
       } catch (error) {
         console.warn('[ChatGPT] Token revoke failed (continuing):', error)
       }
@@ -917,7 +1011,7 @@ class ChatGPTProvider implements OAuthAISourceProvider {
     let errParam = ''
     try {
       const parsed = new URL(req.url || '', `http://${CALLBACK_HOST}`)
-      if (!parsed.pathname.startsWith(CALLBACK_PATH)) {
+      if (parsed.pathname !== CALLBACK_PATH) {
         res.statusCode = 404
         res.end('Not Found')
         return
@@ -936,16 +1030,20 @@ class ChatGPTProvider implements OAuthAISourceProvider {
       '<h1 style="font-size:1.25rem">Login complete</h1><p>You can return to Halo now.</p></body></html>'
     )
 
-    if (!pendingAuth) return
+    const pending = pendingAuth
+    if (!pending || pending.state !== expectedState) {
+      console.warn('[ChatGPT] Authorization callback discarded: no matching pending login')
+      return
+    }
     if (errParam) {
-      pendingAuth.rejectCode(new Error(`Authorization failed: ${errParam}`))
+      pending.rejectCode(new Error(`Authorization failed: ${errParam}`))
       return
     }
     if (!code || stateParam !== expectedState) {
-      pendingAuth.rejectCode(new Error('Authorization callback missing code or state mismatch'))
+      pending.rejectCode(new Error('Authorization callback missing code or state mismatch'))
       return
     }
-    pendingAuth.resolveCode(code)
+    pending.resolveCode(code)
   }
 
   /**
@@ -966,7 +1064,8 @@ class ChatGPTProvider implements OAuthAISourceProvider {
     const response = await proxyFetch(TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString()
+      body: body.toString(),
+      signal: AbortSignal.timeout(30_000)
     })
 
     if (!response.ok) {
@@ -992,15 +1091,11 @@ class ChatGPTProvider implements OAuthAISourceProvider {
   }
 
   /** Release the loopback server and clear pending state. Idempotent. */
-  private cleanupPending(): void {
-    if (pendingAuth) {
-      try {
-        pendingAuth.server.close()
-      } catch {
-        // ignore close errors
-      }
-      pendingAuth = null
-    }
+  private cleanupPending(expected = pendingAuth): void {
+    if (!expected || pendingAuth !== expected) return
+    pendingAuth = null
+    expected.rejectCode(new Error('Authorization cancelled'))
+    expected.server.close()
   }
 }
 

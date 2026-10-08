@@ -9,12 +9,53 @@
  * - ~8x faster first-paint on large documents
  */
 
-import { memo } from 'react'
-import { Streamdown } from 'streamdown'
+import { memo, useContext, useMemo, useRef, useState } from 'react'
+import { Maximize2 } from 'lucide-react'
+import { Streamdown, defaultRehypePlugins } from 'streamdown'
 import type { PluginConfig } from 'streamdown'
 import 'streamdown/styles.css'
 import 'katex/dist/katex.min.css'
 import { useCodePlugin, useMathPlugin } from '../../lib/streamdown-plugins'
+import { createStreamingMarkdown } from '../../lib/streaming-markdown'
+import { useTranslation } from '../../i18n'
+import { OpenTableContext } from './open-table-context'
+import { fileLinkHandlers, rehypeFileMentions, rehypeLocalFileLinks, rehypeRestoreFileLinks, useFileLinkOptions, useFileMentionLinks } from '../references'
+
+function tableToCsv(table: HTMLTableElement): string {
+  return Array.from(table.rows)
+    .map(row => Array.from(row.cells)
+      .map(cell => {
+        const text = cell.innerText.trim()
+        return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+      })
+      .join(','))
+    .join('\n')
+}
+
+function TableBlock({ children }: { children?: React.ReactNode }) {
+  const { t } = useTranslation()
+  const openTable = useContext(OpenTableContext)
+  const tableRef = useRef<HTMLTableElement>(null)
+
+  return (
+    <div className="group/table relative my-3">
+      <div className="overflow-x-auto rounded-lg border border-border/50">
+        <table ref={tableRef} className="w-full text-sm">{children}</table>
+      </div>
+      {openTable && (
+        <button
+          type="button"
+          onClick={() => { if (tableRef.current) openTable(tableToCsv(tableRef.current)) }}
+          title={t('Open in canvas')}
+          aria-label={t('Open in canvas')}
+          className="absolute right-1.5 top-1.5 flex h-7 w-7 items-center justify-center rounded-md border border-border bg-background/90 text-muted-foreground opacity-0 transition-opacity ease-halo hover:text-foreground focus-visible:opacity-100 group-hover/table:opacity-100"
+        >
+          <Maximize2 className="h-3.5 w-3.5" />
+        </button>
+      )}
+    </div>
+  )
+}
 
 interface MarkdownRendererProps {
   content: string
@@ -73,11 +114,7 @@ const components = {
   ),
 
   // Tables
-  table: ({ children }: { children?: React.ReactNode }) => (
-    <div className="my-3 overflow-x-auto rounded-lg border border-border/50">
-      <table className="w-full text-sm">{children}</table>
-    </div>
-  ),
+  table: ({ children }: { children?: React.ReactNode }) => <TableBlock>{children}</TableBlock>,
   thead: ({ children }: { children?: React.ReactNode }) => (
     <thead className="bg-secondary/50">{children}</thead>
   ),
@@ -116,6 +153,20 @@ const components = {
   ),
 }
 
+// Streamdown memoizes its context on these identities; inline literals would
+// re-render every code block, link and table on each parent render.
+const CONTROLS = { code: true } as const
+const LINK_SAFETY = { enabled: true } as const
+// File targets become inert before URL hardening; HTML still passes the unchanged sanitizer.
+const FILE_LINK_REHYPE_PLUGINS = [
+  defaultRehypePlugins.raw,
+  rehypeLocalFileLinks,
+  defaultRehypePlugins.sanitize,
+  rehypeRestoreFileLinks,
+  defaultRehypePlugins.harden,
+]
+const FILE_MENTION_REHYPE_PLUGINS = [...FILE_LINK_REHYPE_PLUGINS, rehypeFileMentions]
+
 export const MarkdownRenderer = memo(function MarkdownRenderer({
   content,
   className = '',
@@ -123,22 +174,46 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
 }: MarkdownRendererProps) {
   const codePlugin = useCodePlugin()
   const mathPlugin = useMathPlugin()
+  const streaming = mode === 'streaming'
+
+  // Streaming code stays monochrome: highlighting re-tokenizes the whole block
+  // on every delta. The finished message renders static and highlights once.
+  const plugins = useMemo<PluginConfig>(() => {
+    const config: PluginConfig = {}
+    if (codePlugin && !streaming) config.code = codePlugin
+    if (mathPlugin) config.math = mathPlugin
+    return config
+  }, [codePlugin, mathPlugin, streaming])
+
+  // Mending and block lexing follow the open tail of the reply, not all of it.
+  const [streamingParser] = useState(createStreamingMarkdown)
+  const markdown = useMemo(
+    () => (streaming ? streamingParser.update(content).markdown : content),
+    [content, streaming, streamingParser],
+  )
+
+  // File mentions become links only where a provider asks for them, and only
+  // once the reply is complete — a streaming reply is never checked.
+  const providedFileLinks = useFileLinkOptions()
+  const fileLinks = streaming ? null : providedFileLinks
+  const containerRef = useRef<HTMLDivElement>(null)
+  useFileMentionLinks(containerRef, markdown, fileLinks)
 
   if (!content) return null
 
-  const plugins: PluginConfig = {}
-  if (codePlugin) plugins.code = codePlugin
-  if (mathPlugin) plugins.math = mathPlugin
-
   return (
-    <div className={`markdown-content overflow-x-auto ${className}`}>
+    <div ref={containerRef} className={`markdown-content overflow-x-auto ${className}`} {...fileLinkHandlers(fileLinks)}>
       <Streamdown
         mode={mode}
+        parseIncompleteMarkdown={false}
+        parseMarkdownIntoBlocksFn={streaming ? streamingParser.parseBlocks : undefined}
         components={components as any}
-        controls={{ code: true }}
+        controls={CONTROLS}
+        linkSafety={LINK_SAFETY}
         plugins={plugins}
+        rehypePlugins={providedFileLinks ? (streaming ? FILE_LINK_REHYPE_PLUGINS : FILE_MENTION_REHYPE_PLUGINS) : undefined}
       >
-        {content}
+        {markdown}
       </Streamdown>
     </div>
   )

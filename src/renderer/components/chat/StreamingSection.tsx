@@ -4,7 +4,7 @@
  * Pure presentational component — no store coupling. Composes
  * ThoughtProcess + BrowserTaskCard + StreamingBubble + AskUserQuestionCard.
  *
- * Shared across: MessageList (main chat), AppChatView, ImChatView.
+ * Shared across: MessageList (space and digital-human chat), ImChatView.
  */
 
 import { ThoughtProcess } from './ThoughtProcess'
@@ -13,7 +13,8 @@ import { BrowserTaskCard } from '../tool/BrowserTaskCard'
 import { TerminalTaskCard } from '../tool/TerminalTaskCard'
 import { AskUserQuestionCard } from './AskUserQuestionCard'
 import { QueuedMessagesPanel } from './QueuedMessagesPanel'
-import type { Thought, PendingQuestion } from '../../types'
+import { ApiRetryNotice } from './ApiRetryNotice'
+import type { Thought, PendingQuestion, ApiRetryNotice as ApiRetryNoticeState } from '../../types'
 import type { BrowserToolCall } from './useBrowserToolCalls'
 import type { TerminalToolCall } from './useTerminalToolCalls'
 
@@ -40,8 +41,12 @@ export interface StreamingSectionProps {
   terminalToolCalls?: TerminalToolCall[]
 
   /** Whether to show the "View live feed" button on BrowserTaskCard.
-   *  Set false in automation app contexts where Canvas/BrowserView is unavailable. */
+   *  Set false where there is no live browser view for the conversation. */
   showBrowserViewButton?: boolean
+
+  /** Whether to show the "Open" button on TerminalTaskCard.
+   *  Set false where there is no canvas to open a terminal in. */
+  showTerminalOpenButton?: boolean
 
   /** Active question from AskUserQuestion tool */
   pendingQuestion?: PendingQuestion | null
@@ -63,6 +68,12 @@ export interface StreamingSectionProps {
    * known from the conversation, not the content.
    */
   senderName?: string
+
+  /** A failed model request the engine is waiting to resend. */
+  apiRetry?: ApiRetryNoticeState | null
+
+  /** Stops the turn; offered on the retry notice. */
+  onStop?: () => void
 }
 
 export function StreamingSection({
@@ -74,11 +85,14 @@ export function StreamingSection({
   browserToolCalls = [],
   terminalToolCalls = [],
   showBrowserViewButton = true,
+  showTerminalOpenButton = true,
   pendingQuestion,
   onAnswerQuestion,
   className = '',
   queuedMessages = [],
   senderName,
+  apiRetry = null,
+  onStop,
 }: StreamingSectionProps) {
   return (
     <div className={`flex justify-start animate-fade-in pb-4 ${className}`}>
@@ -91,6 +105,9 @@ export function StreamingSection({
         {(thoughts.length > 0 || isThinking) && (
           <ThoughtProcess thoughts={thoughts} isThinking={isThinking} />
         )}
+
+        {/* The model request failed and is waiting to be sent again */}
+        {apiRetry && <ApiRetryNotice retry={apiRetry} onStop={onStop} />}
 
         {/* Real-time browser task card */}
         {browserToolCalls.length > 0 && (
@@ -109,7 +126,7 @@ export function StreamingSection({
             <TerminalTaskCard
               terminalToolCalls={terminalToolCalls}
               isActive={isThinking}
-              showOpenButton={showBrowserViewButton}
+              showOpenButton={showTerminalOpenButton}
             />
           </div>
         )}

@@ -15,7 +15,6 @@
  *   - Remote: Remote access feature (optional)
  *   - Browser: Embedded browser for Content Canvas (V2 feature)
  *   - AIBrowser: AI browser automation tools (self-initializing via MCP server)
- *   - Overlay: Floating UI elements (optional)
  *   - Search: Global search (optional)
  *   - Performance: Developer monitoring tools (dev only)
  *   - GitBash: Windows Git Bash setup (Windows optional)
@@ -28,7 +27,7 @@ import { registerRemoteHandlers } from '../ipc/remote'
 import { powerMonitor } from 'electron'
 import { registerSecurityHandlers } from '../ipc/security'
 import { enableRemoteAccess, enableTunnel } from '../services/remote'
-import { getConfig, getFederationGatewayUrl, migrateCredentialEncryption, setCredentialFailureNotifier } from '../foundation/config.service'
+import { getConfig, getFederationGatewayUrl, migrateCredentialEncryption, setCredentialFailureNotifier, getTeamFolderRoot } from '../foundation/config.service'
 import { isServerMode } from '../foundation/runtime-mode'
 import { registerBrowserHandlers } from '../ipc/browser'
 import { registerBrowserPolicyHandlers } from '../ipc/browser-policy'
@@ -36,25 +35,28 @@ import { registerAIBrowserHandlers, cleanupAIBrowserHandlers } from '../ipc/ai-b
 import { cleanupAIBrowser } from '../services/ai-browser'
 import { cleanupAITerminal } from '../services/ai-terminal'
 import { cleanupTerminalHandlers } from '../ipc/terminal'
-import { registerOverlayHandlers, cleanupOverlayHandlers } from '../ipc/overlay'
 import { initializeSearchHandlers, cleanupSearchHandlers } from '../ipc/search'
 import { registerPerfHandlers } from '../ipc/perf'
 import { registerGitBashHandlers, initializeGitBashOnStartup } from '../ipc/git-bash'
 import { cleanupAllCaches } from '../services/artifact-cache.service'
 import { flushSpaceActivity } from '../services/space.service'
-import { onConversationDeleted } from '../services/conversation.service'
+import { onConversationDeleted, isConversationGone, deleteEphemeralConversations } from '../services/conversation.service'
 import { disposeSearchContext } from '../services/web-search'
 import {
   initConversationInterop,
   disposeConversationInterop,
   createConversationInteropMcpServer,
   deliverExternalMessage,
+  registerConversationSource,
 } from '../services/conversation-interop'
 import { setConversationInteropFactory } from '../services/agent/toolsets/broker'
+import { getAISourceManager } from '../services/ai-sources'
+import { setRequestCredentialResolver } from '../openai-compat-router'
+import { initSpaceMemoryConsolidation, disposeSpaceMemoryConsolidation } from '../services/memory-consolidation'
 import { markExtendedServicesReady } from './state'
 import { getMainWindow, sendToRenderer } from '../foundation/window.service'
 import { initializeHealthSystem, setSessionCleanupFn } from '../services/health'
-import { closeAllV2Sessions } from '../services/agent/session-manager'
+import { closeAllV2Sessions } from '../services/agent'
 import { registerHealthHandlers } from '../ipc/health'
 import { initBackground, shutdownBackground, getBackgroundService, setDaemonStealthInjector } from '../platform/background'
 import { injectStealthScripts } from '../services/stealth'
@@ -63,28 +65,29 @@ import type { DatabaseManager } from '../platform/store'
 import { refuseNewerData } from './schema-refusal'
 import { initTaskState } from '../platform/task-state'
 import { initScheduler, shutdownScheduler } from '../platform/scheduler'
+import { combinedDisposable } from '../platform/event'
 import { initMemory } from '../platform/memory'
-import { setMemorySdk } from '../platform/memory/sdk'
-import { tool as sdkTool, createSdkMcpServer as sdkCreateMcpServer } from '../services/agent/resolved-sdk'
 import { initAppManager, shutdownAppManager } from '../apps/manager'
-import { initAppRuntime, shutdownAppRuntime, getEventRouter, getActivityStore, getImSessionRegistry } from '../apps/runtime'
+import { initAppRuntime, shutdownAppRuntime, getEventRouter, getActivityStore, getImSessionRegistry, isNativeChatGone, createDigitalHumanConversationSource, createRunConversationSource, releaseTeamEpochSessions } from '../apps/runtime'
 import { initTeamStore, shutdownTeamStore, getTeamStore, initTeamService, shutdownTeamService, getTeamService } from '../apps/team'
 import type { TeamStore } from '../apps/team'
 import { initFederationStore, shutdownFederationStore, getFederationStore, getAuthorityStore } from '../apps/federation'
 import { recoverPersistedOffices } from './office-recovery'
 import { initIdentity, getLocalIdentity, getLocalPublicKeyPem, signWithLocalKey } from '../http/identity'
 import { verifyOfficeCredential } from '../http/auth'
-import { setFederationInbound, sendFederationFrameToClient, listOfficeClientIds, broadcastToAll, getSessionIdentity } from '../http/websocket'
-import { createFederationManager, setFederationManager, getFederationManager, makeLocationAwareSessionDeps, withOwnerResolvedSpace, withExternalOrigin, createRelayCapture, createLocationAwareBlackboard, WsFederationClient, classifyArtifactFetchFailure } from '../apps/runtime/federation'
+import { setFederationInbound, sendFederationFrameToClient, sendFederationFrameToClients, listOfficeClientIds, broadcastToAll, getSessionIdentity } from '../http/websocket'
+import { createFederationManager, setFederationManager, getFederationManager, makeLocationAwareSessionDeps, withOwnerResolvedSpace, withExternalOrigin, createRelayCapture, createLocationAwareBlackboard, WsFederationClient, classifyArtifactFetchFailure, projectReplicaApplied } from '../apps/runtime/federation'
 import { getRemoteAccessStatus } from '../services/remote'
 import type { OwnerStatus, MemberWriteRecord, ArtifactRef } from '../apps/runtime/federation'
 import { SELF_NODE_ID, TEAM_EVENTS, buildTeamSessionKey } from '../../shared/apps/team-types'
-import type { BlackboardTask, BlackboardFinding, TaskStatus, TeamActivity, TeamUpdatedEvent, TeamEpoch, TeamCheck } from '../../shared/apps/team-types'
-import { parseTeamSessionKey, parseTeamChatKey } from '../../shared/apps/im-keys'
-import { createTeamRuntime, setActiveTeamRuntime, getActiveTeamRuntime, createTeamTriggerScheduler, createDefaultSessionDeps, createTeamArtifactReader, createTeamArtifactOpener, createLocalArtifactResolver, createLocalArtifactPathResolver, RemoteArtifactError, pruneSharedFileCopies, defaultSharedCopyRoot } from '../apps/runtime/team'
+import type { BlackboardTask, BlackboardFinding, TaskStatus, TeamActivity, TeamUpdatedEvent, TeamEpoch, TeamCheck, TeamOfficeStatusKind } from '../../shared/apps/team-types'
+import { parseTeamSessionKey, parseTeamChatKey, nativeChatAppId, isSpaceConversationId } from '../../shared/apps/im-keys'
+import { createTeamRuntime, setActiveTeamRuntime, getActiveTeamRuntime, createTeamTriggerScheduler, createDefaultSessionDeps, createTeamArtifactReader, createTeamMemberRecordReader, createTeamArtifactOpener, createLocalArtifactResolver, createLocalArtifactPathResolver, createMemberWorkDirResolver, RemoteArtifactError, pruneSharedFileCopies, defaultSharedCopyRoot, teamFolderDir } from '../apps/runtime/team'
 import { readTeamMemberMessages, isAppChatConversationGenerating } from '../apps/runtime/app-chat'
 import type { TeamTriggerScheduler } from '../apps/runtime/team'
 import { createSpace, deleteSpace, getSpace, getSpaceDir } from '../services/space.service'
+import { retainSpaceWatcher, releaseSpaceWatcher } from '../services/watcher-host.service'
+import { getDetailConversations, onDetailConversationsChanged } from '../services/conversation-detail'
 import { listArtifacts } from '../services/artifact.service'
 import { installAppsSubscribers } from '../services/analytics/subscribers/apps.subscriber'
 import { runStartupSnapshot } from '../services/analytics/snapshot'
@@ -103,6 +106,8 @@ import { registerCliConfigHandlers } from '../ipc/cli-config'
 import { registerModelCapabilitiesHandlers } from '../ipc/model-capabilities'
 import { registerWeixinIlinkHandlers } from '../ipc/weixin-ilink'
 import { registerTlonHandlers } from '../ipc/tlon'
+import { registerGitHandlers } from '../ipc/git'
+import { registerCodeReviewHandlers } from '../ipc/code-review'
 import { initTlonWatchers, shutdownTlon, migrateKBsToTextIndex } from '../services/tlon'
 import { shutdownOcr } from '../services/ocr'
 import {
@@ -130,9 +135,16 @@ let platformDb: DatabaseManager | null = null
 // relayCapture.start() returns an IDisposable (agent-event subscription), not
 // a bare function — dispose() it on shutdown.
 let disposeRelayCapture: { dispose(): void } | null = null
+let digitalHumanConversations: { dispose(): void } | null = null
 let flushRelayCapture: (() => void) | null = null
 let onSystemResume: (() => void) | null = null
 let taskStateService: Awaited<ReturnType<typeof initTaskState>> | null = null
+
+/** Tell every window and remote client how an office stands (see TeamOfficeStatusKind). */
+function emitOfficeStatus(teamId: string, kind: TeamOfficeStatusKind): void {
+  broadcastToAll('team:office-status', { teamId, kind })
+  sendToRenderer('team:office-status', { teamId, kind })
+}
 
 /**
  * Initialize platform (store, scheduler, memory) and apps
@@ -161,7 +173,12 @@ async function initPlatformAndApps(): Promise<void> {
   // Note: SDK is initialized earlier in index.ts (before essential services)
   const db = await initStore()
   platformDb = db
-  taskStateService = await initTaskState({ db })
+  taskStateService = await initTaskState({
+    db,
+    isConversationGone: (conversationId, spaceId) => isSpaceConversationId(conversationId)
+      ? isConversationGone(spaceId, conversationId)
+      : nativeChatAppId(conversationId) ? isNativeChatGone(conversationId) : false,
+  })
 
   // ── Phase 1: Platform services (parallel) ───────────────────────────────
   // Dispatch-layer concurrency cap for the scheduler. The runtime execution
@@ -172,12 +189,6 @@ async function initPlatformAndApps(): Promise<void> {
     initScheduler({ db, maxConcurrentRuns: SCHEDULER_MAX_CONCURRENT_RUNS }),
     initMemory(),
   ])
-
-  // Inject the resolved agent-SDK MCP primitives into the memory tier, so
-  // platform/memory builds its MCP server without importing the services
-  // tier. The SDK is already initialized (see index.ts) and these refs are
-  // only invoked later, when a session's memory MCP server is built.
-  setMemorySdk({ tool: sdkTool, createSdkMcpServer: sdkCreateMcpServer })
 
   // Get the background service singleton (already initialized by initBackground())
   const background = getBackgroundService()
@@ -194,13 +205,18 @@ async function initPlatformAndApps(): Promise<void> {
   initTeamStore({ db })
 
   // Cross-Conversation Interop: subscribes to onAgentEvent for the
-  // waitForReply no_reply signal (services/conversation-interop/turn-end-watch.ts).
+  // waitForReply no_reply signal (services/conversation-interop/lifecycle.ts).
   // No DB/store dependency — dormant until the halo-conversations toolset
   // (services/agent/toolsets/broker.ts) actually registers a wait.
   initConversationInterop()
 
+  // Space memory consolidation: subscribes to onAgentEvent turn ends and, when
+  // a space's memory has grown past its threshold, reorganises it in the
+  // background (services/memory-consolidation/space-trigger.ts).
+  initSpaceMemoryConsolidation()
+
   // Wire the toolset broker's dependency-inversion seam (mirrors
-  // setSessionInvalidator/setActiveTeamRuntime/setMemorySdk): broker.ts must
+  // setSessionInvalidator/setActiveTeamRuntime): broker.ts must
   // not import conversation-interop statically, since conversation-interop
   // imports session-manager.ts, which imports FROM broker.ts — a real cycle
   // that pulled the whole agent stack into broker's own module-load time.
@@ -232,10 +248,25 @@ async function initPlatformAndApps(): Promise<void> {
   // (FileWatcherSource, WebhookSource), activates Apps, and starts the router.
   const runtime = await initAppRuntime({ db, appManager, scheduler, memory, background })
 
+  // Digital-human chats can only be judged once the manager and the session
+  // registry are up.
+  taskStateService.pruneGone()
+
   // ── Analytics subscribers ───────────────────────────────────────────────
   // Wire lifecycle events (install/uninstall/run) into the analytics pipeline.
   // Must come after both appManager and runtime are ready.
   installAppsSubscribers(appManager, runtime)
+
+  // Cross-Conversation Interop: digital-human chats join the conversation
+  // directory (dependency-inversion seam: services/conversation-interop declares
+  // the slot, this tier fills it). The source reads the app manager and session
+  // registry lazily, so it only needs registering once the runtime is up;
+  // registering before or after initConversationInterop makes no difference.
+  digitalHumanConversations = combinedDisposable(
+    registerConversationSource(createDigitalHumanConversationSource()),
+    // A scheduled run's one-way sender identity (apps/runtime/run-conversation-source.ts).
+    registerConversationSource(createRunConversationSource())
+  )
 
   // ── Phase 3.6: Team runtime + service ────────────────────────────────────
   // The team coordination kernel reuses the app-chat session layer (resume,
@@ -252,20 +283,23 @@ async function initPlatformAndApps(): Promise<void> {
     const localSessionDeps = createDefaultSessionDeps(teamStore)
 
     // Local artifact byte resolution (apps/runtime/team/artifact-read): bootstrap
-    // only supplies the app→work-dir lookup. Shared by the federation
-    // owner-serve path and the team_read_artifact reader below.
+    // only supplies the member→work-dir lookup and the team-folder root. Shared
+    // by the federation owner-serve path and the team_read_artifact reader below.
     //
     // getSpaceDir, never space.path: for a space pointed at a project folder the
     // agent works in that folder, so a ref resolved against space.path (internal
     // bookkeeping) can never be found.
-    const resolveAppWorkDir = (appId: string): string | null => {
-      const app = appManager.getApp(appId)
-      if (!app?.spaceId) return null
-      return getSpaceDir(app.spaceId) || null
-    }
+    const teamFolderRoot = getTeamFolderRoot()
+    const resolveMemberWorkDir = createMemberWorkDirResolver({
+      store: teamStore,
+      getAppSpaceId: (appId) => appManager.getApp(appId)?.spaceId ?? null,
+      getSpaceWorkDir: (spaceId) => getSpaceDir(spaceId) || null,
+    })
+    const getTeamFolderDir = (teamId: string, epochId: string) => teamFolderDir(teamFolderRoot, teamId, epochId)
     const readLocalArtifactBytes = createLocalArtifactResolver({
       store: teamStore,
-      getWorkDirForApp: resolveAppWorkDir,
+      getWorkDirForApp: resolveMemberWorkDir,
+      getTeamFolderDir,
     })
 
     /**
@@ -358,8 +392,8 @@ async function initPlatformAndApps(): Promise<void> {
               awaitingDecision: p.awaitingDecision === true,
             })
             const team = teamStore.getTeamById(p.teamId)
-            const event = team ? { teamId: p.teamId, team } : { teamId: p.teamId }
-            broadcastToAll(TEAM_EVENTS.updated, event)
+            const event: TeamUpdatedEvent = { teamId: p.teamId, ...(team ? { team } : {}), changed: ['members'] }
+            broadcastToAll(TEAM_EVENTS.updated, event as unknown as Record<string, unknown>)
             sendToRenderer(TEAM_EVENTS.updated, event)
             return
           }
@@ -408,8 +442,12 @@ async function initPlatformAndApps(): Promise<void> {
             teamStore.upsertEpoch(epoch)
             applyClosedTaskLocally(record.teamId, epoch.id)
             const team = teamStore.getTeamById(record.teamId)
-            const payload = team ? { teamId: record.teamId, team } : { teamId: record.teamId }
-            broadcastToAll(TEAM_EVENTS.updated, payload)
+            const payload: TeamUpdatedEvent = {
+              teamId: record.teamId,
+              ...(team ? { team } : {}),
+              changed: ['board', 'epochs', 'conversations'],
+            }
+            broadcastToAll(TEAM_EVENTS.updated, payload as unknown as Record<string, unknown>)
             sendToRenderer(TEAM_EVENTS.updated, payload)
           } else if (
             record.op === 'member_profile' ||
@@ -460,10 +498,11 @@ async function initPlatformAndApps(): Promise<void> {
       // ordinal in the append-only transcript — stable across reads, so viewers
       // pull/replicate only the tail. Carries the thoughts/tool trace so a remote
       // viewer's backfill shows the same thinking the live relay did.
-      const serializeTeamTranscript = (teamId: string, appId: string, epochId: string) => {
+      const serializeTeamTranscript = (teamId: string, appId: string, epochId: string, sinceSeq?: number) => {
         const messages = readTeamMemberMessages(appId, teamId, epochId)
-        return messages.map((m, i) => ({
-          seq: i + 1,
+        const start = typeof sinceSeq === 'number' && sinceSeq > 0 ? sinceSeq - 1 : 0
+        return messages.slice(start).map((m, i) => ({
+          seq: start + i + 1,
           role: m.role,
           content: m.content,
           ...(m.thoughts ? { thoughts: m.thoughts } : {}),
@@ -474,6 +513,7 @@ async function initPlatformAndApps(): Promise<void> {
 
       const federationManager = createFederationManager({
         hostSend: sendFederationFrameToClient,
+        hostSendMany: sendFederationFrameToClients,
         hostListOfficeClients: listOfficeClientIds,
         federationStore: fedStore,
         teamStore,
@@ -575,10 +615,16 @@ async function initPlatformAndApps(): Promise<void> {
             // Carry the observable status: the row alone says idle for the whole
             // turn (this is not a run of the office's own), so a push without it
             // would reset the very board it is announcing work to.
-            const payload = team
-              ? { teamId, team, liveStatus: getActiveTeamRuntime()?.getObservableStatus(teamId) ?? team.status }
+            const payload: TeamUpdatedEvent = team
+              ? {
+                  teamId,
+                  team,
+                  liveStatus: getActiveTeamRuntime()?.getObservableStatus(teamId) ?? team.status,
+                  // A member's working state shows on the roster and on the task it serves.
+                  changed: ['members', 'conversations'],
+                }
               : { teamId }
-            broadcastToAll(TEAM_EVENTS.updated, payload)
+            broadcastToAll(TEAM_EVENTS.updated, payload as unknown as Record<string, unknown>)
             sendToRenderer(TEAM_EVENTS.updated, payload)
           }
           // A paused digital human is one whose owner said "stop working". A
@@ -637,8 +683,8 @@ async function initPlatformAndApps(): Promise<void> {
         // emitting team:updated, the event the renderer re-fetches the team on.
         onRosterChanged: (officeId) => {
           const team = teamStore.getTeamById(officeId)
-          const payload = team ? { teamId: officeId, team } : { teamId: officeId }
-          broadcastToAll(TEAM_EVENTS.updated, payload)
+          const payload: TeamUpdatedEvent = { teamId: officeId, ...(team ? { team } : {}), changed: ['members'] }
+          broadcastToAll(TEAM_EVENTS.updated, payload as unknown as Record<string, unknown>)
           sendToRenderer(TEAM_EVENTS.updated, payload)
         },
         // ── Authority/replication/resilience (falls back to local-only behaviour when absent) ──
@@ -666,8 +712,7 @@ async function initPlatformAndApps(): Promise<void> {
         // maps the kind to neutral copy (t('Reconnected automatically') etc.). No
         // technical words ever travel in a user-facing string.
         onAuthorityChange: (officeId) => {
-          broadcastToAll('team:office-status', { teamId: officeId, kind: 'authority-changed' })
-          sendToRenderer('team:office-status', { teamId: officeId, kind: 'authority-changed' })
+          emitOfficeStatus(officeId, 'authority-changed')
           const team = teamStore.getTeamById(officeId)
           if (team) {
             broadcastToAll(TEAM_EVENTS.updated, { teamId: officeId, team })
@@ -675,8 +720,7 @@ async function initPlatformAndApps(): Promise<void> {
           }
         },
         onOfficePaused: (officeId, paused) => {
-          broadcastToAll('team:office-status', { teamId: officeId, kind: paused ? 'paused' : 'resumed' })
-          sendToRenderer('team:office-status', { teamId: officeId, kind: paused ? 'paused' : 'resumed' })
+          emitOfficeStatus(officeId, paused ? 'paused' : 'resumed')
         },
         // Membership refused on re-entry: reconnecting alone cannot fix it, so
         // the renderer tells the user to rejoin with a fresh invite. The wire
@@ -684,8 +728,7 @@ async function initPlatformAndApps(): Promise<void> {
         // no-technical-words contract.
         onOfficeAccessLost: (officeId, reason) => {
           console.warn(`[Bootstrap] office access lost office=${officeId} reason=${reason}`)
-          broadcastToAll('team:office-status', { teamId: officeId, kind: 'access-lost' })
-          sendToRenderer('team:office-status', { teamId: officeId, kind: 'access-lost' })
+          emitOfficeStatus(officeId, reason === 'VERSION_INCOMPATIBLE' ? 'update-required' : 'access-lost')
         },
         // Owner-side transcript reader: serve a member's team-channel history to a
         // viewer over the office link. Reuses the same read as the IPC/HTTP chat
@@ -705,8 +748,8 @@ async function initPlatformAndApps(): Promise<void> {
           localSessionDeps.stopTeamSession(appId, teamId, epochId),
         // The same read without the request-scoped seam, driving the session-feed
         // plane's proactive replication of owned transcripts to every office node.
-        readOwnedTranscript: (teamId, appId, epochId) =>
-          serializeTeamTranscript(teamId, appId, epochId),
+        readOwnedTranscript: (teamId, appId, epochId, sinceSeq) =>
+          serializeTeamTranscript(teamId, appId, epochId, sinceSeq),
         // A session with a live turn has a provisional trailing message the
         // publisher must withhold (session keys ARE conversation ids).
         //
@@ -726,20 +769,26 @@ async function initPlatformAndApps(): Promise<void> {
           broadcastToAll(TEAM_EVENTS.memberHistory, payload)
           sendToRenderer(TEAM_EVENTS.memberHistory, payload)
         },
-        // A hot-standby applied a replicated task/finding to its replica store.
-        // The signal carries no concrete task/finding object (only op + taskId),
-        // so it's a refresh trigger, not a blackboard merge: emit team:updated so
-        // the open detail re-fetches and the replicated row appears live, instead
-        // of staying silent until a manual refresh.
-        onReplicaApplied: (info) => {
-          if (info.op === 'epoch_upsert' && info.taskId) {
-            const epoch = teamStore.getEpochById(info.taskId)
-            if (epoch?.endReason === 'cleared' || epoch?.workItem?.status === 'completed') applyClosedTaskLocally(info.officeId, info.taskId)
+        // A hot-standby applied replicated board rows. Rows merge into an open
+        // board as deltas; only an epoch change, a snapshot or a large catch-up
+        // page refreshes the whole office view.
+        onReplicaApplied: (officeId, applied) => {
+          const projection = projectReplicaApplied(officeId, applied, (taskId) => teamStore.getTaskById(taskId))
+          for (const epochId of projection.epochIds) {
+            const epoch = teamStore.getEpochById(epochId)
+            if (epoch?.endReason === 'cleared' || epoch?.workItem?.status === 'completed') applyClosedTaskLocally(officeId, epochId)
           }
-          const team = teamStore.getTeamById(info.officeId)
-          const payload = team ? { teamId: info.officeId, team } : { teamId: info.officeId }
-          broadcastToAll(TEAM_EVENTS.updated, payload)
-          sendToRenderer(TEAM_EVENTS.updated, payload)
+          for (const event of projection.boardEvents) emitBlackboard(event as unknown as Record<string, unknown>)
+          if (projection.refresh) {
+            const team = teamStore.getTeamById(officeId)
+            const payload: TeamUpdatedEvent = {
+              teamId: officeId,
+              ...(team ? { team } : {}),
+              ...(projection.changed ? { changed: projection.changed } : {}),
+            }
+            broadcastToAll(TEAM_EVENTS.updated, payload as unknown as Record<string, unknown>)
+            sendToRenderer(TEAM_EVENTS.updated, payload)
+          }
         },
         // Joiner-side: the host kicked a member → drop the row by re-fetching the
         // office. The roster also re-converges via the accompanying re-broadcast.
@@ -755,6 +804,7 @@ async function initPlatformAndApps(): Promise<void> {
             teamId: officeId,
             ...(team ? { team } : {}),
             ...(ownMember ? { memberKicked: { appId, ...(kickedName ? { memberName: kickedName } : {}) } } : {}),
+            changed: ['members'],
           }
           broadcastToAll(TEAM_EVENTS.updated, payload as unknown as Record<string, unknown>)
           sendToRenderer(TEAM_EVENTS.updated, payload)
@@ -787,6 +837,9 @@ async function initPlatformAndApps(): Promise<void> {
         },
       })
       setFederationManager(federationManager)
+      // Joined offices receive only the live member streams a local viewer shows.
+      federationManager.setWatchedSessions(getDetailConversations())
+      onDetailConversationsChanged((conversationIds) => federationManager.setWatchedSessions(conversationIds))
       setFederationInbound((ctx) => federationManager.handleHostInbound(ctx))
 
       // Activity-stream relay: capture this node's own team-session events
@@ -900,13 +953,31 @@ async function initPlatformAndApps(): Promise<void> {
       ...fetchRemoteArtifact,
     })
 
+    // The lead's read of a member's record (logic in apps/runtime/team/member-record):
+    // this node's transcript store for a local member, the owner's history plane
+    // for a remote one.
+    const readTeamMemberRecord = createTeamMemberRecordReader({
+      store: teamStore,
+      readLocal: (appId, teamId, epochId) => readTeamMemberMessages(appId, teamId, epochId),
+      ...(fedManager
+        ? {
+            fetchRemote: async ({ teamId, epochId, appId, ownerNodeId }) => {
+              const manager = getFederationManager()
+              if (!manager) throw new Error('federation is not initialized')
+              return manager.fetchMemberHistory({ officeId: teamId, ownerNodeId, appId, epochId })
+            },
+          }
+        : {}),
+    })
+
     // The same resolution for a person clicking a shared file: a path the OS can
     // open, with a teammate's file copied here read-only first.
     const openTeamArtifact = createTeamArtifactOpener({
       store: teamStore,
       resolveLocalPath: createLocalArtifactPathResolver({
         store: teamStore,
-        getWorkDirForApp: resolveAppWorkDir,
+        getWorkDirForApp: resolveMemberWorkDir,
+        getTeamFolderDir,
       }),
       ...fetchRemoteArtifact,
     })
@@ -979,6 +1050,7 @@ async function initPlatformAndApps(): Promise<void> {
         store: teamStore,
         session: teamSessionDeps,
         readArtifact: readTeamArtifact,
+        readMemberRecord: readTeamMemberRecord,
         turnTimeoutMs: getConfig().agent?.teamTurnTimeoutMs,
         circuitOverrides: getConfig().agent?.teamCircuitLimits,
         maxConcurrentTurns: getConfig().agent?.teamMaxConcurrentTurns,
@@ -990,6 +1062,11 @@ async function initPlatformAndApps(): Promise<void> {
         // activity entry is the truth, not just the in-memory waiter set.
         hasPendingEscalation: hasPendingEscalationFor,
         onTaskClosed: closeTaskDecisions,
+        // A sealed epoch takes no member turns until reopened: free its idle
+        // engine sessions now rather than after the idle timeout.
+        onEpochSealed: (teamId, epochId) => {
+          releaseTeamEpochSessions(teamId, epochId)
+        },
         describeChatKey: describeTeamChatKey,
         // The roster tells a member what its teammates are, not just what they
         // were assigned — a duty is per-team and routinely blank, while the
@@ -1007,12 +1084,13 @@ async function initPlatformAndApps(): Promise<void> {
           ),
         onChecksChanged: (teamId) => {
           const team = teamStore.getTeamById(teamId)
-          const payload = team ? { teamId, team } : { teamId }
-          broadcastToAll(TEAM_EVENTS.updated, payload)
+          const payload: TeamUpdatedEvent = { teamId, ...(team ? { team } : {}), changed: ['board'] }
+          broadcastToAll(TEAM_EVENTS.updated, payload as unknown as Record<string, unknown>)
           sendToRenderer(TEAM_EVENTS.updated, payload)
         },
         // See `TurnReportDeps.isLeadGenerating` for the contract this fills.
         isLeadGenerating: isAppChatConversationGenerating,
+        teamFolderRoot,
         // A space coordinator's "inbox" is its space conversation: member
         // replies and turn-end notices land there through the conversation
         // delivery layer (wake when idle, queue behind a busy turn). A full
@@ -1151,6 +1229,18 @@ async function initPlatformAndApps(): Promise<void> {
       onRunStateChanged: (teamId) => getFederationManager()?.broadcastRosterFor(teamId),
     })
 
+    // A run left open by a previous session has nothing executing it — its
+    // sessions died with that process — but it holds the team's run slot, so
+    // every trigger this session fires would read "already running" and skip.
+    // Seal those before anything is armed, so the slot, the History rows and the
+    // triggers all start from the truth (TeamRuntime.recoverInterruptedRuns).
+    try {
+      const sealed = await getActiveTeamRuntime()?.recoverInterruptedRuns()
+      if (sealed) console.log(`[Bootstrap] Sealed ${sealed} interrupted team run(s)`)
+    } catch (err) {
+      console.error('[Bootstrap] Team interrupted-run recovery failed:', err)
+    }
+
     // Team triggers: register the kind='team' scheduler handler and rehydrate
     // persisted triggers — schedule triggers become scheduler jobs, event
     // triggers (webhook/file/wecom) become EventRouter subscriptions. Must run
@@ -1164,6 +1254,20 @@ async function initPlatformAndApps(): Promise<void> {
         store: teamStore,
         eventRouter,
         runTeam: (teamId, trigger) => teamService.runTeam(teamId, trigger),
+        // Live state, not the persisted pointer: a run that outlived its process
+        // must not keep refusing this session's triggers.
+        activeRunEpochId: (teamId) => getActiveTeamRuntime()?.activeRunEpochId(teamId) ?? null,
+        fileWatch: {
+          retain: (spaceId, holder) => {
+            const space = getSpace(spaceId)
+            if (!space) {
+              console.warn(`[Bootstrap] team file trigger on missing space ${spaceId} (${holder}); not watching`)
+              return
+            }
+            retainSpaceWatcher(spaceId, space.workingDir || space.path, holder)
+          },
+          release: releaseSpaceWatcher,
+        },
       })
       teamTriggerScheduler.registerHandler()
       teamTriggerScheduler.rehydrate()
@@ -1270,7 +1374,9 @@ async function initPlatformAndApps(): Promise<void> {
   // a joiner's own client reconnects on backoff, so readiness arriving shortly
   // after boot is in time.
   registerIdleTask('recover-offices', () => {
-    recoverPersistedOffices(teamStore)
+    recoverPersistedOffices(teamStore, {
+      onUpdateRequired: (officeId) => emitOfficeStatus(officeId, 'update-required'),
+    })
   })
 
   // ── Tier 3: Idle tasks ─────────────────────────────────────────────────
@@ -1289,8 +1395,14 @@ async function initPlatformAndApps(): Promise<void> {
   // Copies of teammates' files are only a way to open them; the original is
   // fetched again on the next click, so a week-old copy is dead weight.
   registerIdleTask('prune-shared-file-copies', () => pruneSharedFileCopies(defaultSharedCopyRoot(), SHARED_COPY_MAX_AGE_MS))
+  // Dissolving a team removes its folders here; this catches the rest — a team
+  // removed from this machine some other way, or a dissolve cut short by a crash.
+  registerIdleTask('prune-team-folders', () => getActiveTeamRuntime()?.teamFolders.prune())
   registerIdleTask('seed-builtin-skills', () => seedBuiltinSkills(appManager))
   registerIdleTask('verify-office-runtime', () => verifyOfficeRuntime())
+  // The knowledge base chat's conversations left by a run that quit mid-chat;
+  // only those created before this process started, so none is in use now.
+  registerIdleTask('delete-ephemeral-conversations', () => { deleteEphemeralConversations(performance.timeOrigin) })
   startIdleDrain()
 
   const dt = performance.now() - t0
@@ -1328,6 +1440,11 @@ export function initializeExtendedServices(): void {
   // Security: expose renderer-safe security policy flags so the UI can
   // gate features (e.g. Tunnel section visibility under tunnelSafe).
   registerSecurityHandlers()
+
+  // Router seam: each proxied request uses its account's current credential, so a
+  // token refresh never needs an engine session rebuilt. Sessions started before
+  // this line use the credential they were created with, which is still current.
+  setRequestCredentialResolver((sourceId, model) => getAISourceManager().resolveRequestCredentials(sourceId, model))
 
   // Push credential decode failures to renderer (IPC) and remote clients (WS).
   // Registered before the migration task so failures surfaced during it reach a
@@ -1389,8 +1506,7 @@ export function initializeExtendedServices(): void {
     }
   })
 
-  // Browser: Embedded BrowserView for Content Canvas
-  // Note: BrowserView is created lazily when Canvas is opened
+  // Browser pages attach lazily to the registered DOM host.
   registerBrowserHandlers(mainWindow)
 
   // Browser Policy: user-extensible allowlist (Settings + blocked-page action)
@@ -1400,10 +1516,6 @@ export function initializeExtendedServices(): void {
   // (called on demand). Only the view-lifecycle event forwarding is wired here so
   // the renderer can reveal the AI's live view. See ai-browser/DESIGN.md.
   registerAIBrowserHandlers()
-
-  // Overlay: Floating UI elements (chat capsule, etc.)
-  // Already implements lazy initialization internally
-  registerOverlayHandlers(mainWindow)
 
   // Search: Global search functionality
   initializeSearchHandlers()
@@ -1476,6 +1588,12 @@ export function initializeExtendedServices(): void {
   // Tlon: knowledge base management IPC handlers
   registerTlonHandlers()
 
+  // Git: the changes view's repository queries and writes (git runs on first use, never at startup)
+  registerGitHandlers()
+
+  // Code review: the changes view's review buttons and its latest-review record
+  registerCodeReviewHandlers()
+
   // Windows-specific: Initialize Git Bash in background
   if (process.platform === 'win32') {
     initializeGitBashOnStartup()
@@ -1532,95 +1650,105 @@ export function initializeExtendedServices(): void {
  * Called during window-all-closed to properly release resources.
  */
 export async function cleanupExtendedServices(): Promise<void> {
-  // Space: Flush any throttled activity timestamps to disk before teardown
-  flushSpaceActivity()
-
-  // Store: Stop upgrade scheduler before tearing down registry / app manager
-  stopUpgradeScheduler()
-
-  // Announcements: stop polling the feed
-  stopAnnouncementScheduler()
-
-  // Store: Shutdown registry service (before app manager)
-  shutdownRegistryService()
-
-  // Cross-Conversation Interop: drop the onAgentEvent subscription.
-  disposeConversationInterop()
-
-  // Team: Tear down the service + runtime accessor and the data layer before
-  // the App Manager goes away (the service holds an App Manager reference).
-  shutdownTeamService()
-  setActiveTeamRuntime(null)
-  if (onSystemResume) {
-    powerMonitor.removeListener('resume', onSystemResume)
-    onSystemResume = null
-  }
+  let cacheShutdown: Promise<void> | null = null
   try {
-    flushRelayCapture?.()
-    disposeRelayCapture?.dispose()
-  } catch (err) {
-    console.error('[Bootstrap] Relay capture teardown error:', err)
+    // Space: Flush any throttled activity timestamps to disk before teardown
+    flushSpaceActivity()
+
+    // Store: Stop upgrade scheduler before tearing down registry / app manager
+    stopUpgradeScheduler()
+
+    // Announcements: stop polling the feed
+    stopAnnouncementScheduler()
+
+    // Store: Shutdown registry service (before app manager)
+    shutdownRegistryService()
+
+    // Cross-Conversation Interop: drop the digital-human source and every
+    // turn-end subscription.
+    digitalHumanConversations?.dispose()
+    digitalHumanConversations = null
+    disposeConversationInterop()
+    disposeSpaceMemoryConsolidation()
+
+    // Team: Tear down the service + runtime accessor and the data layer before
+    // the App Manager goes away (the service holds an App Manager reference).
+    shutdownTeamService()
+    setActiveTeamRuntime(null)
+    if (onSystemResume) {
+      powerMonitor.removeListener('resume', onSystemResume)
+      onSystemResume = null
+    }
+    try {
+      flushRelayCapture?.()
+      disposeRelayCapture?.dispose()
+    } catch (err) {
+      console.error('[Bootstrap] Relay capture teardown error:', err)
+    }
+    disposeRelayCapture = null
+    flushRelayCapture = null
+    getFederationManager()?.stopAll()
+    setFederationManager(null)
+    setFederationInbound(null)
+    shutdownTeamStore()
+    shutdownFederationStore()
+
+    // Apps: Shutdown runtime first (deactivates all apps, stops event router, cancels runs).
+    // This is intentionally ahead of `analytics.destroy()` so that any final
+    // `RunFinishedEvent`s fired during deactivation are still delivered to the
+    // analytics pipeline and buffered by the telemetry provider.
+    const runtimeShutdown = shutdownAppRuntime().catch(err => console.error('[Bootstrap] AppRuntime shutdown error:', err))
+    try {
+      closeAllV2Sessions()
+    } finally {
+      cacheShutdown = cleanupAllCaches()
+      void cacheShutdown.catch(error => console.error('[Bootstrap] Artifact cache shutdown failed:', error))
+    }
+    await runtimeShutdown
+    await shutdownAppManager().catch(err => console.error('[Bootstrap] AppManager shutdown error:', err))
+
+    // Analytics: Flush pending events (including anything buffered from the
+    // runtime shutdown above). The provider applies its own bounded flush
+    // timeout so we never hang here.
+    await analytics.destroy().catch(err => console.error('[Bootstrap] Analytics shutdown error:', err))
+
+    // Platform: Shutdown scheduler (stop timers)
+    await shutdownScheduler().catch(err => console.error('[Bootstrap] Scheduler shutdown error:', err))
+
+    // Platform: Close database connections
+    taskStateService?.dispose()
+    taskStateService = null
+    if (platformDb) {
+      await shutdownStore(platformDb).catch(err => console.error('[Bootstrap] Store shutdown error:', err))
+      platformDb = null
+    }
+
+    // Background: Shutdown daemon browser, clear keep-alive, destroy tray
+    shutdownBackground()
+
+    // AI Browser: Cleanup global singleton context (scoped contexts are cleaned
+    // up by their owners: app-chat.ts / execute.ts) and unsubscribe event forwarding
+    cleanupAIBrowserHandlers()
+    cleanupAIBrowser()
+
+    // AI Terminal: Unsubscribe event forwarding, then kill all pty sessions
+    cleanupTerminalHandlers()
+    cleanupAITerminal()
+
+    // Dispose temporary search pages before browser hosts shut down.
+    await disposeSearchContext().catch(err => console.error('[Bootstrap] WebSearch shutdown error:', err))
+
+    // Search: Cancel any ongoing searches
+    cleanupSearchHandlers()
+
+    // Tlon: Unsubscribe all KB watchers and clear timers
+    await shutdownTlon().catch(err => console.error('[Bootstrap] Tlon shutdown error:', err))
+
+    // OCR: Terminate the shared tesseract worker (used by tlon, chat toolset, automation)
+    await shutdownOcr().catch(err => console.error('[Bootstrap] OCR shutdown error:', err))
+  } finally {
+    await (cacheShutdown ?? cleanupAllCaches())
   }
-  disposeRelayCapture = null
-  flushRelayCapture = null
-  getFederationManager()?.stopAll()
-  setFederationManager(null)
-  setFederationInbound(null)
-  shutdownTeamStore()
-  shutdownFederationStore()
-
-  // Apps: Shutdown runtime first (deactivates all apps, stops event router, cancels runs).
-  // This is intentionally ahead of `analytics.destroy()` so that any final
-  // `RunFinishedEvent`s fired during deactivation are still delivered to the
-  // analytics pipeline and buffered by the telemetry provider.
-  await shutdownAppRuntime().catch(err => console.error('[Bootstrap] AppRuntime shutdown error:', err))
-  await shutdownAppManager().catch(err => console.error('[Bootstrap] AppManager shutdown error:', err))
-
-  // Analytics: Flush pending events (including anything buffered from the
-  // runtime shutdown above). The provider applies its own bounded flush
-  // timeout so we never hang here.
-  await analytics.destroy().catch(err => console.error('[Bootstrap] Analytics shutdown error:', err))
-
-  // Platform: Shutdown scheduler (stop timers)
-  await shutdownScheduler().catch(err => console.error('[Bootstrap] Scheduler shutdown error:', err))
-
-  // Platform: Close database connections
-  taskStateService?.dispose()
-  taskStateService = null
-  if (platformDb) {
-    await shutdownStore(platformDb).catch(err => console.error('[Bootstrap] Store shutdown error:', err))
-    platformDb = null
-  }
-
-  // Background: Shutdown daemon browser, clear keep-alive, destroy tray
-  shutdownBackground()
-
-  // AI Browser: Cleanup global singleton context (scoped contexts are cleaned
-  // up by their owners: app-chat.ts / execute.ts) and unsubscribe event forwarding
-  cleanupAIBrowserHandlers()
-  cleanupAIBrowser()
-
-  // AI Terminal: Unsubscribe event forwarding, then kill all pty sessions
-  cleanupTerminalHandlers()
-  cleanupAITerminal()
-
-  // Web Search: Dispose search context (cleanup any in-flight BrowserViews)
-  await disposeSearchContext().catch(err => console.error('[Bootstrap] WebSearch shutdown error:', err))
-
-  // Overlay: Cleanup overlay BrowserView
-  cleanupOverlayHandlers()
-
-  // Search: Cancel any ongoing searches
-  cleanupSearchHandlers()
-
-  // Artifact Cache: Close file watchers and clear caches
-  await cleanupAllCaches()
-
-  // Tlon: Unsubscribe all KB watchers and clear timers
-  await shutdownTlon().catch(err => console.error('[Bootstrap] Tlon shutdown error:', err))
-
-  // OCR: Terminate the shared tesseract worker (used by tlon, chat toolset, automation)
-  await shutdownOcr().catch(err => console.error('[Bootstrap] OCR shutdown error:', err))
 
   console.log('[Bootstrap] Extended services cleaned up')
 }

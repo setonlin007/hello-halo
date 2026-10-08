@@ -12,10 +12,15 @@ export const MODULE: RouteModuleMeta = {
       notes: [
         'This really starts Halo working, and the reply is produced after the response comes back. success:true means accepted, not answered.',
         'Poll GET /api/agent/generating/<conversationId> for progress — back off (2s, then double), do not tight-loop.',
-        'Optional body fields: resumeSessionId, thinkingEnabled (boolean), knowledgeBaseId, images (base64 attachments).',
+        'Optional body fields: resumeSessionId, thinkingEnabled (boolean), reasoningEffort (off|minimal|low|medium|high|xhigh|max; overrides thinkingEnabled, but a level the user picked for this conversation wins over it), knowledgeBaseId, images (base64 attachments).',
         'Create the conversation you target with POST /api/spaces/$HALO_SPACE_ID/conversations. Nothing tells you which id in GET /api/agent/sessions is your own, so picking one from there risks talking to yourself, and nothing stops the turn you start from messaging you back.',
         'A turn you start can stop to ask a question, and answering it is not open to you — the user answers it in the Halo app. Do not start one you are unwilling to leave pending.',
       ].join('\n'),
+    },
+    // The chat UI adding to its own running turn; an assistant reaches another
+    // conversation through conversation_send instead.
+    'POST /api/agent/inject-message': {
+      expose: 'internal',
     },
     'POST /api/agent/stop': {
       expose: 'ai',
@@ -128,6 +133,14 @@ export const MODULE: RouteModuleMeta = {
       expose: 'internal',
     },
     'POST /api/agent/toolsets/close': {
+      expose: 'internal',
+    },
+    // A set is recorded as the user's own change (source 'user'); an agent
+    // steers its own session through its Goal tool instead.
+    'POST /api/agent/goal/get': {
+      expose: 'internal',
+    },
+    'POST /api/agent/goal/set': {
       expose: 'internal',
     },
   },

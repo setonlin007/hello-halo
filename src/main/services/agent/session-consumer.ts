@@ -35,11 +35,12 @@
  */
 
 import type { V2SDKSession, SessionState, Thought } from './types'
-import { processStream } from './stream-processor'
+import { processStream, type StreamResult } from './stream-processor'
 import type { TurnSink } from './turn-sink'
 import { emitAgentEvent } from './events'
-import { createSessionState, consumePendingRebuild, markTurnInitReceived } from './session-manager'
+import { createSessionState, consumePendingRebuild, markTurnInitReceived, failPendingSessionTurns, noteSessionMcpStatus } from './session-manager'
 import { hasActiveTeamTasks, isTeamLifecycleThought } from './subagent-handler'
+import { endApiRetry } from './api-retry'
 
 // ============================================
 // Types
@@ -61,6 +62,10 @@ export interface ConsumerHandle {
    * control to detect active team agents while the consumer idles between
    * turns — the spawn may be several turns in the past. */
   getTeamLifecycleThoughts(): Thought[]
+  /** Whether a task CC started (a background shell, agent or workflow) has not
+   * reported completion yet. Its result arrives as a later autonomous turn, so
+   * closing the session now would lose it. */
+  hasRunningTasks(): boolean
   /** Update the display model name used for thought parsing (and the
    * source-resolved context window shown in token usage).
    * Called by sendMessage to keep both in sync after model switches
@@ -96,6 +101,10 @@ interface ConsumerState {
   processingTurn: boolean
   /** Current turn's SessionState (created fresh each turn) */
   currentSessionState: SessionState | null
+  /** An acknowledged turn owes one completion until this timestamp is cleared. */
+  turnStartedAt: number | null
+  /** Lazily reads the acknowledged turn's authoritative stream state. */
+  readTurnSnapshot: (() => StreamResult) | null
   /** Running flag */
   running: boolean
   /** Team lifecycle thoughts (Agent team spawns / TeamDelete) accumulated
@@ -103,6 +112,8 @@ interface ConsumerState {
    * detect active team agents while the consumer idles; reset when the team
    * is disbanded. */
   teamLifecycleThoughts: Thought[]
+  /** Task ids from task_started not yet closed by a task_notification. */
+  runningTasks: Set<string>
 }
 
 // ============================================
@@ -133,8 +144,24 @@ export function startConsumer(
     consumerAbort: new AbortController(),
     processingTurn: false,
     currentSessionState: null,
+    turnStartedAt: null,
+    readTurnSnapshot: null,
     running: true,
     teamLifecycleThoughts: [],
+    runningTasks: new Set(),
+  }
+
+  let sinkStopped = false
+  const settleSink = () => {
+    if (sinkStopped) return
+    sinkStopped = true
+    try {
+      const readSnapshot = state.readTurnSnapshot
+      state.readTurnSnapshot = null
+      state.sink.onConsumerStopped?.(state.currentSessionState ? readSnapshot?.() : undefined)
+    } catch (err) {
+      console.error(`[Consumer][${conversationId}] sink.onConsumerStopped failed:`, err)
+    }
   }
 
   // Fire and forget — errors are logged but don't propagate
@@ -145,25 +172,29 @@ export function startConsumer(
   }).finally(() => {
     state.running = false
     state.currentSessionState = null
-    // Sinks that hand out per-turn promises settle their outstanding ones here;
-    // nothing else will arrive on this session.
-    try {
-      state.sink.onConsumerStopped?.()
-    } catch (err) {
-      console.error(`[Consumer][${conversationId}] sink.onConsumerStopped failed:`, err)
-    }
+    settleSink()
     console.log(`[Consumer][${conversationId}] Consumer loop exited`)
   })
 
   const handle: ConsumerHandle = {
     stop() {
+      const turnStartedAt = state.turnStartedAt
+      state.turnStartedAt = null
       if (!state.consumerAbort.signal.aborted) {
         state.consumerAbort.abort()
         console.log(`[Consumer][${conversationId}] Stop requested`)
       }
-      // Also abort the current turn if one is in progress
       if (state.currentSessionState) {
         state.currentSessionState.abortController.abort()
+        endApiRetry(state.currentSessionState)
+      }
+      // The shared sink may serve a successor before this stream finally exits.
+      settleSink()
+      if (turnStartedAt !== null) {
+        emitAgentEvent('agent:complete', state.spaceId, conversationId, {
+          type: 'complete',
+          duration: Date.now() - turnStartedAt,
+        })
       }
     },
     get isRunning() {
@@ -174,6 +205,9 @@ export function startConsumer(
     },
     getTeamLifecycleThoughts() {
       return state.teamLifecycleThoughts
+    },
+    hasRunningTasks() {
+      return state.runningTasks.size > 0
     },
     updateDisplayModel(newDisplayModel: string, newContextWindow?: number) {
       if (state.displayModel !== newDisplayModel) {
@@ -239,11 +273,18 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
         displayModel: state.displayModel,
         contextWindow: state.contextWindow,
         abortController: turnAbort,
+        sessionSignal: state.consumerAbort.signal,
         t0: turnStartTime,
         callbacks: {
-          onRawMessage: sink.onRawMessage ? (m) => sink.onRawMessage!(m) : undefined,
+          onSnapshotReady: readSnapshot => { state.readTurnSnapshot = readSnapshot },
+          onRawMessage: (m) => {
+            trackTaskLifecycle(state.runningTasks, m)
+            noteSessionMcpStatus(conversationId, v2Session, m)
+            sink.onRawMessage?.(m)
+          },
           onTurnInit: () => {
             receivedAnyEvent = true
+            state.turnStartedAt = turnStartTime
 
             // Mark consumer as actively processing. From this point on,
             // getOrCreateV2Session will correctly defer session rebuilds
@@ -254,6 +295,7 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
             markTurnInitReceived(conversationId)
 
             sink.onTurnStart?.()
+            if (state.consumerAbort.signal.aborted) return
 
             // Notify frontend to transition to generating state
             emitAgentEvent('agent:turn-start', spaceId, conversationId, {
@@ -263,12 +305,16 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
         },
       })
 
+      if (state.consumerAbort.signal.aborted) break
+
       // Turn complete — persist result and notify frontend
       if (receivedAnyEvent) {
         // Reset empty iteration counter on successful turn
         consecutiveEmptyIterations = 0
 
+        state.readTurnSnapshot = null
         sink.onTurnComplete(result)
+        if (state.consumerAbort.signal.aborted) break
 
         // Accumulate team lifecycle thoughts across turns: a team spawned in an
         // earlier turn must keep blocking session rebuilds and idle cleanup while
@@ -281,12 +327,14 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
         ]
         state.teamLifecycleThoughts = hasActiveTeamTasks(teamThoughts) ? teamThoughts : []
 
+        state.turnStartedAt = null
+        agentCompleteEmitted = true
         emitAgentEvent('agent:complete', spaceId, conversationId, {
           type: 'complete',
           duration: Date.now() - turnStartTime,
           tokenUsage: result.tokenUsage,
         })
-        agentCompleteEmitted = true
+        if (state.consumerAbort.signal.aborted) break
 
         console.log(
           `[Consumer][${conversationId}] Turn complete:` +
@@ -303,13 +351,8 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
           break
         }
 
-        // API config or toolset change during this turn → break the loop so the
-        // session is rebuilt with the new set on the next send.
-        // Deferred while team agents are still running: breaking now would leave
-        // the CC subprocess unread and the next send would kill it (and
-        // every in-flight team task) as a zombie. The flag stays set and is
-        // consumed after the team's final turn.
-        if (!hasActiveTeamTasks(state.teamLifecycleThoughts) && consumePendingRebuild(conversationId)) {
+        // Keep consuming until every background and team task has reported back.
+        if (state.runningTasks.size === 0 && !hasActiveTeamTasks(state.teamLifecycleThoughts) && consumePendingRebuild(conversationId)) {
           console.log(`[Consumer][${conversationId}] Rebuild pending, breaking for rebuild`)
           break
         }
@@ -328,6 +371,7 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
             `[Consumer][${conversationId}] ${MAX_EMPTY_ITERATIONS} consecutive empty iterations, ` +
             `process may be in bad state — exiting consumer`
           )
+          failPendingSessionTurns(conversationId, new Error('Chat session ended before the message was processed.'))
           break
         }
 
@@ -339,6 +383,7 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
       }
 
       const error = err as Error
+      if (!receivedAnyEvent && failPendingSessionTurns(conversationId, error)) break
       console.error(`[Consumer][${conversationId}] Turn error:`, error)
 
       // Emit error to frontend
@@ -346,18 +391,23 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
         type: 'error',
         error: error.message || 'Unknown error. Check logs in Settings > System > Logs.',
       })
+      if (state.consumerAbort.signal.aborted) break
 
-      sink.onTurnError?.(error, receivedAnyEvent)
+      const readSnapshot = state.readTurnSnapshot
+      state.readTurnSnapshot = null
+      sink.onTurnError?.(error, receivedAnyEvent, receivedAnyEvent ? readSnapshot?.() : undefined)
+      if (state.consumerAbort.signal.aborted) break
 
       // Reset empty iteration counter — errors are not empty iterations
       consecutiveEmptyIterations = 0
 
       // Emit complete so frontend transitions out of generating state
+      state.turnStartedAt = null
+      agentCompleteEmitted = true
       emitAgentEvent('agent:complete', spaceId, conversationId, {
         type: 'complete',
         duration: Date.now() - turnStartTime,
       })
-      agentCompleteEmitted = true
 
       // If the error is fatal (process died), break the consumer loop
       if (isProcessDeadError(error)) {
@@ -368,8 +418,9 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
       // Safety net (M1 fix): guarantee agent:complete is emitted if a turn started
       // but neither the happy path nor catch path emitted it (e.g., unhandled
       // exception between the sink call and emitAgentEvent).
-      if (receivedAnyEvent && !agentCompleteEmitted) {
+      if (receivedAnyEvent && !agentCompleteEmitted && !state.consumerAbort.signal.aborted) {
         console.warn(`[Consumer][${conversationId}] Safety net: emitting agent:complete (missed in normal path)`)
+        state.turnStartedAt = null
         emitAgentEvent('agent:complete', spaceId, conversationId, {
           type: 'complete',
           duration: Date.now() - turnStartTime,
@@ -378,6 +429,7 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
 
       state.processingTurn = false
       state.currentSessionState = null
+      state.readTurnSnapshot = null
       state.consumerAbort.signal.removeEventListener('abort', onConsumerAbort)
     }
   }
@@ -388,6 +440,14 @@ async function consumeLoop(v2Session: V2SDKSession, state: ConsumerState): Promi
 // ============================================
 // Turn Handling Helpers
 // ============================================
+
+/** Keeps `running` in step with CC's task_started / task_notification events. */
+export function trackTaskLifecycle(running: Set<string>, sdkMessage: unknown): void {
+  const msg = sdkMessage as { type?: unknown; subtype?: unknown; task_id?: unknown } | null
+  if (msg?.type !== 'system' || typeof msg.task_id !== 'string') return
+  if (msg.subtype === 'task_started') running.add(msg.task_id)
+  else if (msg.subtype === 'task_notification') running.delete(msg.task_id)
+}
 
 /**
  * Check if an error indicates the CC process is dead (not recoverable).

@@ -1,5 +1,6 @@
 /** Digital Team domain slice of the unified api object. */
 import { httpRequest, isElectron, onEvent } from './_shared'
+import { ensureExtendedServicesReady } from './bootstrap-ready'
 import type { ApiResponse } from './_shared'
 import type {
   CreateTeamInput,
@@ -12,11 +13,15 @@ import type {
   TeamArtifactOpenResult,
 } from '../../shared/apps/team-types'
 import type { ImageAttachment } from '../../shared/types/image-attachment'
+import type { ContentReference } from '../../shared/types/content-reference'
 
 export const teamApi = {
   // ===== Teams =====
   teamList: async (spaceId?: string): Promise<ApiResponse> => {
-    if (isElectron()) return window.halo.teamList(spaceId)
+    if (isElectron()) {
+      await ensureExtendedServicesReady()
+      return window.halo.teamList(spaceId)
+    }
     const qs = spaceId ? `?spaceId=${encodeURIComponent(spaceId)}` : ''
     return httpRequest('GET', `/api/teams${qs}`)
   },
@@ -77,6 +82,8 @@ export const teamApi = {
    * through the office's owner (team wake) rather than local app-chat, which
    * cannot resolve a non-local app. The owner runs the turn and relays the
    * stream + result back. Desktop-only (needs the federation connection).
+   * References travel as text written into the message; `spaceId` is the
+   * space they were taken in, so their paths read relative to its folder.
    */
   teamSendToMember: async (input: {
     teamId: string
@@ -85,6 +92,8 @@ export const teamApi = {
     message: string
     images?: ImageAttachment[]
     thinkingEnabled?: boolean
+    spaceId?: string
+    references?: ContentReference[]
   }): Promise<ApiResponse> => {
     if (isElectron()) return window.halo.teamSendToMember(input)
     return httpRequest('POST', `/api/teams/${input.teamId}/members/${input.appId}/send`, {
@@ -92,6 +101,8 @@ export const teamApi = {
       message: input.message,
       images: input.images,
       thinkingEnabled: input.thinkingEnabled,
+      spaceId: input.spaceId,
+      references: input.references,
     })
   },
 
@@ -288,7 +299,10 @@ export const teamApi = {
    * only — web clients are never a deep-link target.
    */
   teamConsumePendingInvite: async (): Promise<ApiResponse> => {
-    if (isElectron()) return window.halo.teamConsumePendingInvite()
+    if (isElectron()) {
+      await ensureExtendedServicesReady()
+      return window.halo.teamConsumePendingInvite()
+    }
     return { success: true, data: null }
   },
 

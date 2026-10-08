@@ -14,6 +14,7 @@ import { randomUUID } from 'crypto'
 import type { InstalledApp, AppManagerService, RunOutcome, AppStatus } from '../manager'
 import { AppNotFoundError } from '../manager'
 import type { AutomationSpec, SubscriptionDef } from '../spec'
+import { usesWorkdayCalendar } from '../../../shared/apps/spec-types'
 import type { SchedulerService, SchedulerJob, SchedulerJobCreate } from '../../platform/scheduler'
 import type { EventRouter } from './event-router'
 import type { EventFilter } from './event-types'
@@ -49,17 +50,17 @@ import { AppNotRunnableError, EscalationNotFoundError, ConcurrencyLimitError } f
 import { Semaphore } from './concurrency'
 import { executeRun } from './execute'
 import { injectIntoActiveRun, isRunActive } from './active-runs'
-import { readSessionMessages } from './session-store'
-import { legacySessionEnvironmentKey } from './execution-environment'
 import { automaticEnabled, blockedReason, deriveRuntimeStatus } from './app-state'
 import { getActiveTeamRuntime } from './team'
-import { truncateUtf16Safe } from './text-truncate'
-import { getSpace } from '../../services/space.service'
-import { getEscalationQuestions, formatEscalationAnswer } from '../../../shared/apps/app-types'
-import type { ImSessionRecord } from '../../../shared/types/im-channel'
+import { getEscalationQuestions, formatEscalationAnswer, totalRunTokens, type RunTokenUsage } from '../../../shared/apps/app-types'
+import type { ContentReference } from '../../../shared/types/content-reference'
 import { broadcastToAll } from '../../http/websocket'
+import { destroyChatBrowserContextsForApp } from './app-chat-browser'
 import { sendToRenderer } from '../../foundation/window.service'
 import { notifyAppEvent } from '../../services/notification.service'
+import { RunningRuns } from './running-runs'
+import { clearOldRunTranscripts } from './run-retention'
+import { refreshWorkdayCalendar, workdayStatusOn } from '../../services/workday-calendar'
 
 // ============================================
 // Constants
@@ -74,6 +75,12 @@ const MAX_CONSECUTIVE_ERRORS = 5
 /** Keep-alive reason string for the background service */
 const KEEP_ALIVE_REASON = 'automation-apps-active'
 
+/** Keep-alive reason while an app has a run in flight (covers manual runs of inactive apps) */
+const RUN_KEEP_ALIVE_REASON = 'automation-run'
+
+/** Longest an app state served by getAllAppStates may lag inputs that changed without a publish */
+const STATE_CACHE_TTL_MS = 60_000
+
 /** How often to check for timed-out escalations (5 minutes) */
 const ESCALATION_CHECK_INTERVAL_MS = 5 * 60 * 1000
 
@@ -82,6 +89,9 @@ const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 /** Recorded on runs whose process died before they could finish. */
 const INTERRUPTED_RUN_MESSAGE = 'Interrupted — Halo stopped while this run was in progress.'
+
+/** Refusal to continue a run whose transcript and engine session the retention rule deleted. */
+const RUN_PROCESS_CLEARED_MESSAGE = 'This execution can no longer be continued: its process was cleared under the retention rule'
 
 // ============================================
 // Service Factory
@@ -99,13 +109,16 @@ const INTERRUPTED_RUN_MESSAGE = 'Interrupted — Halo stopped while this run was
 export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService {
   const queuedAutomatic = new Map<string, Set<AbortController>>()
   const intentionallyStoppedRuns = new Set<string>()
-  const activeRunControllers = new Map<string, AbortController>()
+  // appId → the day (toDateString) a calendar gap was last put on its timeline.
+  const calendarGapNotedOn = new Map<string, string>()
+  // By run id. `startedAt` is this execution's own start: a continued run keeps
+  // its first start in the database.
+  const activeExecutions = new Map<string, { controller: AbortController; startedAt: number }>()
   const continuationDispatches = new Set<string>()
   let continuationInterval: ReturnType<typeof setInterval> | null = null
   let shuttingDown = false
   let drainingContinuations = false
   const { store, appManager, scheduler, eventRouter, memory, background } = deps
-  const imSessionRegistry = deps.imSessionRegistry ?? null
 
   // ── Internal State ──────────────────────────────────
   const activations = new Map<string, ActivationState>()
@@ -140,10 +153,18 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
     if (outcome === 'skipped' || outcome === 'noop') return 'skipped'
     return 'ok'
   }
-  // Keyed by unique execution key ("{appId}:{counter}") -- NOT by appId alone.
-  // This avoids concurrent runs for the same App overwriting each other's
-  // abort controller, ensuring deactivate() can cancel ALL running instances.
-  const runningAbortControllers = new Map<string, AbortController>()
+  // Each run has its own execution key ("{appId}:{counter}") so concurrent runs
+  // of one App never overwrite each other's abort controller. While an app has
+  // a run in flight it holds the process alive (a closed window must not end it).
+  const runKeepAlive = new Map<string, () => void>()
+  const runningRuns = new RunningRuns((appId, busy) => {
+    if (busy) {
+      runKeepAlive.set(appId, background.registerKeepAliveReason(`${RUN_KEEP_ALIVE_REASON}:${appId}`))
+    } else {
+      runKeepAlive.get(appId)?.()
+      runKeepAlive.delete(appId)
+    }
+  })
   let executionCounter = 0
   /**
    * Reference-counted map of app IDs waiting for a global semaphore slot.
@@ -162,8 +183,29 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
   let lastPruneAtMs = 0
 
   // ── Helper: Build trigger context ───────────────────
+  /**
+   * How the trigger names the subscription that started a run: the author's id,
+   * else its place in the list (from 1). A person with several schedules or
+   * event subscriptions can then be told in its prompt what each one is for.
+   */
+  function describeSubscription(sub: SubscriptionDef, index: number): string {
+    return sub.id ? `subscription "${sub.id}"` : `subscription #${index + 1}`
+  }
+
+  /** The subscription a schedule job was made from: jobs carry its id, or its index when unnamed. */
+  function subscriptionForJob(job: SchedulerJob, app: InstalledApp): { sub: SubscriptionDef; index: number } | null {
+    const subId: unknown = (job.metadata as { subscriptionId?: unknown } | undefined)?.subscriptionId
+    const subscriptions = app.spec.type === 'automation' ? app.spec.subscriptions ?? [] : []
+    const index = subscriptions.findIndex((sub, i) => (sub.id ?? String(i)) === subId)
+    return index >= 0 ? { sub: subscriptions[index], index } : null
+  }
+
   function buildScheduleTriggerContext(job: SchedulerJob, app: InstalledApp): TriggerContext {
-    const subId = (job.metadata as any)?.subscriptionId || 'unknown'
+    const subId: unknown = (job.metadata as { subscriptionId?: unknown } | undefined)?.subscriptionId
+    const found = subscriptionForJob(job, app)
+    const subscription = found
+      ? ` — ${describeSubscription(found.sub, found.index)}`
+      : typeof subId === 'string' && subId ? ` — subscription "${subId}"` : ''
     const schedule = job.schedule
     let scheduleDesc: string
 
@@ -177,7 +219,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
     return {
       type: 'schedule',
-      description: `Scheduled run for "${app.spec.name}" (${scheduleDesc}). ` +
+      description: `Scheduled run for "${app.spec.name}"${subscription} (${scheduleDesc}). ` +
         `Time: ${new Date().toISOString()}`,
       jobId: job.id,
     }
@@ -186,137 +228,24 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
   function buildEventTriggerContext(
     eventType: string,
     eventPayload: Record<string, unknown>,
-    app: InstalledApp
+    app: InstalledApp,
+    subscription: string
   ): TriggerContext {
     return {
       type: 'event',
-      description: `Triggered by event "${eventType}" for "${app.spec.name}". ` +
+      description: `Triggered by event "${eventType}" for "${app.spec.name}" — ${subscription}. ` +
         `Time: ${new Date().toISOString()}`,
       eventPayload,
     }
   }
 
-  function buildManualTriggerContext(app: InstalledApp): TriggerContext {
+  function buildManualTriggerContext(app: InstalledApp, watchable: boolean): TriggerContext {
     return {
       type: 'manual',
       description: `Manually triggered run for "${app.spec.name}". ` +
         `Time: ${new Date().toISOString()}`,
+      ...(watchable ? { watchable } : {}),
     }
-  }
-
-  /** Max recent conversation turns (user + bot reply) to include per IM session */
-  const IM_HISTORY_TURN_LIMIT = 15
-
-  /** Max total characters for the IM context section (keeps trigger concise) */
-  const IM_HISTORY_MAX_CHARS = 3000
-
-  /** Max characters per individual message line (truncate long bot responses) */
-  const IM_MESSAGE_TRUNCATE = 500
-
-  /**
-   * Prefixes written by the old proactive push path (buildTriggerMessage).
-   * These are internal trigger signals, not real user messages — skip them.
-   */
-  const IM_TRIGGER_PREFIXES = ['[schedule]', '[event]', '[manual]']
-
-  /**
-   * Build an IM conversation history section for injection into trigger context.
-   *
-   * Groups raw JSONL messages into clean conversation turns: each turn is one
-   * user message paired with the bot's FINAL reply (intermediate tool-call
-   * narration is collapsed away, matching what IM users actually see).
-   *
-   * Internal trigger messages ([schedule]/[event]/[manual]) are filtered out.
-   * Returns null if no usable history exists.
-   */
-  function buildImContextForTrigger(
-    app: InstalledApp,
-    sessions: ImSessionRecord[]
-  ): string | null {
-    const space = app.spaceId ? getSpace(app.spaceId) : null
-    const sections: string[] = []
-
-    for (const session of sessions) {
-      // Derive JSONL runId — mirrors deriveRunId() in app-chat.ts
-      const chatRunId = `chat-${session.channel}-${session.chatType}-${session.chatId}`
-      const sessionKey = `app-chat:${app.id}:${session.channel}:${session.chatType}:${session.chatId}`
-      const environment = store.getSessionEnvironment(sessionKey)
-        ?? store.getSessionEnvironment(legacySessionEnvironmentKey(app.id, chatRunId))
-      const spacePath = environment?.spacePath ?? space?.path
-      if (!spacePath) {
-        console.warn('[Runtime] IM trigger history unavailable: missing session environment', { appId: app.id, sessionKey })
-        continue
-      }
-      const messages = readSessionMessages(spacePath, app.id, chatRunId)
-      if (messages.length === 0) continue
-
-      // ── Group into turns ──────────────────────────────────────────────────
-      // Each turn = one real user message + the bot's last reply for that turn.
-      // Multiple consecutive bot messages (tool-call narration) are collapsed
-      // to the final one — that's what the IM user actually received.
-      const turns: Array<{ user: string; botFinal: string }> = []
-      let pendingUser: string | null = null
-      let pendingBotFinal: string | null = null
-
-      for (const m of messages) {
-        if (m.role === 'user') {
-          // Flush completed turn before starting a new one
-          if (pendingUser !== null && pendingBotFinal !== null) {
-            turns.push({ user: pendingUser, botFinal: pendingBotFinal })
-          }
-          // Skip internal trigger signals — not real user messages
-          if (IM_TRIGGER_PREFIXES.some(p => m.content.startsWith(p))) {
-            pendingUser = null
-            pendingBotFinal = null
-            continue
-          }
-          pendingUser = m.content
-          pendingBotFinal = null
-        } else {
-          // Bot message — keep overwriting so we always have the last one
-          if (pendingUser !== null) {
-            pendingBotFinal = m.content
-          }
-        }
-      }
-      // Flush the last turn
-      if (pendingUser !== null && pendingBotFinal !== null) {
-        turns.push({ user: pendingUser, botFinal: pendingBotFinal })
-      }
-
-      if (turns.length === 0) continue
-
-      // ── Format recent turns ───────────────────────────────────────────────
-      const recentTurns = turns.slice(-IM_HISTORY_TURN_LIMIT)
-      let totalChars = 0
-      const lines: string[] = []
-
-      for (const turn of recentTurns) {
-        const userLine = truncateUtf16Safe(turn.user, IM_MESSAGE_TRUNCATE)
-        const botLine = `[bot] ${truncateUtf16Safe(turn.botFinal, IM_MESSAGE_TRUNCATE)}`
-        const turnText = `${userLine}\n${botLine}`
-        totalChars += turnText.length
-        if (totalChars > IM_HISTORY_MAX_CHARS) break
-        lines.push(turnText)
-      }
-
-      if (lines.length > 0) {
-        const header = session.displayName || session.chatId
-        sections.push(
-          `#### ${header} (recent ${lines.length} exchanges)\n\n${lines.join('\n\n')}`
-        )
-      }
-    }
-
-    if (sections.length === 0) return null
-
-    return (
-      `### IM Conversation History\n\n` +
-      `Recent exchanges from IM channels where this App is active.\n` +
-      `Each entry: a user message followed by the bot's final reply.\n` +
-      `Use this to understand what users have been asking about and tailor your output accordingly.\n\n` +
-      sections.join('\n\n')
-    )
   }
 
   function buildEscalationTriggerContext(
@@ -345,7 +274,8 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
     app: InstalledApp,
     sessionId?: string,
     userMessage?: string,
-    interactive?: boolean
+    interactive?: boolean,
+    references?: ContentReference[]
   ): TriggerContext {
     return {
       type: 'continue_followup',
@@ -355,26 +285,57 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         sessionId,
         userMessage,
         interactive,
+        ...(references?.length ? { references } : {}),
       },
     }
   }
 
   // ── Helper: Broadcast app state change ──────────────
+  // Last state published per app, and the state cache getAllAppStates reads.
+  // A state is recomputed on every publish; an app whose inputs change without
+  // a publish is at most STATE_CACHE_TTL_MS stale in getAllAppStates.
+  const lastPublishedState = new Map<string, string>()
+  const stateCache = new Map<string, { state: AutomationAppState; at: number }>()
+
+  function computeAppState(appId: string): AutomationAppState {
+    const state = service.getAppState(appId)
+    stateCache.set(appId, { state, at: Date.now() })
+    return state
+  }
+
+  function forgetAppState(appId: string): void {
+    lastPublishedState.delete(appId)
+    stateCache.delete(appId)
+  }
+
+  /** Publish an app's state to every client, unless it is what they already have. */
+  function publishAppState(appId: string): void {
+    const state = computeAppState(appId)
+    const serialized = JSON.stringify(state)
+    if (lastPublishedState.get(appId) === serialized) return
+    lastPublishedState.set(appId, serialized)
+    broadcastToAll('app:status_changed', { appId, state: state as unknown as Record<string, unknown> })
+    sendToRenderer('app:status_changed', { appId, state })
+  }
+
   function broadcastAppStatus(appId: string): void {
     try {
-      const state = service.getAppState(appId)
-      broadcastToAll('app:status_changed', { appId, state: state as unknown as Record<string, unknown> })
-      sendToRenderer('app:status_changed', { appId, state })
+      publishAppState(appId)
     } catch (error) {
       console.error('[Runtime] Failed to publish execution state', { appId, error })
     }
   }
 
   // ── Helper: Insert + broadcast activity entry ──────
-  function emitActivityEntry(entry: ActivityEntry): void {
-    store.insertEntry(entry)
+  /** Clients upsert by id, so this both announces a new entry and replaces a changed one. */
+  function publishEntry(entry: ActivityEntry): void {
     sendToRenderer('app:activity_entry:new', { appId: entry.appId, entry })
     broadcastToAll('app:activity_entry:new', { appId: entry.appId, entry: entry as unknown as Record<string, unknown> })
+  }
+
+  function emitActivityEntry(entry: ActivityEntry): void {
+    store.insertEntry(entry)
+    publishEntry(entry)
   }
 
   /**
@@ -385,8 +346,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
    * state. Every trigger entry must consult this, not just the manual one.
    */
   function isAppBusy(appId: string): boolean {
-    const running = Array.from(runningAbortControllers.keys()).some(k => k.startsWith(`${appId}:`))
-    return running || (pendingTriggers.get(appId) ?? 0) > 0
+    return runningRuns.has(appId) || (pendingTriggers.get(appId) ?? 0) > 0
   }
 
   /**
@@ -423,7 +383,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
    *
    * @throws AppNotFoundError | AppNotRunnableError | ConcurrencyLimitError
    */
-  function admitManualRun(appId: string): { app: InstalledApp; trigger: TriggerContext } {
+  function admitManualRun(appId: string, watchable = false): { app: InstalledApp; trigger: TriggerContext } {
     const app = appManager.getApp(appId)
     if (!app) {
       throw new AppNotFoundError(appId)
@@ -436,31 +396,81 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       throw new ConcurrencyLimitError(DEFAULT_MAX_CONCURRENT, appId)
     }
 
-    const trigger = buildManualTriggerContext(app)
-
-    // ── Inject IM conversation history into trigger ─────
-    // Use getAllSessions (not the deprecated getProactiveSessions which
-    // filters by the removed `proactive` flag and always returns empty).
-    const imSessions = imSessionRegistry?.getAllSessions(appId)
-    if (imSessions && imSessions.length > 0) {
-      const imContext = buildImContextForTrigger(app, imSessions)
-      if (imContext) {
-        trigger.description += '\n\n' + imContext
-      }
-    }
+    const trigger = buildManualTriggerContext(app, watchable)
 
     return { app, trigger }
   }
 
-  function recordSkippedAutomatic(app: InstalledApp, trigger: TriggerContext, reason: string): AppRunResult {
+  function recordSkippedAutomatic(
+    app: InstalledApp,
+    trigger: TriggerContext,
+    reason: string,
+    details?: Partial<ActivityEntry['content']>,
+  ): AppRunResult {
     const now = Date.now()
     const runId = randomUUID()
     const sessionKey = `${app.id}:${runId}`
     store.insertRun({ runId, appId: app.id, sessionKey, status: 'skipped', triggerType: trigger.type, startedAt: now })
     store.completeRun(runId, { status: 'skipped', finishedAt: now, durationMs: 0 })
-    emitActivityEntry({ id: randomUUID(), appId: app.id, runId, sessionKey, type: 'run_skipped', ts: now, content: { summary: reason, status: 'skipped' } })
+    emitActivityEntry({ id: randomUUID(), appId: app.id, runId, sessionKey, type: 'run_skipped', ts: now, content: { ...details, summary: reason, status: 'skipped' } })
     console.log('[Runtime] Queued automatic execution skipped', { appId: app.id, runId, reason })
     return { appId: app.id, runId, sessionKey, outcome: 'noop', startedAt: now, finishedAt: now, durationMs: 0 }
+  }
+
+  /**
+   * Say on the run's latest entry how many of the person's scheduled times came
+   * due while this execution kept it busy. Each was skipped (one run per
+   * person) and left no other trace on the timeline.
+   */
+  function noteSkippedSchedules(appId: string, runId: string, busySince: number): void {
+    const until = Date.now()
+    let skipped = 0
+    for (const jobId of activations.get(appId)?.schedulerJobIds ?? []) {
+      skipped += scheduler.countDueTimes(jobId, busySince, until)
+    }
+    if (skipped === 0) return
+    const latest = store.getEntriesForRun(runId)[0]
+    const updated = latest ? store.addSkippedSchedules(latest.id, skipped) : null
+    if (updated) publishEntry(updated)
+    console.log(`[Runtime][${runId.slice(0, 8)}] ${skipped} scheduled time(s) came due during the run and were skipped`)
+  }
+
+  /** Show what the model processed for this execution on the run's latest entry. */
+  function noteTokenUsage(runId: string, usage: RunTokenUsage | undefined): void {
+    if (!usage || totalRunTokens(usage) === 0) return
+    const latest = store.getEntriesForRun(runId)[0]
+    const updated = latest ? store.addTokenUsage(latest.id, usage) : null
+    if (updated) publishEntry(updated)
+  }
+
+  /**
+   * A schedule limited to mainland China working days. On a day off nothing
+   * starts; on a day the calendar does not cover nothing starts either, and the
+   * timeline says so once a day rather than at every due time.
+   */
+  async function workdayAllows(job: SchedulerJob, appId: string): Promise<boolean> {
+    const app = appManager.getApp(appId)
+    const found = app ? subscriptionForJob(job, app) : null
+    if (!app || found?.sub.source.type !== 'schedule' || !found.sub.source.config.workday_calendar) return true
+    // A broken calendar must not read as a failing schedule, which the scheduler would back off and disable.
+    const status = await workdayStatusOn(new Date()).catch((error: unknown) => {
+      console.error(`[Runtime] Holiday calendar check failed, app=${appId}:`, error)
+      return 'not_covered' as const
+    })
+    if (status === 'workday') return true
+    if (status === 'day_off') {
+      console.log(`[Runtime] Scheduled run not started: not a working day, app=${appId}`)
+      return false
+    }
+    console.warn(`[Runtime] Scheduled run not started: the holiday calendar does not cover today, app=${appId}`)
+    const today = new Date().toDateString()
+    if (calendarGapNotedOn.get(appId) !== today) {
+      calendarGapNotedOn.set(appId, today)
+      recordSkippedAutomatic(app, buildScheduleTriggerContext(job, app),
+        'The holiday calendar does not cover today, so this scheduled run was skipped. Run it manually if needed.',
+        { workdayCalendarGap: true })
+    }
+    return false
   }
 
   // ── Helper: Execute with concurrency control ────────
@@ -476,6 +486,8 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       onStarted?: (info: { runId: string; sessionKey: string; startedAt: number }) => void
     }
   ): Promise<AppRunResult> {
+    // From here the person is busy (queued or running): its scheduled times are skipped.
+    const busySince = Date.now()
     // Try to acquire a slot immediately without blocking.
     // If no slot is available, transition to 'queued' state and block.
     const immediateSlot = semaphore.tryAcquire()
@@ -542,7 +554,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
     // Use a unique per-run key so concurrent runs of the same App
     // each get their own abort controller entry.
     const executionKey = `${app.id}:${++executionCounter}`
-    runningAbortControllers.set(executionKey, abortController)
+    runningRuns.add(app.id, executionKey, abortController)
 
     // Broadcast run-start status (app transitions from 'queued'/'idle' to 'running')
     broadcastAppStatus(app.id)
@@ -575,7 +587,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         // before their first broadcast.
         onRunStarted: ({ runId, sessionKey, startedAt }) => {
           executingRunId = runId
-          activeRunControllers.set(runId, abortController)
+          activeExecutions.set(runId, { controller: abortController, startedAt })
           emitRunStarted({
             appId: app.id,
             runId,
@@ -642,6 +654,24 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         }
       }
 
+      try {
+        noteSkippedSchedules(app.id, result.runId, busySince)
+      } catch (skipErr) {
+        console.error(`[Runtime][${runTag}] Failed to note skipped scheduled times:`, skipErr)
+      }
+
+      try {
+        noteTokenUsage(result.runId, result.tokenUsage)
+      } catch (usageErr) {
+        console.error(`[Runtime][${runTag}] Failed to note token usage:`, usageErr)
+      }
+
+      try {
+        clearOldRunTranscripts(store, app.id, app.spaceId ? deps.getSpacePath(app.spaceId) : null)
+      } catch (retentionErr) {
+        console.error(`[Runtime][${runTag}] Failed to clear old run transcripts:`, retentionErr)
+      }
+
       // Update manager with run outcome
       const outcome = result.outcome as RunOutcome
       appManager.updateLastRun(app.id, outcome, result.errorMessage)
@@ -656,7 +686,8 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
           )
           try {
             appManager.updateStatus(app.id, 'error', {
-              errorMessage: `Auto-disabled after ${consecutiveErrors} consecutive errors`,
+              errorMessage: `Auto-disabled after ${consecutiveErrors} consecutive failed runs. ` +
+                `Latest: ${result.errorMessage ?? 'no reason was recorded'}`,
             })
             // Deactivate to stop scheduling
             await service.deactivate(app.id)
@@ -705,10 +736,10 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       throw error
     } finally {
       if (executingRunId) {
-        activeRunControllers.delete(executingRunId)
+        activeExecutions.delete(executingRunId)
         intentionallyStoppedRuns.delete(executingRunId)
       }
-      runningAbortControllers.delete(executionKey)
+      runningRuns.remove(app.id, executionKey)
       semaphore.release()
       drainContinuations()
 
@@ -732,8 +763,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
   function publishDecision(entry: ActivityEntry): void {
     try {
-      sendToRenderer('app:activity_entry:new', { appId: entry.appId, entry })
-      broadcastToAll('app:activity_entry:new', { appId: entry.appId, entry: entry as unknown as Record<string, unknown> })
+      publishEntry(entry)
       if (entry.userResponse) {
         const payload = { appId: entry.appId, entryId: entry.id, response: entry.userResponse, ...entry.content.teamContext }
         sendToRenderer('app:escalation:resolved', payload)
@@ -948,6 +978,20 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
     )
   }
 
+  /** Hold (or drop) the file watcher of the App's space to match its file subscriptions. */
+  function syncFileWatch(state: ActivationState, app: InstalledApp | null): void {
+    const wanted = app?.spaceId && app.spec.type === 'automation'
+      && (app.spec.subscriptions ?? []).some((sub) => sub.source.type === 'file')
+      ? app.spaceId
+      : null
+    const held = state.fileWatchSpaceId ?? null
+    if (wanted === held) return
+    const holder = `automation:${state.appId}`
+    if (held) deps.fileWatch?.release(held, holder)
+    if (wanted) deps.fileWatch?.retain(wanted, holder)
+    state.fileWatchSpaceId = wanted
+  }
+
   // ── Service Implementation ──────────────────────────
 
   const service: AppRuntimeService = {
@@ -1006,6 +1050,8 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         }
       }
 
+      if (subscriptions.some(usesWorkdayCalendar)) void refreshWorkdayCalendar()
+
       // Register event router subscriptions for event-type subscriptions
       for (let i = 0; i < subscriptions.length; i++) {
         const sub = subscriptions[i]
@@ -1020,7 +1066,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
             const currentApp = admission.app
 
             console.log(`[Runtime] Event triggered: type=${event.type}, app=${appId}`)
-            const trigger = buildEventTriggerContext(event.type, event.payload, currentApp)
+            const trigger = buildEventTriggerContext(event.type, event.payload, currentApp, describeSubscription(sub, i))
 
             try {
               await executeWithConcurrency(currentApp, trigger)
@@ -1034,11 +1080,14 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
       // Register keep-alive reason if we have any active subscriptions
       if (state.schedulerJobIds.length > 0 || state.eventUnsubscribers.length > 0) {
+        // Held for as long as the App is activated; deactivate disposes it.
         state.keepAliveDisposer = background.registerKeepAliveReason(
-          `${KEEP_ALIVE_REASON}:${appId}`
+          `${KEEP_ALIVE_REASON}:${appId}`,
+          { ttlMs: Infinity }
         )
       }
 
+      syncFileWatch(state, app)
       activations.set(appId, state)
       console.log(
         `[Runtime] App activated: ${appId}, ` +
@@ -1077,6 +1126,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       if (state.keepAliveDisposer) {
         state.keepAliveDisposer()
       }
+      syncFileWatch(state, null)
 
       activations.delete(appId)
       console.log(`[Runtime] App deactivated: ${appId}`)
@@ -1091,6 +1141,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       if (app.spec.type !== 'automation') return // Only automation apps have subscriptions
 
       const subscriptions = app.spec.subscriptions ?? []
+      syncFileWatch(state, app)
 
       // ── 1. Hot-sync scheduler jobs ─────────────────────
       const desiredJobIds = new Set<string>()
@@ -1119,6 +1170,8 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
           console.log(`[Runtime] New scheduler job added: ${jobCreate.id}`)
         }
       }
+
+      if (subscriptions.some(usesWorkdayCalendar)) void refreshWorkdayCalendar()
 
       // Remove stale jobs that are no longer in the subscription list
       for (const jobId of [...state.schedulerJobIds]) {
@@ -1155,7 +1208,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
             const currentApp = admission.app
 
             console.log(`[Runtime] Event triggered: type=${event.type}, app=${appId}`)
-            const trigger = buildEventTriggerContext(event.type, event.payload, currentApp)
+            const trigger = buildEventTriggerContext(event.type, event.payload, currentApp, describeSubscription(sub, i))
 
             try {
               await executeWithConcurrency(currentApp, trigger)
@@ -1180,8 +1233,8 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       return result
     },
 
-    async startManually(appId: string): Promise<AppRunStartInfo> {
-      const { app, trigger } = admitManualRun(appId)
+    async startManually(appId: string, options?: { watchable?: boolean }): Promise<AppRunStartInfo> {
+      const { app, trigger } = admitManualRun(appId, options?.watchable === true)
 
       let settled = false
       let resolveAdmission!: (info: AppRunStartInfo) => void
@@ -1224,10 +1277,9 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
     getDirectoryRuntimeSnapshot() {
       const result: import('../../../shared/apps/people-directory').DirectoryRuntimeSnapshot = {}
-      for (const key of runningAbortControllers.keys()) {
-        const appId = key.slice(0, key.indexOf(':'))
+      for (const [appId, count] of runningRuns.counts()) {
         const row = result[appId] ??= { runningCount: 0, queued: false }
-        row.runningCount++
+        row.runningCount = count
       }
       for (const [appId, count] of pendingTriggers) {
         const row = result[appId] ??= { runningCount: 0, queued: false }
@@ -1244,7 +1296,11 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
     },
 
     getAllAppStates(): Record<string, AutomationAppState> {
-      return Object.fromEntries(appManager.listApps({ type: 'automation' }).map(app => [app.id, service.getAppState(app.id)]))
+      const now = Date.now()
+      return Object.fromEntries(appManager.listApps({ type: 'automation' }).map(app => {
+        const cached = stateCache.get(app.id)
+        return [app.id, cached && now - cached.at < STATE_CACHE_TTL_MS ? cached.state : computeAppState(app.id)]
+      }))
     },
 
     getAppState(appId: string): AutomationAppState {
@@ -1255,8 +1311,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         }
       }
 
-      const appPrefix = `${appId}:`
-      const isRunning = Array.from(runningAbortControllers.keys()).some(k => k.startsWith(appPrefix))
+      const isRunning = runningRuns.has(appId)
       const isQueued = (pendingTriggers.get(appId) ?? 0) > 0
 
       const counts = store.getDecisionCounts(appId)
@@ -1269,7 +1324,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         }),
         automaticEnabled: automaticEnabled(app.status),
         blocked: blockedReason(app.status),
-        runningCount: Array.from(runningAbortControllers.keys()).filter(key => key.startsWith(appPrefix)).length,
+        runningCount: runningRuns.count(appId),
         pendingDecisionCount: counts.pending,
         pendingSoloDecisionCount: counts.solo,
         continuationCount: counts.continuations,
@@ -1286,7 +1341,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         else if (latestRun.status === 'skipped') state.lastStatus = 'skipped'
 
         if (latestRun.status === 'running') {
-          state.runningAtMs = latestRun.startedAt
+          state.runningAtMs = activeExecutions.get(latestRun.runId)?.startedAt ?? latestRun.startedAt
           state.runningRunId = latestRun.runId
           state.runningSessionKey = latestRun.sessionKey
         }
@@ -1365,10 +1420,26 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       publishDecision(store.confirmDeadline(appId, entryId, deadlineAt))
     },
 
+    adoptAuthorVersion(appId: string, entryId: string, fields: string[]): ActivityEntry {
+      const entry = store.getEntry(entryId)
+      const note = entry?.appId === appId ? entry.content.upgrade : undefined
+      if (!entry || !note) throw new Error('This upgrade note no longer exists')
+      if (!Array.isArray(fields) || fields.some(field => typeof field !== 'string')) {
+        throw new Error('fields must be a list of field names')
+      }
+      // Only what the note kept: it is what the user is looking at.
+      const requested = fields.filter(field => note.kept.includes(field))
+      const changed = appManager.adoptAuthorVersion(appId, requested)
+      if (changed.includes('subscriptions')) service.syncAppSubscriptions(appId)
+      const updated = store.markUpgradeAdopted(entryId, requested) ?? entry
+      publishEntry(updated)
+      return updated
+    },
+
     async stopRun(appId: string, runId: string): Promise<void> {
       const run = store.getRun(runId)
       if (!run || run.appId !== appId) throw new Error('Task not found')
-      const controller = activeRunControllers.get(runId)
+      const controller = activeExecutions.get(runId)?.controller
       if (!controller) throw new Error('This execution is no longer running')
       intentionallyStoppedRuns.add(runId)
       store.markRunStopped(runId)
@@ -1380,8 +1451,8 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       const run = store.getRun(runId)
       if (!run || run.appId !== appId) throw new Error('Task not found')
       for (const entry of store.closeRun(runId)) publishDecision(entry)
-      if (activeRunControllers.has(runId)) intentionallyStoppedRuns.add(runId)
-      activeRunControllers.get(runId)?.abort()
+      if (activeExecutions.has(runId)) intentionallyStoppedRuns.add(runId)
+      activeExecutions.get(runId)?.controller.abort()
       console.log('[Runtime] Task closed', { appId, runId })
       broadcastAppStatus(appId)
     },
@@ -1407,6 +1478,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         throw new Error(`Run not found: ${runId}`)
       }
       if (store.isRunClosed(runId)) throw new Error('This task is closed')
+      if (run.transcriptClearedAt) throw new Error(RUN_PROCESS_CLEARED_MESSAGE)
       if (run.status !== 'error') {
         throw new Error(`Run ${runId} is not in error state (status: ${run.status})`)
       }
@@ -1435,20 +1507,20 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       })
     },
 
-    async injectIntoRun(appId: string, runId: string, text: string): Promise<void> {
+    async injectIntoRun(appId: string, runId: string, text: string, references?: ContentReference[]): Promise<void> {
       const app = appManager.getApp(appId)
       if (!app) {
         throw new Error(`App not found: ${appId}`)
       }
       const trimmed = text.trim()
-      if (!trimmed) {
+      if (!trimmed && !references?.length) {
         throw new Error('Cannot send an empty message')
       }
 
       // Live run → inject into the current turn; the AI absorbs it at the next
       // tool boundary (steer an in-progress run).
       if (isRunActive(runId)) {
-        injectIntoActiveRun(appId, runId, trimmed)
+        injectIntoActiveRun(appId, runId, trimmed, references)
         console.log(`[Runtime] Injected into live run: app=${appId}, run=${runId.slice(0, 8)}`)
         return
       }
@@ -1461,6 +1533,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
         throw new Error(`Run not found: ${runId}`)
       }
       if (store.isRunClosed(runId)) throw new Error('This task is closed')
+      if (run.transcriptClearedAt) throw new Error(RUN_PROCESS_CLEARED_MESSAGE)
       const appIsRunning = isAppBusy(appId) || store.hasQueuedSoloContinuation(appId)
       if (appIsRunning) {
         throw new Error(`App ${appId} is busy with another run — try again once it finishes`)
@@ -1472,7 +1545,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
       // A follow-up to a prematurely-ended run (status 'error', report never
       // called) is left non-interactive so it still drives the task to completion.
       const interactive = run.status === 'ok'
-      const trigger = buildContinueTriggerContext(app, run.sessionId, trimmed, interactive)
+      const trigger = buildContinueTriggerContext(app, run.sessionId, trimmed, interactive, references)
       executeWithConcurrency(app, trigger, {
         existingRunId: run.runId,
         existingSessionKey: run.sessionKey,
@@ -1572,7 +1645,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
     async deactivateAll(): Promise<void> {
       shuttingDown = true
       if (continuationInterval) { clearInterval(continuationInterval); continuationInterval = null }
-      for (const controller of runningAbortControllers.values()) controller.abort()
+      runningRuns.abortAll()
       console.log('[Runtime] Deactivating all apps...')
       const appIds = Array.from(activations.keys())
 
@@ -1616,14 +1689,22 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
   // ── Register scheduler handler ──────────────────────
   // This connects the scheduler's onJobDue to our execution logic.
-  // IM conversation history from proactive sessions is injected into the
-  // trigger context, and the run result is forwarded to IM after completion.
   scheduler.onJobDue('app', async (job: SchedulerJob): Promise<RunOutcome> => {
     const appId = (job.metadata as any)?.appId
     if (!appId) {
       console.warn(`[Runtime] Scheduler job ${job.id} has no appId in metadata`)
       return 'skipped'
     }
+
+    // Admission is checked on both sides of the calendar: before it, so a person
+    // who would not run anyway gets no calendar note; after it, because the
+    // calendar may wait for its first download and the answer can change.
+    const precheck = admitAutomaticRun(appId)
+    if ('skipReason' in precheck) {
+      console.log(`[Runtime] Skipping scheduled run: app=${appId}, ${precheck.skipReason}`)
+      return 'skipped'
+    }
+    if (!await workdayAllows(job, appId)) return 'skipped'
 
     const admission = admitAutomaticRun(appId)
     if ('skipReason' in admission) {
@@ -1634,20 +1715,16 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
     const trigger = buildScheduleTriggerContext(job, app)
 
-    // ── Inject IM conversation history into trigger ─────
-    const imSessions = imSessionRegistry?.getAllSessions(appId)
-    if (imSessions && imSessions.length > 0) {
-      const imContext = buildImContextForTrigger(app, imSessions)
-      if (imContext) {
-        trigger.description += '\n\n' + imContext
-      }
-    }
-
     try {
       const result = await executeWithConcurrency(app, trigger)
 
       // IM forwarding is now AI-driven via notify_bot tool (no more system auto-push)
 
+      // Stopping or closing a run is not its schedule failing: the scheduler
+      // must neither back the next time off nor disable the job after repeats.
+      if (result.outcome === 'error' && (store.wasRunStopped(result.runId) || store.isRunClosed(result.runId))) {
+        return 'noop'
+      }
       return result.outcome as RunOutcome
     } catch (err) {
       console.error(`[Runtime] Scheduled run failed: app=${appId}, job=${job.id}:`, err)
@@ -1673,9 +1750,7 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
     // Broadcast status change to all connected remote clients for real-time UI
     try {
-      const state = service.getAppState(appId)
-      broadcastToAll('app:status_changed', { appId, state: state as unknown as Record<string, unknown> })
-      sendToRenderer('app:status_changed', { appId, state })
+      publishAppState(appId)
     } catch (err) {
       console.warn(`[Runtime] Failed to broadcast status change for app=${appId}:`, err)
     }
@@ -1697,10 +1772,51 @@ export function createAppRuntimeService(deps: AppRuntimeDeps): AppRuntimeService
 
   appManager.onAppInstalled((app: InstalledApp) => announceListChange(app.id, 'installed'))
   appManager.onAppUninstalled((app: InstalledApp) => {
-    for (const [key, controller] of runningAbortControllers) if (key.startsWith(`${app.id}:`)) controller.abort()
+    runningRuns.abortApp(app.id)
     for (const controller of queuedAutomatic.get(app.id) ?? []) controller.abort()
+    destroyChatBrowserContextsForApp(app.id, 'app-uninstalled')
+    // Idempotent: a user uninstall already deactivated it, but a space delete or
+    // a system cleanup reaches here with the schedule and subscriptions still live.
+    void service.deactivate(app.id).catch(err => {
+      console.warn(`[Runtime] Deactivate after uninstall failed for app=${app.id}:`, err)
+    })
+    forgetAppState(app.id)
     announceListChange(app.id, 'uninstalled')
+  })
+
+  // ── React to an author's upgrade ────────────────────
+  // Every upgrade path (store, automatic or manual, and the bundle) ends in the
+  // manager's upgradeSpec, so this is where an upgrade reaches the running
+  // digital human: its triggers are rescheduled, and fields kept at the user's
+  // version are written up where the user looks.
+  appManager.onAppSpecUpgraded((appId, outcome) => {
+    try {
+      service.syncAppSubscriptions(appId)
+    } catch (err) {
+      console.error('[Runtime] Rescheduling after an upgrade failed; it applies on next activation', { appId, error: err })
+    }
+    if (outcome.kept.length === 0) return
+    try {
+      emitActivityEntry({
+        id: randomUUID(),
+        appId,
+        runId: UPGRADE_NOTE_RUN_ID,
+        type: 'milestone',
+        ts: Date.now(),
+        content: {
+          summary: `Upgraded from v${outcome.fromVersion} to v${outcome.toVersion}. ` +
+            `Kept the current version of what differs from the author's: ${outcome.kept.join(', ')}`,
+          upgrade: { ...outcome },
+          source: { kind: 'upgrade', appId },
+        },
+      })
+    } catch (err) {
+      console.error('[Runtime] Upgrade note could not be recorded', { appId, kept: outcome.kept, error: err })
+    }
   })
 
   return service
 }
+
+/** Upgrade notes belong to no run; like chat reports, they carry a sentinel run id. */
+const UPGRADE_NOTE_RUN_ID = 'upgrade'

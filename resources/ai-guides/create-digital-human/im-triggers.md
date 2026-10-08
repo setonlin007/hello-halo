@@ -45,12 +45,25 @@ The opposite direction, and this one *is* spec-controlled:
 - At runtime, if the permission is granted **and** the app already has at least one known IM
   contact, a `notify_bot` tool appears (`src/main/apps/runtime/notify-tool.ts`).
 - `notify_bot`'s description embeds a live contact directory (`instanceId:chatId` → display
-  name) built from the app's IM sessions at run time. Targets are chosen by the agent during
+  name) built at run time from the app's own IM sessions, plus — in Halo 3.0 and later — the
+  chats the user added from other bots (next point). Targets are chosen by the agent during
   the run; they are never pre-declared in the spec.
+- **Chats another bot already knows** (Halo 3.0 and later): in the digital human's settings,
+  **Reachable Contacts** (可联系的联系人) → **Add from existing chats** lists the groups and
+  direct chats that other bots on this machine already know. A ticked chat becomes a push
+  target for this digital human without having to message it first, and gets its own
+  **Auto-sync run result** (自动同步运行结果) switch, off by default. Replies in that chat still
+  go to the digital human its bot is bound to; removing the chat only stops this digital
+  human's pushes.
 - If `im-push` is granted but no contact exists yet, the tool is simply absent. The correct
   guidance is then: "connect an IM channel in Settings → Message Channels and have someone
-  message this digital human once" — not a spec change
-  (`src/main/apps/runtime/prompt/capabilities.ts`).
+  message this digital human once" — or, on 3.0 and later, add a chat another bot already
+  knows as above — not a spec change (`src/main/apps/runtime/prompt/capabilities.ts`).
+- **Delivered pushes are recorded** (Halo 3.0 and later): a message or file sent with
+  `notify_bot`, a pushed run result and a question for the owner are written into that chat's
+  history in Halo under a **Sent proactively** (主动发送) label, and become the chat's latest
+  message. Before 3.0 they were not, so a reply to a push showed up there without the message
+  it answered.
 
 A and B are independent: an app can be conversational without pushing, or push from scheduled
 runs without ever being bound to a chat.
@@ -59,9 +72,8 @@ runs without ever being bound to a chat.
 
 - ~~"Should it respond to every message, or only when @-mentioned / prefixed with X?"~~ — In
   WeCom group chats the platform only delivers `@`-mentioned messages to the bot; Halo never
-  sees the rest. `dispatch-inbound.ts` strips the leading mention with the note *"WeCom (and
-  similar IM platforms) deliver a group message to the bot only when the bot is mentioned...
-  no identity matching needed."* Nothing to configure.
+  sees the rest. Nothing to configure — and the mentions stay in the text the digital human
+  reads (`message-channels/wecom-bot.md` §5).
 - ~~"Which subscription type receives WeCom messages?"~~ — None. Omit `subscriptions`. Do not
   use `source.type: "wecom"`; it is schema-only with no event producer.
 - ~~"Which chat IDs should trigger this?"~~ — Scoping is implicit in which bot instance the
@@ -84,6 +96,17 @@ These behaviors are real but live on the IM channel *instance*, not the App Spec
   group chats never auto-claim.
 - `/halo-stop` (also `/stop`, `/halo-cancel`) aborts the running generation for that chat;
   `/halo-clear` (also `/clear`, `/halo-reset`) resets its context. Both are handled before the
-  message reaches the AI.
+  message reaches the AI, case-insensitively. In a direct chat the command must be the whole
+  message. In a group it also counts as the **last word of a message that starts with `@`** —
+  `@Halo AI 团队 /stop`, `@Halo @助手 /clear` — because group messages carry the bot's mention
+  and a bot name may contain spaces (Halo 3.0 and later; `message-channels/wecom-bot.md` §5).
+  Text after the command, no `@` at the start, or no slash makes it an ordinary message.
+- When the app asks for a decision (an escalation, `report_to_user`), the bound bot sends the
+  question to its owner's direct chat with a number, and the owner can answer right there with
+  `/answer <number> <answer>` — handled before the AI, like the commands above, and the same as
+  answering in Halo (Halo 3.0 and later). Groups only hear that a question is waiting. Nothing in
+  the spec configures this; who receives the question and who may answer follows the instance's
+  permission control (`message-channels/index.md` §2). Keep `escalation.enabled` on as usual — the
+  owner no longer has to open Halo to unblock it.
 - A message arriving while the app is still answering is buffered and merged into the next
   round — never dropped, never run concurrently.

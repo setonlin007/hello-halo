@@ -93,7 +93,6 @@ export function ModelConfigPanel({
   const catalogContextWindow = catalogCapability?.contextWindow
   const catalogMaxOutputTokens = catalogCapability?.maxOutputTokens
   const hasCatalogData = catalogContextWindow !== undefined || catalogMaxOutputTokens !== undefined
-  const canEnableExtendedContext = (effective?.contextWindow ?? 0) > 200_000
 
   // ── Reasoning effort presentation ──────────────────────────────────────
   const effortSelectValue = effective?.reasoningEffort ?? ''
@@ -439,31 +438,6 @@ export function ModelConfigPanel({
                     </label>
                   </div>
 
-                  {canEnableExtendedContext && !/\[1m\]$/i.test(modelId) && (
-                    <div>
-                      <label className="flex items-center gap-2 cursor-pointer select-none">
-                        <input
-                          type="checkbox"
-                          checked={userOverride.extendedContext === true}
-                          onChange={e => updateField('extendedContext', e.target.checked)}
-                          className="w-4 h-4 rounded border-border accent-primary cursor-pointer"
-                        />
-                        <span className="text-sm text-foreground">{t('Enable context above 200K')}</span>
-                      </label>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {t('May require provider access and may change pricing. Only enable it when your plan supports this context window.')}
-                      </p>
-                      {userOverride.extendedContext !== true && (
-                        <div className="flex items-start gap-1.5 mt-1 text-xs text-amber-600 dark:text-amber-500">
-                          <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
-                          <span>
-                            {t('Until this is enabled, the context window above is capped at 200,000 tokens.')}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
                   {/* Reasoning effort */}
                   <div>
                     <label className="block text-xs font-medium text-muted-foreground mb-1">
@@ -484,7 +458,7 @@ export function ModelConfigPanel({
                       )}
                     </select>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {t('How hard this model thinks while Deep Thinking is on.')}
+                      {t('How hard this model thinks unless a conversation picks its own level.')}
                     </p>
                     {isCustomEffort && (
                       <div className="flex items-start gap-1.5 mt-1 text-xs text-amber-600 dark:text-amber-500">

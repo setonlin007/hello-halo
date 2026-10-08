@@ -12,7 +12,8 @@
  * IM Sessions are NOT shown here — they live in the digital human config.
  */
 
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
+import type { TFunction } from 'i18next'
 import {
   Mail, MessageSquare, Bell, Webhook, Loader2,
   CheckCircle, XCircle, ChevronDown, RefreshCw,
@@ -38,6 +39,7 @@ import {
   type ImChannelInstanceStatus,
 } from '../../../shared/types/im-channel'
 import { ChannelBackendSelect, ChannelBackendName } from './ChannelBackendSelect'
+import { Disclosure } from '../ui/Disclosure'
 import type {
   ChannelBackendApp,
   ChannelBackendTeam,
@@ -48,8 +50,12 @@ import { WecomScanAuthDialog } from './WecomScanAuthDialog'
 import { FeishuInstanceCard } from './FeishuInstanceCard'
 import { FeishuScanAuthDialog } from './FeishuScanAuthDialog'
 import { ImInstancePermissionSection } from './ImInstancePermissionSection'
+import { defaultGuestPolicy } from '../../../shared/apps/capability-policy'
 import type { ImPermissionDefaults } from './ImInstancePermissionSection'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/Popover'
+import { HelpHint } from '../ui/HelpHint'
+import { ImProcessingNoticeRow } from './ImProcessingNoticeRow'
+import { effectiveSmtpPort, parseSmtpPort, smtpPortAfterSecureChange } from './smtp-port'
 
 // ============================================
 // Types
@@ -92,7 +98,8 @@ interface NotifyChannelDef {
 // Notification Channel Definitions
 // ============================================
 
-function buildNotifyChannelDefs(): NotifyChannelDef[] {
+/** Labels are literal t() calls so the translation extractor finds them; sample values stay as typed. */
+function buildNotifyChannelDefs(t: TFunction): NotifyChannelDef[] {
   return [
     {
       id: 'email',
@@ -101,14 +108,14 @@ function buildNotifyChannelDefs(): NotifyChannelDef[] {
       labelKey: NOTIFICATION_CHANNEL_META.email.labelKey,
       descriptionKey: NOTIFICATION_CHANNEL_META.email.descriptionKey,
       fields: [
-        { key: 'smtp.host', label: 'SMTP Host', type: 'text', placeholder: 'smtp.gmail.com', required: true, nested: 'smtp.host' },
-        { key: 'smtp.port', label: 'SMTP Port', type: 'number', placeholder: '465', required: true, nested: 'smtp.port' },
-        { key: 'smtp.secure', label: 'Use SSL/TLS', type: 'toggle', nested: 'smtp.secure' },
-        { key: 'smtp.user', label: 'Username', type: 'text', placeholder: 'user@example.com', required: true, nested: 'smtp.user' },
-        { key: 'smtp.password', label: 'Password', type: 'password', placeholder: 'App password', required: true, nested: 'smtp.password' },
-        { key: 'defaultTo', label: 'Default Recipient', type: 'text', placeholder: 'recipient@example.com', required: true },
-        { key: 'caldavUrl', label: 'CalDAV URL', type: 'text', placeholder: 'https://{host}/dav/users/{email}/calendars/default/', group: 'advanced' },
-        { key: 'tlsCiphers', label: 'TLS Ciphers', type: 'text', placeholder: 'Auto (system default)', group: 'advanced' },
+        { key: 'smtp.host', label: t('SMTP Host'), type: 'text', placeholder: 'smtp.gmail.com', required: true, nested: 'smtp.host' },
+        { key: 'smtp.port', label: t('SMTP Port'), type: 'number', required: true, nested: 'smtp.port' },
+        { key: 'smtp.secure', label: t('Use SSL/TLS'), type: 'toggle', nested: 'smtp.secure' },
+        { key: 'smtp.user', label: t('Username'), type: 'text', placeholder: 'user@example.com', required: true, nested: 'smtp.user' },
+        { key: 'smtp.password', label: t('Password'), type: 'password', placeholder: t('App password'), required: true, nested: 'smtp.password' },
+        { key: 'defaultTo', label: t('Default Recipient'), type: 'text', placeholder: 'recipient@example.com', required: true },
+        { key: 'caldavUrl', label: t('CalDAV URL'), type: 'text', placeholder: 'https://{host}/dav/users/{email}/calendars/default/', group: 'advanced' },
+        { key: 'tlsCiphers', label: t('TLS Ciphers'), type: 'text', placeholder: t('Auto (system default)'), group: 'advanced' },
       ],
     },
     {
@@ -118,11 +125,11 @@ function buildNotifyChannelDefs(): NotifyChannelDef[] {
       labelKey: NOTIFICATION_CHANNEL_META.wecom.labelKey,
       descriptionKey: NOTIFICATION_CHANNEL_META.wecom.descriptionKey,
       fields: [
-        { key: 'corpId', label: 'Corp ID', type: 'text', placeholder: 'ww...', required: true },
-        { key: 'agentId', label: 'Agent ID', type: 'number', placeholder: '1000002', required: true },
-        { key: 'secret', label: 'Secret', type: 'password', required: true },
-        { key: 'defaultToUser', label: 'Default User ID', type: 'text', placeholder: 'userid (optional)' },
-        { key: 'defaultToParty', label: 'Default Party ID', type: 'text', placeholder: 'party id (optional)' },
+        { key: 'corpId', label: t('Corp ID'), type: 'text', placeholder: 'ww...', required: true },
+        { key: 'agentId', label: t('Agent ID'), type: 'number', placeholder: '1000002', required: true },
+        { key: 'secret', label: t('Secret'), type: 'password', required: true },
+        { key: 'defaultToUser', label: t('Default User ID'), type: 'text', placeholder: t('userid (optional)') },
+        { key: 'defaultToParty', label: t('Default Party ID'), type: 'text', placeholder: t('party id (optional)') },
       ],
     },
     {
@@ -132,11 +139,11 @@ function buildNotifyChannelDefs(): NotifyChannelDef[] {
       labelKey: NOTIFICATION_CHANNEL_META.dingtalk.labelKey,
       descriptionKey: NOTIFICATION_CHANNEL_META.dingtalk.descriptionKey,
       fields: [
-        { key: 'appKey', label: 'App Key', type: 'text', required: true },
-        { key: 'appSecret', label: 'App Secret', type: 'password', required: true },
-        { key: 'agentId', label: 'Agent ID', type: 'number', placeholder: '0', required: true },
-        { key: 'robotCode', label: 'Robot Code', type: 'text', placeholder: 'Robot code (optional)' },
-        { key: 'defaultChatId', label: 'Default Chat ID', type: 'text', placeholder: 'Chat ID (optional)' },
+        { key: 'appKey', label: t('App Key'), type: 'text', required: true },
+        { key: 'appSecret', label: t('App Secret'), type: 'password', required: true },
+        { key: 'agentId', label: t('Agent ID'), type: 'number', placeholder: '0', required: true },
+        { key: 'robotCode', label: t('Robot Code'), type: 'text', placeholder: t('Robot code (optional)') },
+        { key: 'defaultChatId', label: t('Default Chat ID'), type: 'text', placeholder: t('Chat ID (optional)') },
       ],
     },
     {
@@ -146,10 +153,10 @@ function buildNotifyChannelDefs(): NotifyChannelDef[] {
       labelKey: NOTIFICATION_CHANNEL_META.feishu.labelKey,
       descriptionKey: NOTIFICATION_CHANNEL_META.feishu.descriptionKey,
       fields: [
-        { key: 'appId', label: 'App ID', type: 'text', required: true },
-        { key: 'appSecret', label: 'App Secret', type: 'password', required: true },
-        { key: 'defaultChatId', label: 'Default Chat ID', type: 'text', placeholder: 'Chat ID (optional)' },
-        { key: 'defaultUserId', label: 'Default User ID', type: 'text', placeholder: 'User open_id (optional)' },
+        { key: 'appId', label: t('App ID'), type: 'text', required: true },
+        { key: 'appSecret', label: t('App Secret'), type: 'password', required: true },
+        { key: 'defaultChatId', label: t('Default Chat ID'), type: 'text', placeholder: t('Chat ID (optional)') },
+        { key: 'defaultUserId', label: t('Default User ID'), type: 'text', placeholder: t('User open_id (optional)') },
       ],
     },
     {
@@ -159,19 +166,17 @@ function buildNotifyChannelDefs(): NotifyChannelDef[] {
       labelKey: NOTIFICATION_CHANNEL_META.webhook.labelKey,
       descriptionKey: NOTIFICATION_CHANNEL_META.webhook.descriptionKey,
       fields: [
-        { key: 'url', label: 'URL', type: 'text', placeholder: 'https://example.com/webhook', required: true },
+        { key: 'url', label: t('URL'), type: 'text', placeholder: 'https://example.com/webhook', required: true },
         {
-          key: 'method', label: 'Method', type: 'select',
+          key: 'method', label: t('Method'), type: 'select',
           options: [{ value: 'POST', label: 'POST' }, { value: 'PUT', label: 'PUT' }],
         },
-        { key: 'headers', label: 'Headers (JSON)', type: 'text', placeholder: '{"Authorization": "Bearer ..."}' },
-        { key: 'secret', label: 'HMAC Secret', type: 'password', placeholder: 'Signing secret (optional)' },
+        { key: 'headers', label: t('Headers (JSON)'), type: 'text', placeholder: '{"Authorization": "Bearer ..."}' },
+        { key: 'secret', label: t('HMAC Secret'), type: 'password', placeholder: t('Signing secret (optional)') },
       ],
     },
   ]
 }
-
-const NOTIFY_CHANNEL_DEFS = buildNotifyChannelDefs()
 
 // ============================================
 // Helpers
@@ -225,7 +230,7 @@ function ChannelField({ field, value, onChange, docs }: ChannelFieldProps) {
     const checked = Boolean(value)
     return (
       <div className="flex items-center justify-between">
-        <label className="text-sm text-muted-foreground">{t(field.label)}</label>
+        <label className="text-sm text-muted-foreground">{field.label}</label>
         <label className="relative inline-flex items-center cursor-pointer">
           <input
             type="checkbox"
@@ -248,7 +253,7 @@ function ChannelField({ field, value, onChange, docs }: ChannelFieldProps) {
   if (field.type === 'select') {
     return (
       <div className="space-y-1">
-        <label className="text-sm text-muted-foreground">{t(field.label)}</label>
+        <label className="text-sm text-muted-foreground">{field.label}</label>
         <select
           value={(value as string) || field.options?.[0]?.value || ''}
           onChange={(e) => onChange(e.target.value)}
@@ -297,7 +302,7 @@ function ChannelField({ field, value, onChange, docs }: ChannelFieldProps) {
   return (
     <div className="space-y-1">
       <label className="text-sm text-muted-foreground">
-        {t(field.label)}
+        {field.label}
         {field.required && <span className="text-red-400 ml-0.5">*</span>}
       </label>
       <input
@@ -305,7 +310,7 @@ function ChannelField({ field, value, onChange, docs }: ChannelFieldProps) {
         value={displayValue}
         onChange={(e) => handleChange(e.target.value)}
         onBlur={handleBlur}
-        placeholder={field.placeholder ? t(field.placeholder) : undefined}
+        placeholder={field.placeholder}
         className="w-full bg-muted border border-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary"
       />
       {docs && (
@@ -320,6 +325,39 @@ function ChannelField({ field, value, onChange, docs }: ChannelFieldProps) {
           <ExternalLink className="w-3 h-3" />
         </button>
       )}
+    </div>
+  )
+}
+
+interface SmtpPortFieldProps {
+  label: string
+  value: string
+  invalid: boolean
+  onChange: (text: string) => void
+  onBlur: () => void
+}
+
+/** Shows the text being typed so the field can be cleared; only a usable port is saved. */
+function SmtpPortField({ label, value, invalid, onChange, onBlur }: SmtpPortFieldProps) {
+  const { t } = useTranslation()
+  return (
+    <div className="space-y-1">
+      <label className="text-sm text-muted-foreground">
+        {label}
+        <span className="text-red-400 ml-0.5">*</span>
+      </label>
+      <input
+        type="number"
+        inputMode="numeric"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        aria-invalid={invalid}
+        className={`w-full bg-muted border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary ${
+          invalid ? 'border-red-500' : 'border-border'
+        }`}
+      />
+      {invalid && <p className="text-xs text-red-500">{t('Please enter the SMTP port')}</p>}
     </div>
   )
 }
@@ -545,6 +583,13 @@ function InstanceCard({
     onChange({ ...instance, replyScope: scope as ImChannelInstanceConfig['replyScope'] })
   }
 
+  const handleProcessingNoticeChange = () => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    setDraft(null)
+    // On by default (undefined). Toggle off → explicit false; toggle on → undefined.
+    onChange({ ...instance, processingNotice: instance.processingNotice === false ? undefined : false })
+  }
+
   const isStreamingEnabled = instance.streaming === true
   const isQuoteReplyEnabled = (cfg.quoteReply as boolean) !== false
   const replyScope = instance.replyScope ?? 'all'
@@ -715,7 +760,10 @@ function InstanceCard({
 
           {/* Reply scope */}
           <div className="space-y-1">
-            <label className="text-sm text-muted-foreground">{t('Reply Scope')}</label>
+            <div className="flex items-center gap-1">
+              <label className="text-sm text-muted-foreground">{t('Reply Scope')}</label>
+              <HelpHint label={t('About this setting')} text={t('Decides where the digital human replies. All messages: it replies when @mentioned in groups and to direct messages. Group chats only: direct messages are declined. Direct messages only: group messages get no reply.')} />
+            </div>
             <select
               value={replyScope}
               onChange={(e) => handleReplyScopeChange(e.target.value)}
@@ -740,7 +788,10 @@ function InstanceCard({
           {/* Streaming toggle */}
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <p className="text-sm text-muted-foreground">{t('Streaming')}</p>
+              <div className="flex items-center gap-1">
+                <p className="text-sm text-muted-foreground">{t('Streaming')}</p>
+                <HelpHint label={t('About this setting')} text={t('On: the reply is written into one message as it is produced. Off: one complete reply is sent when it is done. In group chats, Quote Reply must be on as well.')} />
+              </div>
               <p className="text-xs text-muted-foreground/70">
                 {isStreamingEnabled
                   ? t('Shows thinking process in real-time')
@@ -773,7 +824,10 @@ function InstanceCard({
           {/* Quote Reply toggle */}
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <p className="text-sm text-muted-foreground">{t('Quote Reply (Group)')}</p>
+              <div className="flex items-center gap-1">
+                <p className="text-sm text-muted-foreground">{t('Quote Reply (Group)')}</p>
+                <HelpHint label={t('About this setting')} text={t('On: a reply in a group quotes the message it answers, so it is clear whom it answers. Off: replies are sent as plain messages, and streaming cannot be used.')} />
+              </div>
               <p className="text-xs text-muted-foreground/70">
                 {isQuoteReplyEnabled
                   ? t('Group replies quote the original message')
@@ -796,6 +850,12 @@ function InstanceCard({
               </div>
             </label>
           </div>
+
+          <ImProcessingNoticeRow
+            on={instance.processingNotice !== false}
+            streaming={isStreamingEnabled}
+            onToggle={handleProcessingNoticeChange}
+          />
 
           {/* ── Permission Control ── */}
           <ImInstancePermissionSection instance={instance} onChange={onChange} onDebouncedChange={scheduleChange} permissionDefaults={permissionDefaults} />
@@ -864,7 +924,6 @@ function NotifyChannelCard({
   const { t } = useTranslation()
   const Icon = def.icon
   const isEnabled = Boolean(channelConfig?.enabled)
-  const [showAdvanced, setShowAdvanced] = useState(false)
 
   // The help link answers "where do I get this credential", so it hangs off the
   // channel's secret input rather than a hard-coded field name.
@@ -900,6 +959,68 @@ function NotifyChannelCard({
   const getFieldValue = (field: FieldDef): unknown => {
     const path = field.nested || field.key
     return getNestedValue(currentConfig || {}, path)
+  }
+
+  // SMTP port: typed text that is not a usable port yet; null shows the port in use.
+  const [portText, setPortText] = useState<string | null>(null)
+  const [portTestRefused, setPortTestRefused] = useState(false)
+  const secure = Boolean(getNestedValue(currentConfig || {}, 'smtp.secure'))
+  const storedPort = getNestedValue(currentConfig || {}, 'smtp.port')
+  const portShown = portText ?? String(effectiveSmtpPort(storedPort, secure))
+  const portInvalid = def.notifyType === 'email' && parseSmtpPort(portShown) === null
+
+  const handlePortChange = (text: string) => {
+    setPortText(text)
+    setPortTestRefused(false)
+    const port = parseSmtpPort(text)
+    if (port !== null && port !== parseSmtpPort(storedPort)) {
+      handleFieldChange('smtp.port', port, 'smtp.port')
+    }
+  }
+
+  const handleSecureChange = (value: unknown) => {
+    let updated = setNestedValue({ ...currentConfig }, 'smtp.secure', value)
+    const port = smtpPortAfterSecureChange(storedPort, secure)
+    if (port !== undefined && port !== parseSmtpPort(storedPort)) {
+      updated = setNestedValue(updated, 'smtp.port', port)
+    }
+    setPortText(null)
+    setPortTestRefused(false)
+    scheduleSave(updated)
+  }
+
+  const handleTest = () => {
+    if (portInvalid) {
+      setPortTestRefused(true)
+      return
+    }
+    onTest(def.notifyType)
+  }
+
+  const renderField = (field: FieldDef, fieldDocs?: ChannelDocsLink) => {
+    if (field.key === 'smtp.port') {
+      return (
+        <SmtpPortField
+          key={field.key}
+          label={field.label}
+          value={portShown}
+          invalid={portInvalid}
+          onChange={handlePortChange}
+          onBlur={() => { if (!portInvalid) setPortText(null) }}
+        />
+      )
+    }
+    return (
+      <ChannelField
+        key={field.key}
+        field={field}
+        value={getFieldValue(field)}
+        onChange={(value) => field.key === 'smtp.secure'
+          ? handleSecureChange(value)
+          : handleFieldChange(field.key, value, field.nested)}
+        docs={fieldDocs}
+      />
+    )
   }
 
   const statusLabel = isEnabled ? t('Configured') : t('Not configured')
@@ -947,57 +1068,38 @@ function NotifyChannelCard({
           </div>
 
           <div className="space-y-3">
-            {def.fields.filter(f => !f.group).map((field) => (
-              <ChannelField
-                key={field.key}
-                field={field}
-                value={getFieldValue(field)}
-                onChange={(value) => handleFieldChange(field.key, value, field.nested)}
-                docs={field.key === credentialFieldKey ? docs : undefined}
-              />
-            ))}
+            {def.fields.filter(f => !f.group).map((field) =>
+              renderField(field, field.key === credentialFieldKey ? docs : undefined))}
           </div>
 
           {/* Advanced fields (collapsible) */}
           {def.fields.some(f => f.group === 'advanced') && (
             <div className="border-t border-border/60 pt-3">
-              <button
-                type="button"
-                onClick={() => setShowAdvanced(!showAdvanced)}
-                className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-              >
-                <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${showAdvanced ? 'rotate-180' : ''}`} />
-                {t('Advanced')}
-              </button>
-              {showAdvanced && (
-                <div className="mt-3 space-y-3 animate-in slide-in-from-top-1 duration-150">
-                  {def.fields.filter(f => f.group === 'advanced').map((field) => (
-                    <ChannelField
-                      key={field.key}
-                      field={field}
-                      value={getFieldValue(field)}
-                      onChange={(value) => handleFieldChange(field.key, value, field.nested)}
-                    />
-                  ))}
-                  <p className="text-[11px] text-muted-foreground leading-relaxed">
-                    {t('CalDAV URL enables calendar tools. Supports {host} and {email} placeholders.')}
-                  </p>
-                </div>
-              )}
+              <Disclosure title={t('Advanced')} contentClassName="space-y-3">
+                {def.fields.filter(f => f.group === 'advanced').map((field) => renderField(field))}
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  {t('CalDAV URL enables calendar tools. Supports {host} and {email} placeholders.')}
+                </p>
+              </Disclosure>
             </div>
           )}
 
           <div className="flex items-center gap-3 pt-2 flex-wrap">
             <button
               type="button"
-              onClick={() => onTest(def.notifyType)}
+              onClick={handleTest}
               disabled={isTesting || !isEnabled}
               className="flex items-center gap-2 px-3 py-1.5 text-sm bg-primary/10 text-primary hover:bg-primary/20 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isTesting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bell className="w-4 h-4" />}
               {isTesting ? t('Testing...') : t('Test')}
             </button>
-            {testResult && (
+            {portTestRefused && portInvalid ? (
+              <div className="flex items-center gap-1.5 text-sm text-red-500">
+                <XCircle className="w-4 h-4" />
+                <span>{t('Please enter the SMTP port')}</span>
+              </div>
+            ) : testResult && (
               <div className={`flex items-center gap-1.5 text-sm ${testResult.success ? 'text-green-500' : 'text-red-500'}`}>
                 {testResult.success ? <CheckCircle className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
                 <span>{testResult.success ? t('Test passed') : testResult.error || t('Test failed')}</span>
@@ -1016,6 +1118,7 @@ function NotifyChannelCard({
 
 export function MessageChannelsSection({ config, setConfig }: MessageChannelsSectionProps) {
   const { t } = useTranslation()
+  const notifyChannelDefs = useMemo(() => buildNotifyChannelDefs(t), [t])
 
   const [expandedChannels, setExpandedChannels] = useState<Set<string>>(new Set())
   const [expandedInstances, setExpandedInstances] = useState<Set<string>>(new Set())
@@ -1171,9 +1274,7 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
       replyScope: 'all', // Default to all messages
       permissionEnabled: pd?.defaultEnabled ?? false,
       ...(pd?.defaultEnabled ? {
-        guestPolicy: pd.defaultGuestAccess
-          ? { allowedTools: pd.defaultGuestPolicy?.allowedTools ?? [] }
-          : undefined,
+        guestPolicy: pd.defaultGuestAccess ? defaultGuestPolicy(pd.defaultGuestPolicy) : undefined,
       } : {}),
     }
     const newInstances = [...instances, newInstance]
@@ -1236,9 +1337,7 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
       replyScope: 'all',
       permissionEnabled: pd?.defaultEnabled ?? false,
       ...(pd?.defaultEnabled ? {
-        guestPolicy: pd.defaultGuestAccess
-          ? { allowedTools: pd.defaultGuestPolicy?.allowedTools ?? [] }
-          : undefined,
+        guestPolicy: pd.defaultGuestAccess ? defaultGuestPolicy(pd.defaultGuestPolicy) : undefined,
       } : {}),
     }
     saveInstances([...instances, newInstance])
@@ -1660,7 +1759,7 @@ export function MessageChannelsSection({ config, setConfig }: MessageChannelsSec
         </div>
 
         {/* ── Notification channels (one-way) ───────────────────────── */}
-        {NOTIFY_CHANNEL_DEFS.map((def) => (
+        {notifyChannelDefs.map((def) => (
           <NotifyChannelCard
             key={def.id}
             def={def}

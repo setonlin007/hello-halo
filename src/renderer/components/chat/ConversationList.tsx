@@ -4,11 +4,11 @@
  * Supports drag-to-resize, inline title editing, and conversation management.
  */
 
-import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, memo } from 'react'
 import { createPortal } from 'react-dom'
-import { Virtuoso } from 'react-virtuoso'
+import { Virtuoso, type Components } from 'react-virtuoso'
 import { Plus } from '../icons/ToolIcons'
-import { EllipsisVertical, Pin, Pencil, Trash2, Search, ChevronRight } from 'lucide-react'
+import { EllipsisVertical, Pin, Pencil, Trash2, ChevronRight } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 import { useChatStore, useAllConversationStatuses } from '../../stores/chat.store'
 import { useSpaceStore } from '../../stores/space.store'
@@ -20,9 +20,13 @@ import { TaskStatusDot } from '../pulse/TaskStatusDot'
 import { EngineBadge } from './EngineBadge'
 import { AutomationAvatar } from '../apps/AutomationAvatar'
 import { useAppChatConversationRows, type AppChatConversationRow } from '../../hooks/useAppChatConversationRows'
+import { appChatSessionLabel, formatRowTime } from './conversation-row-format'
 import { parseAppChatKey } from '../../../shared/apps/im-keys'
 import { NATIVE_SESSION_CHANNEL, NATIVE_DEFAULT_CHAT_ID } from '../../../shared/types/im-channel'
 import type { ConversationMeta } from '../../types'
+import { markEntry, trackHome, trackNavigate } from '../../services/home-telemetry'
+import { openDigitalHumanChat } from '../../utils/conversation-navigation'
+import { openPersonActivity } from '../../utils/people-navigation'
 
 // Width constraints (in pixels)
 const MIN_WIDTH = 140
@@ -32,13 +36,12 @@ const DEFAULT_WIDTH = 260
 // icon-strip view the canvas-open `collapsed` prop uses — dragging it back
 // out past the same threshold restores the normal list.
 const DRAG_COLLAPSE_THRESHOLD = 100
-const SEARCH_DEBOUNCE_MS = 200
 const clampWidth = (v: number) => Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, v))
 
 interface ConversationListProps {
-  /** Canvas-open collapsed mode — 56px icon strip: search/grouping/pin all
-   * hidden, each conversation is just a status dot (prototype's
-   * `.body.canvas-open .conv`). Resizing is disabled in this mode. */
+  /** Canvas-open collapsed mode — 56px icon strip: grouping/pin hidden,
+   * each conversation is just a status dot (prototype's
+   * `.body.canvas-open .conv`). The resize handle can still drag it open. */
   collapsed?: boolean
 }
 
@@ -55,26 +58,22 @@ function appChatRegistryTarget(row: AppChatConversationRow): { channel: string; 
     : { channel: NATIVE_SESSION_CHANNEL, chatId: NATIVE_DEFAULT_CHAT_ID }
 }
 
-/**
- * Row timestamp: clock time for today, weekday-less date beyond it. Kept
- * narrower than `formatTimeAgo` because it has to fit beside a title in a
- * 140–360px sidebar without truncating it.
- */
-function formatRowTime(timestamp: string | number, t: (s: string) => string): string {
-  const d = new Date(timestamp)
-  const ms = d.getTime()
-  if (!ms) return ''
-  const now = new Date()
-  if (d.toDateString() === now.toDateString()) {
-    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+/** What the hover card shows for a row, in either list form. */
+function hoverCardFor(
+  row: Extract<ConversationRow, { type: 'item' | 'dh-item' }>,
+  t: (s: string, opts?: Record<string, unknown>) => string,
+): { label: string; owner?: string; time?: string } {
+  if (row.type === 'dh-item') {
+    return {
+      label: appChatSessionLabel(row.row, t),
+      owner: row.row.digitalHumanName,
+      time: formatRowTime(row.row.updatedAt, t),
+    }
   }
-  const yesterday = new Date(now)
-  yesterday.setDate(now.getDate() - 1)
-  if (d.toDateString() === yesterday.toDateString()) return t('Yesterday')
-  if (d.getFullYear() === now.getFullYear()) {
-    return d.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })
+  return {
+    label: row.conversation.title || t('New conversation'),
+    time: formatRowTime(row.conversation.updatedAt, t),
   }
-  return d.toLocaleDateString(undefined, { year: '2-digit', month: 'numeric', day: 'numeric' })
 }
 
 /** Flattened row fed to `Virtuoso` — headers and items share one list instead
@@ -85,13 +84,81 @@ type ConversationRow =
   /** `hint` is hover-only: the distinction between sections is one-time
    *  knowledge, not worth permanent vertical space in a 140px-wide sidebar.
    *  Omitted where the label already says everything. */
-  | { type: 'header'; key: string; label: string; hint?: string }
+  | { type: 'header'; key: string; section: ConversationSection; label: string; hint?: string; collapsed: boolean }
   | { type: 'item'; key: string; conversation: ConversationMeta }
-  | { type: 'dh-header'; key: string; appId: string; name: string; uninstalled: boolean; collapsed: boolean; count: number }
+  | { type: 'dh-header'; key: string; appId: string; name: string; uninstalled: boolean; collapsed: boolean }
   /** `standalone` rows sit outside their digital human's section (i.e. in
    *  Pinned), so they carry the avatar/name context the section header would
    *  otherwise provide. */
   | { type: 'dh-item'; key: string; row: AppChatConversationRow; standalone: boolean }
+  /** Reveals the next page of a long Pinned section. */
+  | { type: 'more'; key: string; remaining: number }
+
+type ConversationSection = 'pinned' | 'digital-humans' | 'conversations'
+
+/** Pinned rows shown per page, so a long pin list doesn't push the rest out of view. */
+const PINNED_PAGE_SIZE = 5
+
+/**
+ * The scroller takes no padding: Virtuoso's viewport is absolutely positioned
+ * at top 0 and width 100% of the scroller's padding box, so side padding shifts
+ * rows right without narrowing them (clipping their right edge) and vertical
+ * padding is ignored. Side spacing lives on each row instead, and the top and
+ * bottom spacing are Header/Footer spacers. `flow-root` keeps a header row's
+ * top margin inside the row, where Virtuoso measures it.
+ */
+const PaddedRow: Components<ConversationRow>['Item'] = ({ children, item: _item, context: _context, ...props }) => (
+  <div {...props} className="flow-root px-2 pb-0.5">{children}</div>
+)
+const listComponents: Components<ConversationRow> = {
+  Item: PaddedRow,
+  Header: () => <div className="h-1" />,
+  Footer: () => <div className="h-3" />,
+}
+
+// Titles run to the row's edge and fade out instead of ending in an ellipsis;
+// the hover actions float over that edge rather than reserving room for it.
+const ROW_TITLE = 'flex-1 min-w-0 overflow-hidden whitespace-nowrap [mask-image:linear-gradient(to_right,black_calc(100%_-_20px),transparent)]'
+// Shown only while the row itself is highlighted (hover, open menu, keyboard
+// focus), since their fade-in backdrop is the row's highlight colour.
+const ROW_ACTIONS = 'absolute inset-y-0 right-1.5 flex items-center gap-0.5 pl-5 bg-[linear-gradient(to_right,transparent,hsl(var(--secondary))_20px)] opacity-0 pointer-events-none transition-opacity group-hover:opacity-100 group-hover:pointer-events-auto group-data-[menu-open]:opacity-100 group-data-[menu-open]:pointer-events-auto has-[:focus-visible]:opacity-100 has-[:focus-visible]:pointer-events-auto'
+const ROW_HIGHLIGHT = 'data-[menu-open]:bg-secondary data-[menu-open]:text-foreground has-[:focus-visible]:bg-secondary'
+
+/** A digital human's face, clickable through to its page (activity thread). */
+function PersonAvatarLink({ appId, name, size, dimmed, disabled, className }: {
+  appId: string
+  name: string
+  size: number
+  /** Half strength unless this digital human's conversation is open. */
+  dimmed: boolean
+  disabled?: boolean
+  className?: string
+}) {
+  const { t } = useTranslation()
+  const face = <AutomationAvatar name={name} size={size} />
+  if (disabled) {
+    return <span className={cn('flex shrink-0', dimmed && 'opacity-50', className)}>{face}</span>
+  }
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation()
+        trackNavigate('apps', 'conversation_list', 'home_conv_dh')
+        openPersonActivity(appId)
+      }}
+      title={t('View {{name}}', { name })}
+      aria-label={t('View {{name}}', { name })}
+      className={cn(
+        'flex shrink-0 rounded-full transition-[opacity,transform] ease-halo hover:opacity-100 hover:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+        dimmed && 'opacity-50',
+        className
+      )}
+    >
+      {face}
+    </button>
+  )
+}
 
 /**
  * Build the full flat row list:
@@ -105,6 +172,10 @@ function buildConversationRows(
   conversations: ConversationMeta[],
   appChatRows: AppChatConversationRow[],
   collapsedApps: Set<string>,
+  collapsedSections: Set<ConversationSection>,
+  pinnedShown: number,
+  /** The open conversation's id; always listed even past the Pinned page. */
+  activeId: string | undefined,
   t: (key: string) => string
 ): ConversationRow[] {
   const pinnedConvs: ConversationMeta[] = []
@@ -129,14 +200,27 @@ function buildConversationRows(
 
   const out: ConversationRow[] = []
 
-  if (pinnedConvs.length || pinnedDh.length) {
-    out.push({ type: 'header', key: 'header:pinned', label: t('Pinned') })
-    for (const conv of pinnedConvs) out.push({ type: 'item', key: conv.id, conversation: conv })
-    for (const row of pinnedDh) out.push({ type: 'dh-item', key: row.id, row, standalone: true })
+  const header = (section: ConversationSection, label: string, hint?: string): boolean => {
+    const collapsed = collapsedSections.has(section)
+    out.push({ type: 'header', key: `header:${section}`, section, label, hint, collapsed })
+    return !collapsed
   }
 
-  if (byApp.size > 0) {
-    out.push({ type: 'header', key: 'header:digital-humans', label: t('Digital Humans'), hint: t('Conversations with digital humans available in this workspace') })
+  if ((pinnedConvs.length || pinnedDh.length) && header('pinned', t('Pinned'))) {
+    // One recency order across both kinds, so neither can push the other
+    // entirely past the first page.
+    const pinned = [
+      ...pinnedConvs.map(conv => ({ at: Date.parse(conv.updatedAt) || 0, row: { type: 'item' as const, key: conv.id, conversation: conv } })),
+      ...pinnedDh.map(row => ({ at: row.updatedAt, row: { type: 'dh-item' as const, key: row.id, row, standalone: true } })),
+    ].sort((a, b) => b.at - a.at).map(entry => entry.row as ConversationRow)
+    const shown = pinned.slice(0, pinnedShown)
+    const active = pinned.slice(pinnedShown).find(row => row.key === activeId)
+    if (active) shown.push(active)
+    out.push(...shown)
+    if (pinned.length > shown.length) out.push({ type: 'more', key: 'more:pinned', remaining: pinned.length - shown.length })
+  }
+
+  if (byApp.size > 0 && header('digital-humans', t('Digital Humans'), t('Conversations with digital humans available in this workspace'))) {
     for (const [appId, rows] of byApp) {
       if (rows.length === 0) continue
       const collapsed = collapsedApps.has(appId)
@@ -147,7 +231,6 @@ function buildConversationRows(
         name: rows[0].digitalHumanName,
         uninstalled: rows[0].uninstalled,
         collapsed,
-        count: rows.length,
       })
       if (!collapsed) {
         for (const row of rows) out.push({ type: 'dh-item', key: row.id, row, standalone: false })
@@ -155,8 +238,7 @@ function buildConversationRows(
     }
   }
 
-  if (rest.length) {
-    out.push({ type: 'header', key: 'header:conversations', label: t('Conversations'), hint: t('Your direct conversations with Halo') })
+  if (rest.length && header('conversations', t('Conversations'), t('Your direct conversations with Halo'))) {
     for (const conv of rest) out.push({ type: 'item', key: conv.id, conversation: conv })
   }
 
@@ -198,6 +280,19 @@ export const ConversationList = memo(function ConversationList({
       return next
     })
   }, [])
+  // Transient like the collapse state; switching spaces starts from one page.
+  const [pinnedShown, setPinnedShown] = useState(PINNED_PAGE_SIZE)
+  useEffect(() => { setPinnedShown(PINNED_PAGE_SIZE) }, [currentSpaceId])
+  // Collapsed top-level sections; transient like the sub-groups above.
+  const [collapsedSections, setCollapsedSections] = useState<Set<ConversationSection>>(new Set())
+  const toggleSection = useCallback((section: ConversationSection) => {
+    setCollapsedSections(prev => {
+      const next = new Set(prev)
+      if (next.has(section)) next.delete(section)
+      else next.add(section)
+      return next
+    })
+  }, [])
 
   // Single batch subscription for all conversation statuses (replaces N individual hooks)
   const conversationStatuses = useAllConversationStatuses()
@@ -210,6 +305,10 @@ export const ConversationList = memo(function ConversationList({
   // user reach the same icon-strip view by dragging the handle instead of
   // only via the canvas. Independent of `collapsed`; combined below.
   const [isDragCollapsed, setIsDragCollapsed] = useState(false)
+  // Dragged back open while the canvas has it collapsed. Lasts until the
+  // canvas closes, so the next canvas open starts collapsed again.
+  const [expandedOverCanvas, setExpandedOverCanvas] = useState(false)
+  useEffect(() => { if (!collapsed) setExpandedOverCanvas(false) }, [collapsed])
   const widthRef = useRef(width)
 
   // Sync width when config arrives asynchronously
@@ -224,37 +323,48 @@ export const ConversationList = memo(function ConversationList({
   const [editingTitle, setEditingTitle] = useState('')
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null)
   const [menuPosition, setMenuPosition] = useState<{ top: number; left: number } | null>(null)
-  const [searchQuery, setSearchQuery] = useState('')
-  const [debouncedQuery, setDebouncedQuery] = useState('')
-  const searchInputRef = useRef<HTMLInputElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const editContainerRef = useRef<HTMLDivElement>(null)
   const editInputRef = useRef<HTMLInputElement | null>(null)
   const focusedEditingIdRef = useRef<string | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  /** Hovered row's identity card — rows truncate their title and the
+   * collapsed rail shows no title at all, so both lean on this. `owner` is
+   * set for a digital human's session. */
+  const [hoverCard, setHoverCard] = useState<{
+    label: string
+    owner?: string
+    time?: string
+    top: number
+    left: number
+  } | null>(null)
 
-  // Debounced local filter — avoids re-filtering on every keystroke.
-  useEffect(() => {
-    const id = setTimeout(() => setDebouncedQuery(searchQuery.trim()), SEARCH_DEBOUNCE_MS)
-    return () => clearTimeout(id)
-  }, [searchQuery])
-
-  const filteredConversations = useMemo(() => {
-    if (!debouncedQuery) return conversations
-    const needle = debouncedQuery.toLowerCase()
-    return conversations.filter(c => (c.title ?? '').toLowerCase().includes(needle))
-  }, [conversations, debouncedQuery])
-
-  // Search by digital-human name (the row's "title").
-  const filteredAppChatRows = useMemo(() => {
-    if (!debouncedQuery) return allAppChatRows
-    const needle = debouncedQuery.toLowerCase()
-    return allAppChatRows.filter(r => r.digitalHumanName.toLowerCase().includes(needle))
-  }, [allAppChatRows, debouncedQuery])
+  const showHoverCard = useCallback((
+    el: HTMLElement,
+    card: { label: string; owner?: string; time?: string },
+  ) => {
+    const r = el.getBoundingClientRect()
+    setHoverCard({ ...card, top: r.top + r.height / 2, left: r.right + 8 })
+  }, [])
+  const hideHoverCard = useCallback(() => setHoverCard(null), [])
+  // Centred on its row, but shifted to stay inside the window — rows near the
+  // bottom (or top) edge would otherwise cut the card off.
+  const hoverCardRef = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const el = hoverCardRef.current
+    if (!el || !hoverCard) return
+    const margin = 8
+    const h = el.offsetHeight
+    const top = Math.min(Math.max(hoverCard.top - h / 2, margin), window.innerHeight - h - margin)
+    el.style.top = `${top}px`
+  }, [hoverCard])
 
   const rows = useMemo<ConversationRow[]>(
-    () => buildConversationRows(filteredConversations, filteredAppChatRows, collapsedApps, t),
-    [filteredConversations, filteredAppChatRows, collapsedApps, t]
+    () => buildConversationRows(
+      conversations, allAppChatRows, collapsedApps, collapsedSections, pinnedShown,
+      selectedAppChat?.conversationId ?? currentConversationId, t
+    ),
+    [conversations, allAppChatRows, collapsedApps, collapsedSections, pinnedShown, selectedAppChat?.conversationId, currentConversationId, t]
   )
 
   // Handle drag resize
@@ -271,10 +381,12 @@ export const ConversationList = memo(function ConversationList({
       const containerRect = containerRef.current.getBoundingClientRect()
       const newWidth = e.clientX - containerRect.left
       if (newWidth < DRAG_COLLAPSE_THRESHOLD) {
-        setIsDragCollapsed(true)
+        if (collapsed) setExpandedOverCanvas(false)
+        else setIsDragCollapsed(true)
         return
       }
       setIsDragCollapsed(false)
+      if (collapsed) setExpandedOverCanvas(true)
       const clampedWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, newWidth))
       setWidth(clampedWidth)
       widthRef.current = clampedWidth
@@ -299,7 +411,7 @@ export const ConversationList = memo(function ConversationList({
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
     }
-  }, [isDragging])
+  }, [isDragging, collapsed])
 
   // Close dropdown menu on outside click
   useEffect(() => {
@@ -349,6 +461,7 @@ export const ConversationList = memo(function ConversationList({
     const name = editingTitle.trim()
     if (editingId && name) {
       const appChatRow = allAppChatRows.find(r => r.id === editingId)
+      trackHome('home.conversation.action', { action: 'rename', kind: appChatRow ? 'digital_human' : 'normal' })
       if (appChatRow) {
         const target = appChatRegistryTarget(appChatRow)
         void api.imSessionsSetCustomName({ appId: appChatRow.appId, ...target, name })
@@ -388,8 +501,21 @@ export const ConversationList = memo(function ConversationList({
     handleSaveEdit()
   }
 
+  const handleSelectConversation = (conv: ConversationMeta) => {
+    trackHome('home.conversation.select', { kind: 'normal', pinned: !!conv.starred })
+    useChatStore.getState().selectConversation(conv.id)
+  }
+
+  const handleCreateConversation = (surface: 'list' | 'rail_collapsed') => {
+    const spaceId = useSpaceStore.getState().currentSpace?.id
+    if (!spaceId) return
+    trackHome('home.conversation.create', { surface })
+    useChatStore.getState().createConversation(spaceId)
+  }
+
   const handleTogglePin = (e: React.MouseEvent, conv: ConversationMeta) => {
     e.stopPropagation()
+    trackHome('home.conversation.action', { action: conv.starred ? 'unpin' : 'pin', kind: 'normal' })
     const spaceId = useSpaceStore.getState().currentSpace?.id
     if (spaceId) useChatStore.getState().toggleStarConversation(spaceId, conv.id, !conv.starred)
   }
@@ -420,11 +546,28 @@ export const ConversationList = memo(function ConversationList({
   const handleSelectAppChat = (row: AppChatConversationRow) => {
     const spaceId = useSpaceStore.getState().currentSpace?.id
     if (!spaceId) return
+    trackHome('home.conversation.select', { kind: 'digital_human', pinned: row.starred, appId: row.appId })
+    markEntry('home_conv_dh')
     useChatStore.getState().selectAppChatConversation(spaceId, row.appId, row.id)
+  }
+
+  const handleNewAppChat = (appId: string) => {
+    const spaceId = useSpaceStore.getState().currentSpace?.id
+    if (!spaceId) return
+    trackHome('home.conversation.create', { surface: 'dh_group' })
+    // Starting one under a collapsed group should still show it.
+    setCollapsedApps(prev => {
+      if (!prev.has(appId)) return prev
+      const next = new Set(prev)
+      next.delete(appId)
+      return next
+    })
+    void openDigitalHumanChat(appId, spaceId)
   }
 
   const handleToggleAppChatPin = (e: React.MouseEvent, row: AppChatConversationRow) => {
     e.stopPropagation()
+    trackHome('home.conversation.action', { action: row.starred ? 'unpin' : 'pin', kind: 'digital_human' })
     const spaceId = useSpaceStore.getState().currentSpace?.id
     if (spaceId) toggleAppChatPin(spaceId, row.id)
   }
@@ -438,13 +581,13 @@ export const ConversationList = memo(function ConversationList({
   const handleDeleteAppChat = async (row: AppChatConversationRow) => {
     const spaceId = useSpaceStore.getState().currentSpace?.id
     if (!spaceId) return
+    trackHome('home.conversation.action', { action: 'delete', kind: 'digital_human' })
     try {
-      const res = row.isDefault
-        ? await api.appChatClear(row.appId, spaceId, row.id)
-        : await api.appSessionDelete(row.appId, spaceId, row.id)
-      if (res.success) {
-        useChatStore.getState().resetSession(row.id)
-      }
+      // The store owns what it holds for the conversation (cache, live turn,
+      // selection), so it performs the deletion rather than only being told.
+      const chat = useChatStore.getState()
+      if (row.isDefault) await chat.clearConversation(row.id)
+      else await chat.deleteAppChatSession(row.appId, spaceId, row.id)
     } catch (err) {
       console.error('[ConversationList] Delete app-chat session error:', err)
     } finally {
@@ -466,17 +609,18 @@ export const ConversationList = memo(function ConversationList({
 
     return (
       <div
-        onClick={() => !isEditing && useChatStore.getState().selectConversation(conversation.id)}
+        onClick={() => !isEditing && handleSelectConversation(conversation)}
+        onMouseEnter={(e) => showHoverCard(e.currentTarget, hoverCardFor({ type: 'item', key: conversation.id, conversation }, t))}
+        onMouseLeave={hideHoverCard}
+        data-menu-open={menuOpenId === conversation.id || undefined}
         className={cn(
-          'group relative flex w-full items-center gap-1.5 rounded-sm px-2.5 py-1.5 text-[13px] transition-colors ease-halo cursor-pointer',
+          'group relative flex w-full items-center gap-1.5 rounded-sm pl-2.5 pr-1.5 py-1.5 text-[13px] transition-colors ease-halo cursor-pointer',
+          ROW_HIGHLIGHT,
           isActive
             ? 'bg-secondary text-foreground font-medium'
-            : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
+            : 'text-subtle-foreground hover:bg-secondary hover:text-foreground'
         )}
       >
-        {isActive && (
-          <span className="absolute left-0 top-[7px] bottom-[7px] w-[2.5px] rounded-[2px] bg-primary" />
-        )}
 
         {isEditing ? (
           <div ref={editContainerRef} className="flex flex-1 items-center gap-1" onClick={(e) => e.stopPropagation()}>
@@ -510,40 +654,38 @@ export const ConversationList = memo(function ConversationList({
                 by design, not a prototype-vs-implementation mismatch to fix. */}
             {status !== 'idle' && <TaskStatusDot status={status} size="sm" />}
 
-            <span className="flex-1 min-w-0 truncate">{conversation.title}</span>
+            <span className={ROW_TITLE}>{conversation.title}</span>
 
             <EngineBadge engineId={conversation.engineId} size="xs" />
 
-            <span className="shrink-0 text-[10px] tabular-nums text-subtle-foreground group-hover:hidden">
-              {formatRowTime(conversation.updatedAt, t)}
-            </span>
+            <div className={ROW_ACTIONS}>
+              <button
+                onClick={(e) => handleTogglePin(e, conversation)}
+                className={cn(
+                  'w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center transition-colors',
+                  conversation.starred
+                    ? 'text-accent-on-dark'
+                    : 'text-faint-foreground hover:bg-surface-hover hover:text-foreground'
+                )}
+                title={conversation.starred ? t('Unpin') : t('Pin')}
+                aria-pressed={conversation.starred}
+              >
+                <Pin className="w-[13px] h-[13px]" strokeWidth={1.8} />
+              </button>
 
-            <button
-              onClick={(e) => handleTogglePin(e, conversation)}
-              className={cn(
-                'ml-auto w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center transition-colors',
-                conversation.starred
-                  ? 'text-accent-on-dark'
-                  : 'hidden group-hover:flex text-subtle-foreground hover:bg-surface-hover hover:text-foreground'
-              )}
-              title={conversation.starred ? t('Unpin') : t('Pin')}
-              aria-pressed={conversation.starred}
-            >
-              <Pin className="w-[13px] h-[13px]" strokeWidth={1.8} />
-            </button>
-
-            <button
-              onClick={(e) => openMoreMenu(e, conversation.id)}
-              className="w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center text-subtle-foreground opacity-0 group-hover:opacity-100 transition-colors hover:bg-surface-hover hover:text-foreground focus-visible:opacity-100"
-              title={t('More')}
-            >
-              <EllipsisVertical className="w-[13px] h-[13px]" strokeWidth={1.8} />
-            </button>
+              <button
+                onClick={(e) => openMoreMenu(e, conversation.id)}
+                className="w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center text-faint-foreground transition-colors hover:bg-surface-hover hover:text-foreground"
+                title={t('More')}
+              >
+                <EllipsisVertical className="w-[13px] h-[13px]" strokeWidth={1.8} />
+              </button>
+            </div>
           </>
         )}
       </div>
     )
-  }, [editingId, editingTitle, currentConversationId, selectedAppChat, conversationStatuses, t])
+  }, [editingId, editingTitle, currentConversationId, selectedAppChat, conversationStatuses, menuOpenId, t])
 
   // Render a single digital-human conversation row. Uninstalled digital
   // humans fade out and become non-interactive rather than disappearing —
@@ -552,33 +694,39 @@ export const ConversationList = memo(function ConversationList({
   const renderAppChatItem = useCallback((row: AppChatConversationRow, standalone: boolean) => {
     const isActive = row.id === selectedAppChat?.conversationId
     const isEditing = editingId === row.id
-    // Inside its own section the digital human's name/avatar is already on the
-    // sub-header, so the row shows only what distinguishes one session from
-    // another. A standalone row (Pinned) has no such header above it and has
-    // to carry that identity itself.
-    const sessionLabel = row.isDefault
-      ? (row.lastMessage || t('No messages yet'))
-      : (row.customName || row.displayName.trim() || row.lastMessage || t('New chat'))
+    const sessionLabel = appChatSessionLabel(row, t)
+    const status = conversationStatuses.get(row.id) ?? 'idle'
 
     return (
       <div
         onClick={() => !isEditing && !row.uninstalled && handleSelectAppChat(row)}
+        onMouseEnter={(e) => showHoverCard(e.currentTarget, hoverCardFor({ type: 'dh-item', key: row.id, row, standalone }, t))}
+        onMouseLeave={hideHoverCard}
+        data-menu-open={menuOpenId === row.id || undefined}
         className={cn(
-          'group relative flex w-full items-center gap-1.5 rounded-sm pr-2.5 py-1.5 text-[13px] transition-colors ease-halo',
-          standalone ? 'pl-2.5' : 'pl-5',
+          'group relative flex w-full items-center gap-1.5 rounded-sm pr-1.5 py-1.5 text-[13px] transition-colors ease-halo',
+          ROW_HIGHLIGHT,
+          standalone ? 'pl-2.5' : 'pl-[30px]',
           row.uninstalled
             ? 'opacity-40 cursor-not-allowed'
             : 'cursor-pointer',
           isActive && !row.uninstalled
             ? 'bg-secondary text-foreground font-medium'
-            : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
+            : 'text-subtle-foreground hover:bg-secondary hover:text-foreground'
         )}
       >
-        {isActive && !row.uninstalled && (
-          <span className="absolute left-0 top-[7px] bottom-[7px] w-[2.5px] rounded-[2px] bg-primary" />
+
+        {standalone && (
+          <PersonAvatarLink
+            appId={row.appId}
+            name={row.digitalHumanName}
+            size={16}
+            dimmed={!isActive}
+            disabled={row.uninstalled}
+          />
         )}
 
-        {standalone && <AutomationAvatar name={row.digitalHumanName} size={16} />}
+        {status !== 'idle' && <TaskStatusDot status={status} size="sm" />}
 
         {isEditing ? (
           <div ref={editContainerRef} className="flex flex-1 items-center gap-1" onClick={(e) => e.stopPropagation()}>
@@ -594,27 +742,23 @@ export const ConversationList = memo(function ConversationList({
             />
           </div>
         ) : (
-          <span className="flex-1 min-w-0 truncate">
+          <span className={ROW_TITLE}>
             {standalone && row.isDefault ? row.digitalHumanName : sessionLabel}
           </span>
         )}
         {row.status === 'paused' && !isEditing && (
-          <span className="text-[10px] text-muted-foreground shrink-0">{t('Paused')}</span>
+          <span className="text-[11px] text-muted-foreground shrink-0">{t('Paused')}</span>
         )}
 
-        <span className="shrink-0 text-[10px] tabular-nums text-subtle-foreground group-hover:hidden">
-          {formatRowTime(row.updatedAt, t)}
-        </span>
-
         {!row.uninstalled && (
-          <>
+          <div className={ROW_ACTIONS}>
             <button
               onClick={(e) => handleToggleAppChatPin(e, row)}
               className={cn(
-                'ml-auto w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center transition-colors',
+                'w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center transition-colors',
                 row.starred
                   ? 'text-accent-on-dark'
-                  : 'hidden group-hover:flex text-subtle-foreground hover:bg-surface-hover hover:text-foreground'
+                  : 'text-faint-foreground hover:bg-surface-hover hover:text-foreground'
               )}
               title={row.starred ? t('Unpin') : t('Pin')}
               aria-pressed={row.starred}
@@ -624,67 +768,111 @@ export const ConversationList = memo(function ConversationList({
 
             <button
               onClick={(e) => openMoreMenu(e, row.id)}
-              className="w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center text-subtle-foreground opacity-0 group-hover:opacity-100 transition-colors hover:bg-surface-hover hover:text-foreground focus-visible:opacity-100"
+              className="w-[22px] h-[22px] flex-shrink-0 rounded-[6px] flex items-center justify-center text-faint-foreground transition-colors hover:bg-surface-hover hover:text-foreground"
               title={t('More')}
             >
               <EllipsisVertical className="w-[13px] h-[13px]" strokeWidth={1.8} />
             </button>
-          </>
+          </div>
         )}
       </div>
     )
-  }, [selectedAppChat?.conversationId, editingId, editingTitle, t])
+  }, [selectedAppChat?.conversationId, editingId, editingTitle, conversationStatuses, menuOpenId, t])
 
-  const hasQuery = debouncedQuery.length > 0
-  const noResults = hasQuery && rows.every(r => r.type === 'header')
+  // Fixed-positioned and portaled: the row lists scroll, and a scroll
+  // container clips anything reaching past its edge.
+  const hoverCardPortal = hoverCard && !editingId && !menuOpenId && createPortal(
+    <div
+      ref={hoverCardRef}
+      role="tooltip"
+      style={{ top: hoverCard.top, left: hoverCard.left }}
+      className="pointer-events-none fixed z-[60] w-[260px] rounded-lg border border-border bg-popover px-3.5 py-3 shadow-lg"
+    >
+      {hoverCard.owner && (
+        <span className="mb-1.5 flex items-center gap-2">
+          <AutomationAvatar name={hoverCard.owner} size={20} />
+          <span className="truncate text-[13px] text-muted-foreground">{hoverCard.owner}</span>
+        </span>
+      )}
+      <span className="block text-sm leading-relaxed text-foreground line-clamp-3">{hoverCard.label}</span>
+      {hoverCard.time && (
+        <span className="mt-1.5 block text-xs text-muted-foreground">{hoverCard.time}</span>
+      )}
+    </div>,
+    document.body
+  )
 
-  if (collapsed || isDragCollapsed) {
-    // Canvas-driven collapse (`collapsed`) has no drag handle — the canvas
-    // dictates the layout, dragging it back open would immediately fight
-    // with that. Drag-triggered collapse (`isDragCollapsed`) keeps the
-    // handle so the same drag gesture can pull it back out.
-    const showDragHandle = !collapsed
+  if ((collapsed && !expandedOverCanvas) || isDragCollapsed) {
     return (
       <div
-        ref={showDragHandle ? containerRef : undefined}
-        className="relative w-14 h-full flex-shrink-0 border-r border-border bg-background flex flex-col items-center"
+        ref={containerRef}
+        className="relative w-14 h-full flex-shrink-0 border-r border-border/50 bg-background flex flex-col items-center"
       >
         <div className="w-full px-2 pt-2.5 pb-1.5">
           <button
-            onClick={() => {
-              const spaceId = useSpaceStore.getState().currentSpace?.id
-              if (spaceId) useChatStore.getState().createConversation(spaceId)
-            }}
-            className="flex h-9 w-full items-center justify-center rounded-sm border border-primary/[0.18] bg-primary/[0.12] text-accent-on-dark transition-colors ease-halo hover:bg-primary/[0.18]"
+            onClick={() => handleCreateConversation('rail_collapsed')}
+            className="flex h-9 w-full items-center justify-center rounded-sm bg-secondary/60 text-foreground transition-colors ease-halo hover:bg-surface-hover"
             title={t('New conversation')}
           >
             <Plus className="w-4 h-4" />
           </button>
         </div>
-        <div className="flex-1 w-full overflow-y-auto px-2 py-1 flex flex-col items-center">
-          {conversations.map(conv => (
-            <button
-              key={conv.id}
-              onClick={() => useChatStore.getState().selectConversation(conv.id)}
-              title={conv.title}
-              className="flex h-[25px] w-full items-center justify-center"
-            >
-              <span className={cn(
-                'w-[7px] h-[7px] rounded-full',
-                conv.id === currentConversationId && !selectedAppChat ? 'bg-primary opacity-100' : 'bg-subtle-foreground opacity-50'
-              )} />
-            </button>
-          ))}
+        {/* Same rows as the expanded list, minus its section headers, so
+            collapsing never drops a conversation the open list shows. Dots
+            carry no label of their own, so the hover bubble is the only way
+            to tell them apart; it is portaled and fixed-positioned because
+            this column scrolls, and a scroll container clips anything
+            reaching past its edge. */}
+        <div className="flex-1 w-full overflow-y-auto px-2 py-1 flex flex-col items-center gap-0.5">
+          {rows.map(row => {
+            if (row.type === 'header' || row.type === 'dh-header' || row.type === 'more') return null
+            const isAppChat = row.type === 'dh-item'
+            const id = isAppChat ? row.row.id : row.conversation.id
+            const active = isAppChat
+              ? row.row.id === selectedAppChat?.conversationId
+              : row.conversation.id === currentConversationId && !selectedAppChat
+            const status = conversationStatuses.get(id) ?? 'idle'
+            return (
+              <button
+                key={row.key}
+                onClick={() => {
+                  if (isAppChat) {
+                    if (!row.row.uninstalled) handleSelectAppChat(row.row)
+                  } else {
+                    handleSelectConversation(row.conversation)
+                  }
+                }}
+                onMouseEnter={(e) => showHoverCard(e.currentTarget, hoverCardFor(row, t))}
+                onMouseLeave={hideHoverCard}
+                aria-current={active}
+                className={cn(
+                  'flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full transition-colors ease-halo hover:bg-secondary',
+                  active && 'bg-secondary'
+                )}
+              >
+                {/* Colour carries the state; the round backdrop marks the open
+                    conversation (and hover) — with the list collapsed this is
+                    the only place either is visible. */}
+                {status !== 'idle' ? (
+                  <TaskStatusDot status={status} size="md" />
+                ) : (
+                  <span className={cn(
+                    'w-[7px] h-[7px] rounded-full',
+                    active ? 'bg-foreground' : 'bg-subtle-foreground opacity-50'
+                  )} />
+                )}
+              </button>
+            )
+          })}
         </div>
-        {showDragHandle && (
-          <div
-            className={`absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/50 transition-colors z-20 ${
-              isDragging ? 'bg-primary/50' : ''
-            }`}
-            onMouseDown={handleMouseDown}
-            title={t('Drag to resize width')}
-          />
-        )}
+        {hoverCardPortal}
+        <div
+          className={`absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/50 transition-colors z-20 ${
+            isDragging ? 'bg-primary/50' : ''
+          }`}
+          onMouseDown={handleMouseDown}
+          title={t('Drag to resize width')}
+        />
       </div>
     )
   }
@@ -693,36 +881,13 @@ export const ConversationList = memo(function ConversationList({
     <>
     <div
       ref={containerRef}
-      className="border-r border-border flex flex-col bg-background relative"
+      className="border-r border-border/50 flex flex-col bg-background relative"
       style={{ width, transition: isDragging ? 'none' : 'width 0.2s ease' }}
     >
-      {/* Search + new conversation — prototype's `.conv-top`: search on top,
-          button below, 8px gap. Search filters this list locally (see
-          module doc); it intentionally has no ⌘K badge since that shortcut
-          opens the unrelated global search instead. */}
-      <div className="flex flex-col gap-2 px-2.5 pt-2.5 pb-3">
-        <div className="flex h-8 items-center gap-[7px] rounded-sm border border-transparent bg-surface-hover px-[9px] transition-colors duration ease-halo focus-within:border-primary">
-          <Search className="w-3.5 h-3.5 flex-shrink-0 text-subtle-foreground" strokeWidth={1.8} />
-          <input
-            ref={searchInputRef}
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                setSearchQuery('')
-                searchInputRef.current?.blur()
-              }
-            }}
-            placeholder={t('Search conversations')}
-            className="flex-1 min-w-0 bg-transparent text-xs text-foreground outline-none placeholder:text-subtle-foreground"
-          />
-        </div>
+      <div className="flex flex-col gap-2 px-2.5 pt-4 pb-3">
         <button
-          onClick={() => {
-            const spaceId = useSpaceStore.getState().currentSpace?.id
-            if (spaceId) useChatStore.getState().createConversation(spaceId)
-          }}
-          className="flex h-8 w-full items-center justify-center gap-1.5 rounded-sm border border-primary/[0.18] bg-primary/[0.12] text-xs font-medium text-accent-on-dark transition-colors ease-halo hover:bg-primary/[0.18]"
+          onClick={() => handleCreateConversation('list')}
+          className="flex h-8 w-full items-center justify-center gap-1.5 rounded-sm bg-secondary/60 text-xs font-medium text-foreground transition-colors ease-halo hover:bg-surface-hover"
         >
           <Plus className="w-3.5 h-3.5" />
           {t('New conversation')}
@@ -731,58 +896,100 @@ export const ConversationList = memo(function ConversationList({
 
       {/* Conversation list - virtualized for performance with large lists */}
       <div className="flex-1 overflow-hidden">
-        {noResults ? (
-          <p className="px-4 py-8 text-center text-xs text-subtle-foreground">
-            {t('No matching conversations')}
-          </p>
-        ) : (
-          <Virtuoso
+        <Virtuoso
             data={rows}
             overscan={200}
-            className="px-2 pt-1 pb-3"
+            // Virtuoso's scroller only sets overflow-y, which leaves overflow-x
+            // resolving to `auto` — a stray pixel of row width then shows a
+            // horizontal scrollbar under a list that never scrolls sideways.
+            className="overflow-x-hidden"
+            components={listComponents}
             itemContent={(index, row) => {
               if (row.type === 'header') {
                 // No uppercase/letter-spacing: both are no-ops on CJK labels
                 // and only loosen them oddly.
                 return (
-                  <div className={cn(
-                    'bg-background px-1.5 pb-1 text-[11px] font-medium text-subtle-foreground',
-                    index === 0 ? 'pt-1' : 'mt-4 pt-2.5 border-t border-border/50'
-                  )}>
-                    <span title={row.hint} className="cursor-default">{row.label}</span>
+                  <div className={cn('bg-background', index === 0 ? 'pt-1' : 'mt-4 pt-2.5 border-t border-border/50')}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        trackHome('home.conversation.section', { section: row.section, action: row.collapsed ? 'expand' : 'collapse' })
+                        toggleSection(row.section)
+                      }}
+                      aria-expanded={!row.collapsed}
+                      title={row.hint}
+                      className="group flex w-full items-center gap-1 rounded-sm px-1.5 pb-1 text-xs font-medium text-subtle-foreground/70 hover:text-subtle-foreground transition-colors ease-halo"
+                    >
+                      <span>{row.label}</span>
+                      <ChevronRight className={cn(
+                        'ml-auto w-3 h-3 shrink-0 transition-[transform,opacity]',
+                        row.collapsed ? 'opacity-100' : 'rotate-90 opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100'
+                      )} />
+                    </button>
                   </div>
                 )
               }
               if (row.type === 'dh-header') {
+                const toggle = () => {
+                  trackHome('home.dh_group.toggle', { collapsed: !row.collapsed })
+                  toggleAppCollapsed(row.appId)
+                }
+                return (
+                  <div className={cn(
+                    'group flex w-full items-center gap-0.5 rounded-sm pr-1 mt-0.5 transition-colors ease-halo',
+                    row.uninstalled ? 'opacity-40' : 'hover:bg-secondary'
+                  )}>
+                    <PersonAvatarLink
+                      appId={row.appId}
+                      name={row.name}
+                      size={18}
+                      dimmed={selectedAppChat?.appId !== row.appId}
+                      disabled={row.uninstalled}
+                      className="ml-1.5"
+                    />
+                    <button
+                      type="button"
+                      onClick={toggle}
+                      aria-expanded={!row.collapsed}
+                      className={cn(
+                        'flex flex-1 min-w-0 items-center pl-1.5 py-1.5 text-[13px] font-medium',
+                        row.uninstalled ? 'cursor-not-allowed' : 'text-foreground'
+                      )}
+                    >
+                      <span className="flex-1 min-w-0 truncate text-left">{row.name}</span>
+                    </button>
+                    {!row.uninstalled && (
+                      <button
+                        type="button"
+                        onClick={() => handleNewAppChat(row.appId)}
+                        title={t('New conversation with {{name}}', { name: row.name })}
+                        aria-label={t('New conversation with {{name}}', { name: row.name })}
+                        className="flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-subtle-foreground pointer-events-none opacity-0 transition-opacity hover:bg-background hover:text-foreground group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                    {/* A second hit area for the same toggle; the name button carries it for keyboard users. */}
+                    <button type="button" tabIndex={-1} aria-hidden="true" onClick={toggle} className="flex h-5 w-5 shrink-0 items-center justify-center">
+                      <ChevronRight className={cn(
+                        'w-3 h-3 text-subtle-foreground transition-[transform,opacity]',
+                        row.collapsed ? 'opacity-100' : 'rotate-90 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
+                      )} />
+                    </button>
+                  </div>
+                )
+              }
+              if (row.type === 'more') {
                 return (
                   <button
                     type="button"
-                    onClick={() => toggleAppCollapsed(row.appId)}
-                    className={cn(
-                      // pr = the rows' own 10px padding plus the 22px their
-                      // always-rendered (opacity-0) "more" button occupies, so
-                      // this count lands on the same right edge as their
-                      // timestamps instead of hugging the container.
-                      'group w-full flex items-center gap-1.5 rounded-sm pl-0.5 pr-8 py-1.5 mt-0.5 text-[13px] font-medium transition-colors ease-halo',
-                      row.uninstalled
-                        ? 'opacity-40 cursor-not-allowed'
-                        : 'text-foreground hover:bg-secondary'
-                    )}
+                    onClick={() => {
+                      trackHome('home.conversation.section', { section: 'pinned', action: 'more' })
+                      setPinnedShown(n => n + PINNED_PAGE_SIZE)
+                    }}
+                    className="w-full rounded-sm pl-2.5 py-1 text-left text-xs text-subtle-foreground hover:text-foreground transition-colors ease-halo"
                   >
-                    <ChevronRight className={cn(
-                      'w-3 h-3 shrink-0 text-subtle-foreground transition-transform',
-                      !row.collapsed && 'rotate-90'
-                    )} />
-                    <AutomationAvatar name={row.name} size={18} />
-                    <span className="flex-1 min-w-0 truncate text-left">{row.name}</span>
-                    {/* Only while collapsed: expanded, the sessions are right
-                        there to count. Sits on the same right edge as their
-                        timestamps (see the pr above). */}
-                    {row.collapsed && (
-                      <span className="shrink-0 ml-1 text-[10px] tabular-nums text-subtle-foreground">
-                        {row.count}
-                      </span>
-                    )}
+                    {t('Show more ({{count}})', { count: row.remaining })}
                   </button>
                 )
               }
@@ -791,8 +998,7 @@ export const ConversationList = memo(function ConversationList({
               }
               return renderConversationItem(row.conversation)
             }}
-          />
-        )}
+        />
       </div>
 
       {/* Drag handle - on right side */}
@@ -804,6 +1010,8 @@ export const ConversationList = memo(function ConversationList({
         title={t('Drag to resize width')}
       />
     </div>
+
+    {hoverCardPortal}
 
     {/* Dropdown menu — Portal to document.body, fully outside flex layout.
         Pin lives inline on the row now; this keeps rename/delete. */}
@@ -830,6 +1038,7 @@ export const ConversationList = memo(function ConversationList({
             <button
               onClick={(e) => {
                 e.stopPropagation()
+                trackHome('home.conversation.action', { action: 'delete', kind: 'normal' })
                 const spaceId = useSpaceStore.getState().currentSpace?.id
                 if (spaceId) useChatStore.getState().deleteConversation(spaceId, conv.id)
                 setMenuOpenId(null)

@@ -6,10 +6,11 @@
  * and quick access to show the main window, toggle online/offline, and quit.
  */
 
-import { Tray, Menu, nativeImage } from 'electron'
+import { Tray, Menu, nativeImage, nativeTheme } from 'electron'
 import { join } from 'path'
 import { getTrayIconDir } from '../../foundation/product-config'
-import type { BackgroundStatus } from './types'
+import { readWindowsTaskbarIsDark } from './taskbar-theme'
+import type { BackgroundStatus, TrayNotice } from './types'
 
 /**
  * Callback interface for tray menu actions.
@@ -31,12 +32,16 @@ export interface TrayCallbacks {
  * Platform differences:
  * - macOS: Uses template images that auto-adapt to light/dark menu bar.
  *   The tray icon appears in the top menu bar.
- * - Windows: Uses 16x16 PNG icon. The tray icon appears in the system tray
- *   notification area.
+ * - Windows: A white or black glyph matching the macOS one, picked to
+ *   contrast with the taskbar and swapped when the system theme changes.
+ * - Linux: A brand-blue glyph; panel themes vary too much to pick black or white.
  */
 export class TrayManager {
   private tray: Tray | null = null
   private callbacks: TrayCallbacks | null = null
+  private notice: TrayNotice | null = null
+  private readonly onThemeUpdated = (): void => this.refreshWindowsIcon()
+  private themeReadSeq = 0
 
   /**
    * Initialize the tray icon and menu.
@@ -51,8 +56,14 @@ export class TrayManager {
       return
     }
 
-    const icon = this.createIcon()
-    this.tray = new Tray(icon)
+    try {
+      this.tray = new Tray(this.createIcon())
+    } catch (error) {
+      // No status-icon host: the app runs without a tray, and closing the last
+      // window quits (see hasTray).
+      console.error('[Tray] Could not create the system tray icon:', error)
+      return
+    }
 
     this.tray.setToolTip('Halo')
 
@@ -64,8 +75,23 @@ export class TrayManager {
       })
     }
 
+    if (process.platform === 'win32') {
+      this.refreshWindowsIcon()
+      nativeTheme.on('updated', this.onThemeUpdated)
+    }
+
     this.updateMenu()
     console.log('[Tray] System tray initialized')
+  }
+
+  /** Whether a tray icon exists, i.e. the user can reach the app with no window open. */
+  hasTray(): boolean {
+    return this.tray !== null
+  }
+
+  setNotice(notice: TrayNotice | null): void {
+    this.notice = notice
+    this.updateMenu()
   }
 
   /**
@@ -78,7 +104,15 @@ export class TrayManager {
     const reasons = this.callbacks.getActiveReasons()
     const isOnline = status === 'online'
 
+    const notice = this.notice
     const menuItems: Electron.MenuItemConstructorOptions[] = [
+      ...(notice
+        ? [
+            { label: notice.message, enabled: false },
+            { label: notice.actionLabel, click: () => notice.onAction() },
+            { type: 'separator' as const }
+          ]
+        : []),
       {
         label: 'Show Halo',
         click: () => this.callbacks?.onShowWindow()
@@ -135,7 +169,9 @@ export class TrayManager {
     this.tray.setContextMenu(contextMenu)
 
     // Update tooltip to show status
-    const tooltip = reasons.length > 0
+    const tooltip = notice
+      ? `Halo - ${notice.message}`
+      : reasons.length > 0
       ? `Halo (${isOnline ? 'Online' : 'Offline'}) - ${reasons.length} active task(s)`
       : `Halo (${isOnline ? 'Online' : 'Offline'})`
     this.tray.setToolTip(tooltip)
@@ -145,6 +181,7 @@ export class TrayManager {
    * Destroy the tray icon. Called during shutdown.
    */
   destroy(): void {
+    nativeTheme.off('updated', this.onThemeUpdated)
     if (this.tray) {
       this.tray.destroy()
       this.tray = null
@@ -174,8 +211,37 @@ export class TrayManager {
       return icon
     }
 
-    // Windows/Linux: Use standard 16x16 icon
-    const iconPath = join(resourcesPath, 'tray-16.png')
-    return nativeImage.createFromPath(iconPath)
+    if (process.platform === 'win32') {
+      // Until the taskbar theme is read, guess from the app theme.
+      const icon = createWindowsGlyph(resourcesPath, nativeTheme.shouldUseDarkColors)
+      if (icon) return icon
+    }
+
+    // Brand-blue glyph: reads on light and dark panels alike. `tray-16.png` is
+    // the fallback for icon sets that predate it.
+    const colored = nativeImage.createFromPath(join(resourcesPath, 'tray-color.png'))
+    return colored.isEmpty() ? nativeImage.createFromPath(join(resourcesPath, 'tray-16.png')) : colored
   }
+
+  private refreshWindowsIcon(): void {
+    const seq = ++this.themeReadSeq
+    readWindowsTaskbarIsDark().then((isDark) => {
+      // A later read may have finished first; only the newest applies.
+      if (!this.tray || isDark === null || seq !== this.themeReadSeq) return
+      const icon = createWindowsGlyph(getTrayIconDir(), isDark)
+      if (icon) this.tray.setImage(icon)
+    })
+  }
+}
+
+/**
+ * White glyph for a dark taskbar, black for a light one. An .ico, since
+ * Windows builds the tray icon from the image's 1x bitmap only and loads other
+ * sizes only from an .ico. Null when the icon set predates these files (a
+ * brand `trayIconDir`), so the caller falls back to the brand-blue icon instead
+ * of showing a blank slot.
+ */
+function createWindowsGlyph(resourcesPath: string, taskbarIsDark: boolean): Electron.NativeImage | null {
+  const icon = nativeImage.createFromPath(join(resourcesPath, taskbarIsDark ? 'tray-win-white.ico' : 'tray-win-black.ico'))
+  return icon.isEmpty() ? null : icon
 }

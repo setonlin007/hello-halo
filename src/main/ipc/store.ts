@@ -19,13 +19,15 @@
  *   store:get-capabilities               Resolve renderer-safe store capability flags
  */
 
-import { ipcMain, dialog } from 'electron'
+import { ipcMain } from 'electron'
+import { showOpenDialog, showSaveDialog } from '../foundation/file-dialog'
 import { readFile, writeFile } from 'fs/promises'
 import * as storeController from '../controllers/store.controller'
 import {
   onSyncStatusChanged,
   onUpgradeAvailable,
   applyUpgrade,
+  previewUpgrade,
   checkUpgradesNow,
   publish,
   getPublishPreview,
@@ -34,21 +36,20 @@ import {
   inspectSkillDeps,
   packDhpkg,
   packSkill,
-  unpackDhpkg,
 } from '../store'
 import { deriveSlug } from '../store/publish/spec-enrich'
 import { getAppManager } from '../apps/manager'
-import { getAppRuntime } from '../apps/runtime'
 import { sendToRenderer } from '../foundation/window.service'
-import type { StoreInstallProgress } from '../../shared/store/store-types'
-import type { AppType, AppSpec } from '../../shared/apps/spec-types'
+import type { StoreInstallProgress, StoreQueryParams } from '../../shared/store/store-types'
+import type { AppType } from '../../shared/apps/spec-types'
+import type { AppSpec } from '../apps/spec'
 import { storeRpc } from '../../shared/rpc/contracts/store.contract'
 import { registerRawRpcHandlers } from './rpc'
 
 export function registerStoreHandlers(): void {
   registerRawRpcHandlers(storeRpc, {
     // ── store:query (new primary entry point) ─────────────────────────────
-    storeQuery: async (params: { search?: string; type?: string; category?: string; page?: number; pageSize?: number; locale?: string }) => {
+    storeQuery: async (params: Partial<StoreQueryParams>) => {
       return storeController.queryStoreApps(params)
     },
 
@@ -118,6 +119,17 @@ export function registerStoreHandlers(): void {
       } catch (error: unknown) {
         const err = error as Error
         console.error('[StoreIPC] store:apply-upgrade error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // ── store:preview-upgrade ──────────────────────────────────────────────
+    storePreviewUpgrade: async (input: { appId: string }) => {
+      try {
+        return { success: true, data: await previewUpgrade(input.appId) }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.warn('[StoreIPC] store:preview-upgrade error:', err.message)
         return { success: false, error: err.message }
       }
     },
@@ -215,7 +227,7 @@ export function registerStoreHandlers(): void {
         if (!app) return { success: false, error: `App not found: ${input.appId}` }
 
         const safeName = deriveSlug(app.spec.store?.slug ?? app.spec.name) || 'app'
-        const dialogResult = await dialog.showSaveDialog({
+        const dialogResult = await showSaveDialog({
           title: 'Export as .dhpkg',
           defaultPath: `${safeName}-${app.spec.version ?? '0.0.0'}.dhpkg`,
           filters: [{ name: 'DHP Package', extensions: ['dhpkg'] }],
@@ -260,7 +272,7 @@ export function registerStoreHandlers(): void {
         }
 
         const safeName = deriveSlug(app.spec.store?.slug ?? app.spec.name) || 'app'
-        const dialogResult = await dialog.showSaveDialog({
+        const dialogResult = await showSaveDialog({
           title: 'Export skill',
           defaultPath: `${safeName}-${app.spec.version ?? '0.0.0'}.zip`,
           filters: [{ name: 'Skill Package', extensions: ['zip'] }],
@@ -287,7 +299,7 @@ export function registerStoreHandlers(): void {
       try {
         let filePath = input?.filePath
         if (!filePath) {
-          const dialogResult = await dialog.showOpenDialog({
+          const dialogResult = await showOpenDialog({
             title: 'Import .dhpkg',
             filters: [{ name: 'DHP Package', extensions: ['dhpkg', 'zip'] }],
             properties: ['openFile'],
@@ -299,27 +311,11 @@ export function registerStoreHandlers(): void {
         }
 
         const buf = await readFile(filePath)
-        const { spec } = await unpackDhpkg(buf)
+        const result = await storeController.importDhpkg(buf, input?.spaceId)
+        if (!result.success) return result
 
-        const manager = getAppManager()
-        if (!manager) return { success: false, error: 'App Manager not ready' }
-
-        const spaceId = input?.spaceId ?? null
-        const appId = await manager.install(spaceId, spec, {})
-
-        const runtime = getAppRuntime()
-        if (runtime) {
-          try {
-            await runtime.activate(appId)
-          } catch (err) {
-            console.warn(
-              `[StoreIPC] store:import-dhpkg: runtime activate failed (non-fatal): ${(err as Error).message}`
-            )
-          }
-        }
-
-        console.log(`[StoreIPC] store:import-dhpkg: ${filePath} -> appId=${appId}`)
-        return { success: true, data: { appId } }
+        console.log(`[StoreIPC] store:import-dhpkg: ${filePath} -> appId=${result.data.appId}`)
+        return result
       } catch (error: unknown) {
         const err = error as Error
         console.error('[StoreIPC] store:import-dhpkg error:', err.message)

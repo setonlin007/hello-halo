@@ -18,7 +18,7 @@ vi.mock('../../../../../src/main/services/notification.service', () => ({
 }))
 
 const fakeAgent = { marker: 'proxy-agent' }
-const resolveProxyAgentMock = vi.fn(async () => ({ agent: fakeAgent, endpoint: 'http://10.107.100.64:9090' }))
+const resolveProxyAgentMock = vi.fn(async (_url: string) => ({ agent: fakeAgent, endpoint: 'http://10.107.100.64:9090' }))
 vi.mock('../../../../../src/main/services/proxy-fetch', () => ({
   resolveProxyAgent: (url: string) => resolveProxyAgentMock(url),
 }))

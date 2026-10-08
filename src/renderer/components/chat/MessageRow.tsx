@@ -4,7 +4,7 @@
  * Pure presentational component — no store coupling. Handles both inline
  * thoughts (Thought[]) and separated/lazy thoughts (v2 format with ThoughtsSummary).
  *
- * Shared across: MessageList (main chat), AppChatView, ImChatView, SessionDetailView.
+ * Shared across: MessageList (space and digital-human chat), ImChatView, SessionDetailView.
  */
 
 import { memo, type ReactNode } from 'react'
@@ -18,6 +18,7 @@ import {
   isCrossConversationNotice,
 } from './cross-conversation'
 import { TeamMemberMessage, isTeamMessage } from './team-collab'
+import { PushedMessageLabel, isPushedMessage } from './PushedMessageLabel'
 import type { Message, Thought } from '../../types'
 
 export interface MessageRowProps {
@@ -40,14 +41,18 @@ export interface MessageRowProps {
   onLoadThoughts?: (messageId: string) => Promise<Thought[]>
 
   /** Hide the "View live feed" button in BrowserTaskCard.
-   *  Set true in automation app contexts where Canvas/BrowserView is unavailable. */
-  hideBrowserViewButton?: boolean
+   *  Set true where there is no live browser view to show for the conversation. */
+  hideBrowserLiveView?: boolean
+
+  /** Hide the "Open" button in TerminalTaskCard.
+   *  Set true where there is no canvas to open a terminal in. */
+  hideTerminalOpen?: boolean
 
   /** Mid-turn injection messages associated with this assistant message.
    *  Rendered as a permanent annotation at the bottom of the assistant bubble. */
   injectionMessages?: Message[]
 
-  /** Additional className for the outer wrapper (e.g., width constraints from Virtuoso) */
+  /** Additional className for the outer wrapper (e.g., width constraints from the list) */
   className?: string
 
   /**
@@ -65,7 +70,8 @@ export const MessageRow = memo(function MessageRow({
   defaultThoughtsExpanded = false,
   defaultThoughtsMaximized = false,
   onLoadThoughts,
-  hideBrowserViewButton = false,
+  hideBrowserLiveView = false,
+  hideTerminalOpen = false,
   injectionMessages,
   className = '',
   senderName,
@@ -115,6 +121,7 @@ export const MessageRow = memo(function MessageRow({
           {hasInlineThoughts ? (
             <CollapsedThoughtProcess
               thoughts={message.thoughts as Thought[]}
+              messageId={message.id}
               defaultExpanded={defaultThoughtsExpanded}
               defaultMaximized={defaultThoughtsMaximized}
             />
@@ -139,7 +146,8 @@ export const MessageRow = memo(function MessageRow({
               previousCost={previousCost}
               hideThoughts
               isInContainer
-              hideBrowserViewButton={hideBrowserViewButton}
+              hideBrowserLiveView={hideBrowserLiveView}
+              hideTerminalOpen={hideTerminalOpen}
             />
           )}
 
@@ -164,7 +172,8 @@ export const MessageRow = memo(function MessageRow({
             <MessageItem
               message={message}
               previousCost={previousCost}
-              hideBrowserViewButton={hideBrowserViewButton}
+              hideBrowserLiveView={hideBrowserLiveView}
+              hideTerminalOpen={hideTerminalOpen}
               isInContainer
             />
             <InjectionAnnotation messages={injectionMessages} />
@@ -177,10 +186,12 @@ export const MessageRow = memo(function MessageRow({
   return (
     <div className={`pb-5 ${className}`}>
       {senderLabel}
+      {isPushedMessage(message) && <PushedMessageLabel via={message.metadata?.pushVia} by={message.metadata?.pushedByName} />}
       <MessageItem
         message={message}
         previousCost={previousCost}
-        hideBrowserViewButton={hideBrowserViewButton}
+        hideBrowserLiveView={hideBrowserLiveView}
+        hideTerminalOpen={hideTerminalOpen}
       />
     </div>
   )

@@ -23,7 +23,7 @@ import { CapabilityPolicyFields } from '../capability/CapabilityPolicyFields'
 import { api } from '../../api'
 import { SystemPromptEditor } from '../apps/SystemPromptEditor'
 import { ConfirmDialog } from '../ui/ConfirmDialog'
-import { useTeamStore } from '../../stores/team.store'
+import { useTeamStore, useTeamView, detailOf } from '../../stores/team.store'
 import { useAppsStore } from '../../stores/apps.store'
 import { useAppsPageStore } from '../../stores/apps-page.store'
 import { useTranslation } from '../../i18n'
@@ -208,8 +208,8 @@ function OwnInstructions({ prompt }: { prompt: string }) {
 function MemberChecks({ teamId, checks }: { teamId: string; checks: TeamCheckView[] }) {
   const { t, i18n } = useTranslation()
   const cancelCheck = useTeamStore(s => s.cancelCheck)
-  const conversations = useTeamStore(s => s.conversations)
-  const epochs = useTeamStore(s => s.epochs)
+  const conversations = useTeamView(v => v.conversations)
+  const epochs = useTeamView(v => v.epochs)
   const [stopping, setStopping] = useState<TeamCheckView | null>(null)
 
   if (checks.length === 0) {
@@ -302,7 +302,7 @@ function BorrowedWorkRecord({ teamId, member }: { teamId: string; member: TeamMe
   }, [open, teamId, appId])
 
   const nameByApp = new Map(
-    (useTeamStore.getState().detail?.members ?? []).map(m => [m.appId, m.memberName]),
+    (detailOf(useTeamStore.getState(), teamId)?.members ?? []).map(m => [m.appId, m.memberName]),
   )
   const refused = entries?.filter(e => e.decision === 'denied').length ?? 0
 
@@ -398,19 +398,12 @@ function DelegatedCapabilities({ teamId, member }: { teamId: string; member: Tea
       {open && (
         <div className="space-y-3 border-t border-border px-3 py-3">
           <p className="text-xs text-muted-foreground/70">
-            {t('The tools it has in hand when anyone else puts it to work — a teammate’s digital human, or a person on another machine. Talking to it yourself is unaffected.')}
+            {t('The tools it has in hand when anyone else puts it to work — a teammate’s digital human, a person on another machine, or a guest in an IM chat your team answers whose request reaches it. Talking to it yourself is unaffected.')}
           </p>
           <CapabilityPolicyFields
             policy={policy}
             mode="permissive"
-            groupLabels={{
-              file: t('File Read'),
-              network: t('Network'),
-              other: t('Other'),
-              // Reworded for this scenario: these are the ones that touch the
-              // owner's machine, which is the whole reason the screen exists.
-              advanced: t('Touches your computer'),
-            }}
+            audience="teammate"
             onChange={next => save({ ...policy, ...next })}
             extraToggles={[
               {

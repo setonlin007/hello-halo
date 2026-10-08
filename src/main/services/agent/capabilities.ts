@@ -17,7 +17,7 @@
  * new fields is safe — renderer fallbacks tolerate missing flags.
  */
 
-export type EngineId = 'anthropic' | 'halo' | 'codex'
+export type EngineId = 'anthropic' | 'halo' | 'codex' | 'dsh'
 
 /**
  * Logical tool kinds Halo's UI knows how to render. The renderer maps tool
@@ -103,6 +103,17 @@ export interface EngineCapabilities {
     /** Whether sub-agent task lifecycle events are observable from outside. */
     visibleLifecycle: boolean
   }
+  prompt: {
+    /**
+     * The runtime writes its own agent guidance from the tools it actually
+     * registered — dsh assembles one section per mounted plugin, Codex ships
+     * built-in instructions. Halo then contributes identity and product
+     * context only: a second tool policy written against CC's tool names
+     * would both contradict the runtime's own and name tools the model does
+     * not have. False means Halo owns that layer (see `system-prompt.ts`).
+     */
+    nativeAgentGuidance: boolean
+  }
   features: {
     skills: boolean
     mcp: boolean
@@ -131,6 +142,12 @@ export interface EngineCapabilities {
     multimodalImage: boolean
     contextCompaction: boolean
     askUserQuestion: boolean
+    /**
+     * Whether the engine keeps a per-session goal the host can read and set
+     * (`getGoal` / `setGoal` on the session, `goal` seed option) and reports
+     * changes as `system` / `goal_updated` stream messages.
+     */
+    goal: boolean
   }
 }
 
@@ -162,6 +179,7 @@ export const ANTHROPIC_CAPABILITIES: EngineCapabilities = {
   },
   todo: { states: ['pending', 'in_progress', 'completed'], hasActiveForm: true },
   subAgent: { model: 'declarative', visibleLifecycle: true },
+  prompt: { nativeAgentGuidance: false },
   features: {
     skills: true,
     mcp: true,
@@ -173,28 +191,34 @@ export const ANTHROPIC_CAPABILITIES: EngineCapabilities = {
     multimodalImage: true,
     contextCompaction: true,
     askUserQuestion: true,
+    goal: false,
   },
 }
 
 /**
- * Halo SDK — currently mirrors CC's capability set since it implements the
- * same protocol surface. Kept as a separate constant so future divergence is
- * a simple constant edit, not an architectural change.
+ * Halo SDK — mirrors CC's capability set since it implements the same protocol
+ * surface, plus the features only it offers.
  */
 export const HALO_CAPABILITIES: EngineCapabilities = {
   ...ANTHROPIC_CAPABILITIES,
   engineId: 'halo',
   displayName: 'Halo SDK',
+  features: {
+    ...ANTHROPIC_CAPABILITIES.features,
+    goal: true,
+  },
 }
 
 /**
- * Codex (app-server) — see codex/capabilities.ts for the canonical definition.
- * Re-exported here so callers don't need to touch the codex/ subtree to get
- * the descriptor.
+ * Codex (app-server) and DeepSeek Harness — see the adapter subtrees for the
+ * canonical definitions. Re-exported here so callers don't need to reach into
+ * an adapter subtree to get a descriptor.
  */
 export { CODEX_CAPABILITIES } from './codex/capabilities'
+export { DSH_CAPABILITIES } from './dsh/capabilities'
 
 import { CODEX_CAPABILITIES } from './codex/capabilities'
+import { DSH_CAPABILITIES } from './dsh/capabilities'
 
 /**
  * Resolve capabilities for an engine id. Used by `getEngineCapabilities()`
@@ -205,5 +229,6 @@ export function defaultCapabilitiesFor(engineId: EngineId): EngineCapabilities {
     case 'anthropic': return ANTHROPIC_CAPABILITIES
     case 'halo': return HALO_CAPABILITIES
     case 'codex': return CODEX_CAPABILITIES
+    case 'dsh': return DSH_CAPABILITIES
   }
 }

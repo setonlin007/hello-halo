@@ -23,9 +23,10 @@ import {
   streamOpenAIChatToAnthropic,
   streamOpenAIResponsesToAnthropic,
   streamAnthropicPassthrough,
-  pipeAnthropicPassthrough
+  pipeAnthropicPassthrough,
+  collectAnthropicMessage
 } from '../stream'
-import { isNativeAnthropicHost, normalizeClaudeCodeAttribution, normalizeSystemPrompt, resolveClaudeCodeUserAgent, safeJsonParse, pickSessionAffinityHeaders, pickSessionId, inlineToolSchemaRefs } from '../utils'
+import { isNativeAnthropicHost, normalizeAnthropicReasoning, normalizeClaudeCodeAttribution, normalizeSystemPrompt, resolveClaudeCodeUserAgent, safeJsonParse, pickSessionAffinityHeaders, pickSessionId, inlineToolSchemaRefs } from '../utils'
 import { proxyFetch } from '../../services/proxy-fetch'
 import { getApiTypeFromUrl, isValidEndpointUrl, getEndpointUrlError, shouldForceStream } from './api-type'
 import { runInterceptors } from '../interceptors'
@@ -33,6 +34,7 @@ import { applyProviderAdapter, type AdapterContext } from './provider-adapters'
 import { handleKiroRequest } from '../adapters/kiro.adapter'
 import { countTokens } from '../utils/token-counter'
 import { deferInputTokensEstimate, fillResponseUsageFallback } from '../utils/usage-estimator'
+import { applyRetryHints, getUpstreamError, sendError } from './error-response'
 
 export interface RequestHandlerOptions {
   debug?: boolean
@@ -48,90 +50,6 @@ export interface RequestHandlerOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
-
-/**
- * Anthropic error type to HTTP status code mapping
- */
-const ERROR_STATUS_MAP: Record<string, number> = {
-  invalid_request_error: 400,
-  authentication_error: 401,
-  permission_error: 403,
-  not_found_error: 404,
-  request_too_large: 413,
-  rate_limit_error: 429,
-  api_error: 500,
-  overloaded_error: 529,
-  timeout_error: 504
-}
-
-/**
- * HTTP status code to Anthropic error type mapping (official only)
- */
-const STATUS_ERROR_MAP: Record<number, string> = {
-  400: 'invalid_request_error',
-  401: 'authentication_error',
-  403: 'permission_error',
-  404: 'not_found_error',
-  413: 'request_too_large',
-  429: 'rate_limit_error',
-  500: 'api_error',
-  529: 'overloaded_error'
-}
-
-/**
- * Get Anthropic error type from HTTP status code
- */
-function getErrorTypeFromStatus(status: number): string {
-  return STATUS_ERROR_MAP[status] || 'api_error'
-}
-
-/**
- * Get error type and message from upstream response
- * Priority: upstream error.type (OpenAI format) > HTTP status mapping > 'api_error'
- */
-function getUpstreamError(status: number, errorText: string): { type: string; message: string } {
-  try {
-    const json = JSON.parse(errorText)
-    // OpenAI format: { error: { type, message } }
-    if (json?.error?.type) {
-      return { type: json.error.type, message: json.error.message || '' }
-    }
-    // Anthropic format: { error: { type, message } }
-    if (json?.error?.message) {
-      return { type: json.error.type || getErrorTypeFromStatus(status), message: json.error.message }
-    }
-  } catch {
-    // Not JSON, ignore
-  }
-  return {
-    type: getErrorTypeFromStatus(status),
-    message: errorText || `HTTP ${status}`
-  }
-}
-
-/**
- * Send error response in Anthropic JSON format
- *
- * Returns HTTP error status code + JSON body (not SSE).
- * SDK recognizes HTTP 4xx/5xx and throws APIError immediately.
- */
-function sendError(
-  res: ExpressResponse,
-  errorType: string,
-  message: string
-): void {
-  const status = ERROR_STATUS_MAP[errorType] || 500
-  console.log(`[RequestHandler] Sending error: HTTP ${status} ${errorType} - ${message.slice(0, 100)}`)
-
-  res.status(status)
-  res.setHeader('Content-Type', 'application/json')
-  res.setHeader('request-id', `req_${Date.now()}`)
-  res.setHeader('retry-after', '3')
-  res.json({
-    type: 'error',
-    error: { type: errorType, message }
-  })
-}
 
 // ============================================================================
 // Upstream Fetch
@@ -420,14 +338,17 @@ async function handleAnthropicPassthrough(
     anthropicRequest.model = wireModel
   }
 
-  const toolCount = anthropicRequest.tools?.length ?? 0
-  console.log(`[RequestHandler] Anthropic passthrough tools=${toolCount}`)
-  console.log(`[RequestHandler] POST ${targetUrl} (stream=${anthropicRequest.stream ?? false})`)
+  // Runs on the wire model: thinking controls depend on the model that answers.
+  const { request: upstreamRequest, modified: reasoningNormalized } =
+    normalizeAnthropicReasoning(anthropicRequest, config)
 
-  // Use raw body buffer when neither interceptors nor model override modified the request.
+  const toolCount = anthropicRequest.tools?.length ?? 0
+  const pipeMode = isNativeAnthropicHost(backendUrl) ? 'raw' : 'repair'
+
+  // Use raw body buffer when nothing above modified the request.
   // This avoids a JSON.stringify round-trip — the upstream receives byte-identical body from SDK.
-  const canUseRawBody = rawBody && !requestModified && !modelOverridden
-  const fetchBody: Buffer | unknown = canUseRawBody ? rawBody : anthropicRequest
+  const canUseRawBody = rawBody && !requestModified && !modelOverridden && !reasoningNormalized
+  const fetchBody: Buffer | unknown = canUseRawBody ? rawBody : upstreamRequest
 
   if (debug) {
     console.log(`[RequestHandler] Raw body forwarding: ${canUseRawBody ? 'yes' : 'no (modified)'}`)
@@ -444,8 +365,7 @@ async function handleAnthropicPassthrough(
     const upstreamResp = await fetchAnthropicUpstream(
       targetUrl, apiKey, fetchBody, timeoutMs, sdkHeaders, customHeaders, clientAbort.signal
     )
-    console.log(`[RequestHandler] Anthropic upstream response: ${upstreamResp.status}`)
-    console.log(`[RequestHandler] upstream_ok wire=anthropic status=${upstreamResp.status} duration_ms=${Date.now() - anthUpstreamStartTs} url=${targetUrl}`)
+    console.log(`[RequestHandler] upstream_ok wire=anthropic status=${upstreamResp.status} duration_ms=${Date.now() - anthUpstreamStartTs} stream=${anthropicRequest.stream ?? false} tools=${toolCount} url=${targetUrl}`)
 
     // Handle errors — forward upstream response transparently (status + headers + body)
     if (!upstreamResp.ok) {
@@ -455,8 +375,8 @@ async function handleAnthropicPassthrough(
 
       res.status(upstreamResp.status)
       forwardResponseHeaders(upstreamResp, res)
-      // Business policy: override retry-after for faster client recovery
-      res.setHeader('retry-after', '3')
+      const { type: errorType, message: errorMessage } = getUpstreamError(upstreamResp.status, errorText)
+      applyRetryHints(res, upstreamResp.status, errorType, errorMessage, upstreamResp.headers)
       res.end(errorText)
       return
     }
@@ -468,11 +388,10 @@ async function handleAnthropicPassthrough(
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
 
-      if (isNativeAnthropicHost(backendUrl)) {
+      if (pipeMode === 'raw') {
         // Genuine first-party Anthropic: forward SSE verbatim. The repair
         // pipeline (below) would drop interleaved thinking text, so it must be
         // bypassed for well-formed native streams.
-        console.log('[RequestHandler] Anthropic passthrough (raw pipe)')
         await pipeAnthropicPassthrough(upstreamResp.body, res)
       } else {
         // Third-party Anthropic-compatible providers: re-serialize through the
@@ -487,7 +406,7 @@ async function handleAnthropicPassthrough(
           deferInputTokensEstimate(anthropicRequest)
         )
       }
-      console.log(`[RequestHandler] stream_end wire=anthropic status=${upstreamResp.status} duration_ms=${Date.now() - anthUpstreamStartTs} client_aborted=${clientAbort.signal.aborted} url=${targetUrl}`)
+      console.log(`[RequestHandler] stream_end wire=anthropic pipe=${pipeMode} status=${upstreamResp.status} duration_ms=${Date.now() - anthUpstreamStartTs} client_aborted=${clientAbort.signal.aborted} url=${targetUrl}`)
       return
     }
 
@@ -529,7 +448,6 @@ async function handleOpenAIConversion(
 ): Promise<void> {
   const { debug = false, timeoutMs = DEFAULT_TIMEOUT_MS, sdkHeaders } = options
   const { url: backendUrl, key: apiKey, model, headers: customHeaders, apiType: configApiType, adapterId } = config
-  console.log(`[RequestHandler] adapterId: ${adapterId || 'none'}`)
 
   // Validate URL has valid endpoint suffix
   if (!isValidEndpointUrl(backendUrl)) {
@@ -543,8 +461,6 @@ async function handleOpenAIConversion(
   if (model) {
     anthropicRequest.model = model
   }
-
-  console.log(`[RequestHandler] model=${anthropicRequest.model} apiKey=${apiKey ? apiKey.slice(0, 8) + '...' : 'none'}`)
 
   // Requests are deliberately NOT serialized per backend: a single slow stream
   // (e.g. a multi-minute reasoning turn) must never block other sessions.
@@ -568,28 +484,29 @@ async function handleOpenAIConversion(
     const requestToSend = { ...anthropicRequest, stream: wantStream }
     const convertOptions = {
       visionOverride: config.visionOverride,
-      reasoningEffort: config.reasoningEffort
+      reasoningEffort: config.reasoningEffort,
+      pickedReasoningEffort: config.pickedReasoningEffort
     }
     const openaiRequest = apiType === 'responses'
       ? convertAnthropicToOpenAIResponses(requestToSend, convertOptions).request
       : convertAnthropicToOpenAIChat(requestToSend, convertOptions).request
 
     const toolCount = (openaiRequest as any).tools?.length ?? 0
-    console.log(`[RequestHandler] wire=${apiType} tools=${toolCount}`)
     if (debug && toolCount > 0) {
       // Tool schemas are resent every turn and usually dominate input tokens;
       // the stringify is the reason this stays behind the debug flag.
       console.log(`[RequestHandler] tools_payload_chars=${JSON.stringify((openaiRequest as any).tools).length}`)
     }
-    console.log(`[RequestHandler] POST ${backendUrl} (stream=${wantStream ?? false})`)
-
     const requestHeaders: Record<string, string> = {
       ...(customHeaders || {}),
       ...pickSessionAffinityHeaders(sdkHeaders),
     }
 
     // Apply provider-specific transformations (e.g., Groq temperature fix, OpenRouter headers)
-    const adapterContext: AdapterContext = { originalRequest: requestToSend, sessionId: pickSessionId(sdkHeaders) }
+    const adapterContext: AdapterContext = {
+      originalRequest: requestToSend, sessionId: pickSessionId(sdkHeaders),
+      codexModelCapabilities: config.codexModelCapabilities
+    }
     const adapter = applyProviderAdapter(
       backendUrl,
       openaiRequest as unknown as Record<string, unknown>,
@@ -597,14 +514,9 @@ async function handleOpenAIConversion(
       adapterId,
       adapterContext
     )
-    if (adapter) {
-      console.log(`[RequestHandler] Applied provider adapter: ${adapter.name}`)
-    }
-
     // Make upstream request - URL is used directly, no modification
     let upstreamResp = await fetchUpstream(backendUrl, apiKey, openaiRequest, timeoutMs, clientAbort.signal, requestHeaders)
-    console.log(`[RequestHandler] Upstream response: ${upstreamResp.status}`)
-    console.log(`[RequestHandler] upstream_ok wire=openai api_type=${apiType} status=${upstreamResp.status} duration_ms=${Date.now() - oaiUpstreamStartTs} url=${backendUrl}`)
+    console.log(`[RequestHandler] upstream_ok wire=openai api_type=${apiType} status=${upstreamResp.status} duration_ms=${Date.now() - oaiUpstreamStartTs} model=${anthropicRequest.model} stream=${wantStream ?? false} tools=${toolCount} adapter=${adapter?.name ?? adapterId ?? 'none'} url=${backendUrl}`)
 
     // Handle errors - use upstream error type if available, else map from status
     if (!upstreamResp.ok) {
@@ -635,10 +547,10 @@ async function handleOpenAIConversion(
             const retryErrorText = await upstreamResp.text().catch(() => '')
             const { type: retryErrorType, message: retryErrorMessage } = getUpstreamError(upstreamResp.status, retryErrorText)
             console.error(`[RequestHandler] Provider error ${upstreamResp.status}: ${retryErrorText.slice(0, 200)}`)
-            return sendError(res, retryErrorType, retryErrorMessage)
+            return sendError(res, retryErrorType, retryErrorMessage, upstreamResp)
           }
         } else {
-          return sendError(res, errorType, errorMessage)
+          return sendError(res, errorType, errorMessage, upstreamResp)
         }
       } else if (requiresStream && !wantStream) {
         console.warn('[RequestHandler] Upstream requires stream=true, retrying...')
@@ -661,28 +573,49 @@ async function handleOpenAIConversion(
           const { type: retryErrorType, message: retryErrorMessage } = getUpstreamError(upstreamResp.status, retryErrorText)
           console.error(`[RequestHandler] Provider error ${upstreamResp.status}: ${retryErrorText.slice(0, 200)}`)
           console.log(`[RequestHandler] upstream_error_detail wire=openai api_type=${apiType} retry=true status=${upstreamResp.status} duration_ms=${Date.now() - oaiRetryStartTs} content_type=${upstreamResp.headers.get('content-type') || ''} www_authenticate=${upstreamResp.headers.get('www-authenticate') || ''} url=${backendUrl} body_head="${retryErrorText.slice(0, 500).replace(/"/g, "'")}"`)
-          return sendError(res, retryErrorType, retryErrorMessage)
+          return sendError(res, retryErrorType, retryErrorMessage, upstreamResp)
         }
       } else {
-        return sendError(res, errorType, errorMessage)
+        return sendError(res, errorType, errorMessage, upstreamResp)
       }
     }
 
     // Handle streaming response
     if (wantStream) {
-      res.setHeader('Content-Type', 'text/event-stream')
-      res.setHeader('Cache-Control', 'no-cache')
-      res.setHeader('Connection', 'keep-alive')
-
       // Background input-token estimate backing the usage fallback for
       // providers that omit usage from the stream; computes while the
       // model generates, so stream finish never waits on it.
       const estimateInputTokens = deferInputTokensEstimate(anthropicRequest)
-      if (apiType === 'responses') {
-        await streamOpenAIResponsesToAnthropic(upstreamResp.body, res, anthropicRequest.model, debug, estimateInputTokens)
-      } else {
-        await streamOpenAIChatToAnthropic(upstreamResp.body, res, anthropicRequest.model, debug, estimateInputTokens)
+      const streamToAnthropic = apiType === 'responses' ? streamOpenAIResponsesToAnthropic : streamOpenAIChatToAnthropic
+      const upstreamBody = upstreamResp.body
+
+      // The upstream may stream for a client that did not ask to (a source
+      // that forces streaming, a Responses upstream given no stream flag, a
+      // retry the upstream demanded); that client expects one JSON message.
+      // Claude Code sends such a request as its fallback after a failed
+      // stream and reads `usage` straight off the reply.
+      if (anthropicRequest.stream !== true) {
+        const collected = await collectAnthropicMessage((sink) =>
+          streamToAnthropic(upstreamBody, sink, anthropicRequest.model, debug, estimateInputTokens))
+        if (clientAbort.signal.aborted) {
+          console.log(`[RequestHandler] client_disconnected wire=openai api_type=${apiType} duration_ms=${Date.now() - oaiUpstreamStartTs} url=${backendUrl} — collected stream dropped`)
+          return
+        }
+        const outcome = 'error' in collected
+          ? `error=${collected.error.type}`
+          : `stop=${collected.message.stop_reason} blocks=${collected.message.content.length}`
+        console.log(`[RequestHandler] stream_collected wire=openai api_type=${apiType} status=${upstreamResp.status} duration_ms=${Date.now() - oaiUpstreamStartTs} ${outcome} url=${backendUrl}`)
+        if ('error' in collected) {
+          return sendError(res, collected.error.type, collected.error.message)
+        }
+        res.json(collected.message)
+        return
       }
+
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Connection', 'keep-alive')
+      await streamToAnthropic(upstreamBody, res, anthropicRequest.model, debug, estimateInputTokens)
       console.log(`[RequestHandler] stream_end wire=openai api_type=${apiType} status=${upstreamResp.status} duration_ms=${Date.now() - oaiUpstreamStartTs} client_aborted=${clientAbort.signal.aborted} url=${backendUrl}`)
       return
     }
@@ -733,8 +666,7 @@ export async function handleMessagesRequest(
   res: ExpressResponse,
   options: RequestHandlerOptions = {}
 ): Promise<void> {
-  const { url: backendUrl, apiType: configApiType } = config
-  console.log('[RequestHandler] handleMessagesRequest', backendUrl)
+  const { apiType: configApiType } = config
 
   // Run interceptors on Anthropic-format request (before any conversion)
   const interceptResult = await runInterceptors(

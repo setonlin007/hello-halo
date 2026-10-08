@@ -14,7 +14,7 @@
  * quick actions.
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react'
 import { ArtifactFilesTab } from './ArtifactFilesTab'
 import { DigitalHumansTab } from './DigitalHumansTab'
 import { SkillsTab } from './SkillsTab'
@@ -23,7 +23,24 @@ import { useCanvasStore } from '../../stores/canvas.store'
 import { ChevronRight, X } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 import { useIsMobile } from '../../hooks/useIsMobile'
+import { capCount, msBucket, trackHome } from '../../services/home-telemetry'
 import type { ArtifactRailTab as RailTab } from '../../types'
+
+interface TabView { tab: RailTab; firstOpen: boolean; startedAt: number }
+interface TabItems { count: number; ok: boolean }
+
+function trackTabView(view: TabView, items: TabItems) {
+  // Only Skill and MCP fetch on first open, so only they have a load to time.
+  const timed = view.firstOpen && (view.tab === 'skill' || view.tab === 'mcp')
+  trackHome('home.rail.tab.view', {
+    tab: view.tab,
+    firstOpen: view.firstOpen,
+    itemCount: capCount(items.count),
+    empty: items.count === 0,
+    loadBucket: timed ? msBucket(Date.now() - view.startedAt) : undefined,
+    ok: timed ? items.ok : undefined,
+  })
+}
 
 // Width constraints (in pixels) - Desktop only
 const MIN_WIDTH = 200
@@ -36,6 +53,9 @@ const DEFAULT_WIDTH = 300
 // (tree expansion, fetched lists) across a collapse/expand cycle.
 const COLLAPSED_WIDTH = 0
 const clampWidth = (v: number) => Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, v))
+// Header width besides the tab strip: side padding, collapse button, border
+// and a little air, so the tabs fit on one line without scrolling.
+const HEADER_CHROME_PX = 60
 
 interface ArtifactRailProps {
   // External control props for Canvas integration
@@ -44,13 +64,19 @@ interface ArtifactRailProps {
   // Width persistence
   initialWidth?: number             // Persisted width from config
   onWidthChange?: (width: number) => void  // Callback when user finishes resizing
+  /** The width the rail takes when open: its stored width, or wider to fit its tabs. Reported at rest, not mid-drag. */
+  onOpenWidthChange?: (width: number) => void
   /** One-shot external tab request (e.g. a workspace card's asset chip) —
    * every change switches to that tab, not just the first. */
   initialTab?: RailTab
 }
 
 /** Tab strip — Files/Skill/MCP, each a sibling content component below. */
-function TabStrip({ active, onChange }: { active: RailTab; onChange: (tab: RailTab) => void }) {
+function TabStrip({ active, onChange, stripRef }: {
+  active: RailTab
+  onChange: (tab: RailTab) => void
+  stripRef?: React.Ref<HTMLDivElement>
+}) {
   const { t } = useTranslation()
   const tabs: { id: RailTab; label: string }[] = [
     { id: 'files', label: t('Files') },
@@ -59,12 +85,12 @@ function TabStrip({ active, onChange }: { active: RailTab; onChange: (tab: RailT
     { id: 'mcp', label: t('MCP') },
   ]
   return (
-    <div className="flex items-center gap-1 overflow-x-auto">
+    <div ref={stripRef} className="flex min-w-0 items-center gap-1 overflow-x-auto scrollbar-none">
       {tabs.map(tab => (
         <button
           key={tab.id}
           onClick={() => onChange(tab.id)}
-          className={`h-[26px] px-2.5 rounded-sm text-xs transition-colors ease-halo ${
+          className={`h-[26px] px-2.5 flex-shrink-0 whitespace-nowrap rounded-sm text-[13px] transition-colors ease-halo ${
             active === tab.id ? 'bg-secondary text-foreground font-medium' : 'text-subtle-foreground hover:text-foreground'
           }`}
           aria-current={active === tab.id}
@@ -81,6 +107,7 @@ export function ArtifactRail({
   onExpandedChange,
   initialWidth,
   onWidthChange,
+  onOpenWidthChange,
   initialTab
 }: ArtifactRailProps) {
   const { t } = useTranslation()
@@ -120,6 +147,70 @@ export function ArtifactRail({
   onWidthChangeRef.current = onWidthChange
   const isMobile = useIsMobile()
 
+  // The rail never gets narrower than its tab labels in the current language.
+  const tabStripRef = useRef<HTMLDivElement>(null)
+  const [minWidth, setMinWidth] = useState(MIN_WIDTH)
+  const minWidthRef = useRef(minWidth)
+  useLayoutEffect(() => {
+    const strip = tabStripRef.current
+    if (!isExpanded || isMobile || !strip) return
+    const next = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, strip.scrollWidth + HEADER_CHROME_PX))
+    minWidthRef.current = next
+    setMinWidth(next)
+  }, [isExpanded, isMobile, t])
+  const effectiveWidth = Math.max(width, minWidth)
+  const onOpenWidthChangeRef = useRef(onOpenWidthChange)
+  onOpenWidthChangeRef.current = onOpenWidthChange
+  // Before the page's own layout effects, so it knows the width before first paint.
+  useLayoutEffect(() => {
+    if (!isDragging) onOpenWidthChangeRef.current?.(effectiveWidth)
+  }, [effectiveWidth, isDragging])
+
+  // A tab view is emitted by the shell, which knows when a tab was activated,
+  // once the tab has reported its list — mounted-but-hidden tabs report too,
+  // so an activation can often be answered at once.
+  const tabItemsRef = useRef(new Map<RailTab, TabItems>())
+  const viewedTabsRef = useRef(new Set<RailTab>())
+  const pendingTabViewRef = useRef<TabView | null>(null)
+
+  const reportTabItems = useCallback((tab: RailTab, count: number | null, ok = true) => {
+    if (count === null) {
+      tabItemsRef.current.delete(tab)
+      return
+    }
+    const items = { count, ok }
+    tabItemsRef.current.set(tab, items)
+    const pending = pendingTabViewRef.current
+    if (pending?.tab === tab) {
+      pendingTabViewRef.current = null
+      trackTabView(pending, items)
+    }
+  }, [])
+
+  const tabItemsListeners = useMemo(() => ({
+    files: (count: number | null, ok?: boolean) => reportTabItems('files', count, ok),
+    'digital-humans': (count: number | null, ok?: boolean) => reportTabItems('digital-humans', count, ok),
+    skill: (count: number | null, ok?: boolean) => reportTabItems('skill', count, ok),
+    mcp: (count: number | null, ok?: boolean) => reportTabItems('mcp', count, ok),
+  }), [reportTabItems])
+
+  const isRailVisible = isMobile ? mobileOverlayOpen : isExpanded
+  useEffect(() => {
+    if (!isRailVisible) {
+      pendingTabViewRef.current = null
+      return
+    }
+    const view = { tab: activeTab, firstOpen: !viewedTabsRef.current.has(activeTab), startedAt: Date.now() }
+    viewedTabsRef.current.add(activeTab)
+    const items = tabItemsRef.current.get(activeTab)
+    if (items) {
+      pendingTabViewRef.current = null
+      trackTabView(view, items)
+    } else {
+      pendingTabViewRef.current = view
+    }
+  }, [isRailVisible, activeTab])
+
   // Sync width when initialWidth arrives from async config load
   useEffect(() => {
     if (initialWidth !== undefined && !isDragging) {
@@ -135,11 +226,12 @@ export function ArtifactRail({
   // Handle expand/collapse toggle
   const handleToggleExpanded = useCallback(() => {
     const newExpanded = !isExpanded
+    trackHome('home.rail.toggle', { open: newExpanded, surface: 'header_button' })
 
     // UI-first optimization: When Canvas is open, directly update DOM
     // before React state update to ensure layout resizes immediately
     if (isCanvasOpen && railRef.current) {
-      const targetWidth = newExpanded ? width : COLLAPSED_WIDTH
+      const targetWidth = newExpanded ? effectiveWidth : COLLAPSED_WIDTH
       railRef.current.style.width = `${targetWidth}px`
     }
 
@@ -148,7 +240,7 @@ export function ArtifactRail({
     } else {
       setInternalExpanded(newExpanded)
     }
-  }, [isExpanded, isControlled, onExpandedChange, isCanvasOpen, width])
+  }, [isExpanded, isControlled, onExpandedChange, isCanvasOpen, effectiveWidth])
 
   // Handle drag resize (desktop only)
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -163,7 +255,7 @@ export function ArtifactRail({
     const handleMouseMove = (e: MouseEvent) => {
       if (!railRef.current) return
       const newWidth = window.innerWidth - e.clientX
-      const clampedWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, newWidth))
+      const clampedWidth = Math.min(MAX_WIDTH, Math.max(minWidthRef.current, newWidth))
       setWidth(clampedWidth)
       widthRef.current = clampedWidth
     }
@@ -197,21 +289,21 @@ export function ArtifactRail({
   const tabContent = (
     <>
       <div className={`flex-1 flex flex-col overflow-hidden${activeTab === 'files' ? '' : ' hidden'}`}>
-        <ArtifactFilesTab />
+        <ArtifactFilesTab onItemsChange={tabItemsListeners.files} />
       </div>
       {mountedTabs.has('digital-humans') && (
         <div className={`flex-1 flex flex-col overflow-hidden${activeTab === 'digital-humans' ? '' : ' hidden'}`}>
-          <DigitalHumansTab />
+          <DigitalHumansTab onItemsChange={tabItemsListeners['digital-humans']} />
         </div>
       )}
       {mountedTabs.has('skill') && (
         <div className={`flex-1 flex flex-col overflow-hidden${activeTab === 'skill' ? '' : ' hidden'}`}>
-          <SkillsTab />
+          <SkillsTab onItemsChange={tabItemsListeners.skill} />
         </div>
       )}
       {mountedTabs.has('mcp') && (
         <div className={`flex-1 flex flex-col overflow-hidden${activeTab === 'mcp' ? '' : ' hidden'}`}>
-          <McpTab />
+          <McpTab onItemsChange={tabItemsListeners.mcp} />
         </div>
       )}
     </>
@@ -221,11 +313,14 @@ export function ArtifactRail({
   if (isMobile) {
     return (
       <>
-        {/* Floating trigger button - z-[60] to stay above Canvas overlay (z-50) */}
+        {/* The resource trigger stays above the mobile canvas and browser guest. */}
         <button
-          onClick={() => setMobileOverlayOpen(true)}
+          onClick={() => {
+            trackHome('home.rail.toggle', { open: true, surface: 'mobile_fab' })
+            setMobileOverlayOpen(true)
+          }}
           className="
-            fixed right-0 top-1/3 z-[60]
+            fixed right-0 top-1/3 z-[var(--layer-workspace-trigger)]
             w-10 h-14
             bg-card
             border-l border-y border-border
@@ -241,9 +336,9 @@ export function ArtifactRail({
           <ChevronRight className="w-4 h-4 text-muted-foreground rotate-180" />
         </button>
 
-        {/* Overlay backdrop + panel - z-[70] to stay above Canvas overlay (z-50) */}
+        {/* The resource sheet covers both the canvas and its browser guest. */}
         {mobileOverlayOpen && (
-          <div className="fixed z-[70] flex justify-end" style={{ top: 'var(--sat, 0px)', right: 0, bottom: 0, left: 0 }}>
+          <div className="fixed z-[var(--layer-workspace-sheet)] flex justify-end" style={{ top: 'var(--sat, 0px)', right: 0, bottom: 0, left: 0 }}>
             {/* Backdrop */}
             <div
               className="absolute inset-0 bg-background/70 animate-fade-in"
@@ -281,12 +376,12 @@ export function ArtifactRail({
   }
 
   // ==================== Desktop Inline Mode ====================
-  const displayWidth = isExpanded ? width : COLLAPSED_WIDTH
+  const displayWidth = isExpanded ? effectiveWidth : COLLAPSED_WIDTH
 
   return (
     <div
       ref={railRef}
-      className={`h-full flex-shrink-0 flex flex-col relative overflow-hidden ${isExpanded ? 'border-l border-border bg-card' : ''}`}
+      className={`h-full flex-shrink-0 flex flex-col relative overflow-hidden ${isExpanded ? 'border-l border-border/50 bg-card' : ''}`}
       style={{
         width: displayWidth,
         // Disable transition when: dragging OR Canvas is open (prevent layout flicker)
@@ -310,11 +405,11 @@ export function ArtifactRail({
           collapse direction — there's no icon-only strip to click when
           closed, matching the prototype's binary show/hide. */}
       {isExpanded && (
-        <div className="flex-shrink-0 pl-3 pr-1.5 h-10 border-b border-border flex items-center justify-between">
-          <TabStrip active={activeTab} onChange={handleTabChange} />
+        <div className="flex-shrink-0 pl-3 pr-1.5 h-10 border-b border-border/50 flex items-center justify-between">
+          <TabStrip active={activeTab} onChange={handleTabChange} stripRef={tabStripRef} />
           <button
             onClick={handleToggleExpanded}
-            className="w-8 h-8 flex items-center justify-center rounded-sm text-subtle-foreground transition-colors ease-halo hover:bg-secondary hover:text-foreground"
+            className="w-8 h-8 flex items-center justify-center rounded-sm text-faint-foreground transition-colors ease-halo hover:bg-secondary hover:text-foreground"
           >
             <ChevronRight className="w-4 h-4" />
           </button>

@@ -6,7 +6,7 @@
  * streaming text) for the selected IM session.
  *
  * No input area — IM interactions happen in the external IM channel.
- * Reuses the same atomic chat components as AppChatView for consistency.
+ * Reuses the same atomic chat components as the main chat page for consistency.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react'
@@ -19,7 +19,7 @@ import { useEngineCapabilities } from '../../stores/engine.store'
 import { MessageList } from '../chat/MessageList'
 import type { MessageListHandle } from '../chat/MessageList'
 import { ScrollToBottomButton } from '../chat/ScrollToBottomButton'
-import { useRemoteSubscription } from '../../hooks/useRemoteSubscription'
+import { useConversationDetail } from '../../hooks/useConversationDetail'
 import { useWsRecovery } from '../../hooks/useWsRecovery'
 import { useTranslation } from '../../i18n'
 import type { Message } from '../../types'
@@ -27,6 +27,7 @@ import type { ImSessionRecord, SessionSource } from '../../../shared/types/im-ch
 import { getImSessionDisplayName } from '../../../shared/types/im-channel'
 import { buildImSessionKey } from '../../../shared/apps/im-keys'
 import { CHANNEL_LABELS } from './im-channel-labels'
+import type { ApiRetryState } from '../../../shared/types/api-retry'
 
 interface ImChatViewProps {
   appId: string
@@ -45,8 +46,8 @@ export function ImChatView({ appId, spaceId, session, clearKey, footerAction }: 
 
   const conversationId = buildImSessionKey(appId, session.channel, session.chatType, session.chatId)
 
-  // ── Subscribe to agent events (remote/Capacitor clients use WebSocket) ──
-  useRemoteSubscription(conversationId)
+  // Live reply detail for this conversation, desktop and remote alike.
+  useConversationDetail(conversationId)
 
   // Persisted messages
   const [messages, setMessages] = useState<Message[]>([])
@@ -67,7 +68,7 @@ export function ImChatView({ appId, spaceId, session, clearKey, footerAction }: 
     textBlockVersion,
   } = chatSession
 
-  // Scroll control via the shared MessageList shell (Virtuoso-based)
+  // Scroll control via the shared MessageList shell
   const messageListRef = useRef<MessageListHandle>(null)
   const [showScrollButton, setShowScrollButton] = useState(false)
   const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
@@ -124,8 +125,33 @@ export function ImChatView({ appId, spaceId, session, clearKey, footerAction }: 
     return () => { cancelled = true }
   }, [isGenerating, appId, spaceId, session.channel, session.chatType, session.chatId])
 
+  // A message the digital human pushes to this chat is written outside any turn,
+  // so the session update announcing it is the cue to read the record again.
+  useEffect(() => {
+    let cancelled = false
+    const unsubscribe = api.onImSessionUpdated?.((data: unknown) => {
+      const update = data as { appId?: string; channel?: string; chatId?: string }
+      if (update.appId !== appId || update.channel !== session.channel || update.chatId !== session.chatId) return
+      if (session.teamContext || useChatStore.getState().getSession(conversationId).isGenerating) return
+      api.appImChatMessages(appId, spaceId, session.channel, session.chatType, session.chatId)
+        .then(res => {
+          if (cancelled) return
+          if (res.success && res.data) {
+            const msgs = (res.data as Message[]) ?? []
+            setMessages(msgs)
+            setLoadState(msgs.length > 0 ? 'loaded' : 'empty')
+          }
+        })
+        .catch(err => { if (!cancelled) console.error('[ImChatView] Reload error:', err) })
+    })
+    return () => {
+      cancelled = true
+      unsubscribe?.()
+    }
+  }, [appId, spaceId, conversationId, session.channel, session.chatType, session.chatId])
+
   // ── WebSocket reconnect recovery (remote/Capacitor only) ──
-  // Same pattern as AppChatView — reload messages and reconcile session state
+  // Same pattern as the main chat page — reload messages and reconcile session state
   // after a WebSocket reconnect to recover any events lost during the gap.
   useWsRecovery(useCallback(() => {
     console.log(`[ImChatView] WS reconnected — reloading messages for ${conversationId}`)
@@ -145,10 +171,12 @@ export function ImChatView({ appId, spaceId, session, clearKey, footerAction }: 
     if (useChatStore.getState().getSession(conversationId).isGenerating) {
       api.getSessionState(conversationId).then(res => {
         if (res.success && res.data) {
-          const { isActive } = res.data as { isActive: boolean }
+          const { isActive, apiRetry } = res.data as { isActive: boolean; apiRetry?: ApiRetryState }
           if (!isActive) {
             console.log(`[ImChatView] Backend session inactive — clearing stale generating state`)
             useChatStore.getState().resetSession(conversationId)
+          } else {
+            useChatStore.getState().handleAgentApiRetry({ spaceId, conversationId, retry: apiRetry ?? null })
           }
         }
       }).catch(() => {})
@@ -273,9 +301,11 @@ export function ImChatView({ appId, spaceId, session, clearKey, footerAction }: 
             <p className="text-sm text-muted-foreground">{t('No messages yet')}</p>
           </div>
         ) : (
-          <div className="h-full px-4">
+          <div className="h-full">
             <MessageList
+              key={conversationId}
               ref={messageListRef}
+              sidePadClassName="px-4"
               conversationId={conversationId}
               messages={messages}
               streamingContent={streamingContent}
@@ -287,8 +317,10 @@ export function ImChatView({ appId, spaceId, session, clearKey, footerAction }: 
               error={error}
               errorType={errorType}
               textBlockVersion={textBlockVersion}
+              onStop={() => setShowStopConfirm(true)}
               onAtBottomStateChange={handleAtBottomStateChange}
-              hideBrowserViewButton
+              hideBrowserLiveView
+              hideTerminalOpen
             />
           </div>
         )}

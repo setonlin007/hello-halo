@@ -6,19 +6,15 @@
  */
 
 import { query as claudeQuery } from './resolved-sdk'
-import { getConfig, getTempSpacePath } from '../../foundation/config.service'
-import { ensureOpenAICompatRouter, encodeBackendConfig } from '../../openai-compat-router'
+import { getTempSpacePath } from '../../foundation/config.service'
 import type { McpProbeStatus, McpServerStatusInfo } from './types'
 import {
   getHeadlessElectronPath,
   getApiCredentials,
   getDbMcpServers,
-  inferOpenAIWireApi,
-  credentialsToBackendConfig
 } from './helpers'
 import { emitAgentBroadcast } from './events'
-import { getCleanUserEnv, resolveCredentialsForSdk, buildSubprocessNoProxy } from './sdk-config'
-import { resolveModelId } from '../../../shared/types/ai-sources'
+import { buildSdkEnv, resolveCredentialsForSdk } from './sdk-config'
 import { analytics } from '../analytics/analytics.service'
 import { AnalyticsEvents } from '../analytics/types'
 
@@ -29,6 +25,37 @@ import { AnalyticsEvents } from '../analytics/types'
 // Cached MCP status - updated when SDK reports status during conversation
 let cachedMcpStatus: McpServerStatusInfo[] = []
 let lastMcpStatusUpdate: number = 0
+
+const recoveredListeners = new Set<(name: string) => void>()
+
+/**
+ * Subscribe to a server's derived status turning 'connected' from anything
+ * else — by a probe, a connection test or any session's report. Sessions that
+ * could not use the server do not reconnect by themselves; the session manager
+ * rebuilds them on this cue.
+ */
+export function onMcpServerRecovered(listener: (name: string) => void): () => void {
+  recoveredListeners.add(listener)
+  return () => {
+    recoveredListeners.delete(listener)
+  }
+}
+
+function isRecovery(previous: McpServerStatusInfo | undefined, next: McpServerStatusInfo): boolean {
+  return next.status === 'connected' && previous?.status !== 'connected'
+}
+
+function notifyRecovered(names: string[]): void {
+  for (const name of names) {
+    for (const listener of recoveredListeners) {
+      try {
+        listener(name)
+      } catch (err) {
+        console.error(`[Agent] MCP recovery listener failed for ${name}:`, err)
+      }
+    }
+  }
+}
 
 /**
  * Get cached MCP status
@@ -118,6 +145,7 @@ export function broadcastMcpStatus(
   const now = Date.now()
 
   const byName = new Map(cachedMcpStatus.map(s => [s.name, s]))
+  const recovered: string[] = []
   for (const s of mcpServers) {
     const prev = byName.get(s.name)
     const sessionStatus = s.status as NonNullable<McpServerStatusInfo['sessionStatus']>
@@ -136,11 +164,13 @@ export function broadcastMcpStatus(
       lastCheckedAt: now
     }
     next.status = deriveStatus(next)
+    if (isRecovery(prev, next)) recovered.push(s.name)
     byName.set(s.name, next)
   }
   cachedMcpStatus = Array.from(byName.values())
 
   emitMcpStatusBroadcast()
+  notifyRecovered(recovered)
 }
 
 /** Probe-sourced fields. `status` is the probe's own verdict, not the derived one. */
@@ -184,6 +214,7 @@ export function updateServerStatus(name: string, patch: McpProbeStatusPatch): vo
   else cachedMcpStatus.push(entry)
 
   emitMcpStatusBroadcast()
+  if (isRecovery(prev, entry)) notifyRecovered([name])
 }
 
 /**
@@ -237,10 +268,8 @@ async function runMcpConnectionTest(): Promise<McpConnectionTestResult> {
   console.log('[Agent] Starting MCP connection test...')
 
   try {
-    const config = getConfig()
-
     // Get API credentials based on current aiSources configuration
-    const credentials = await getApiCredentials(config)
+    const credentials = await getApiCredentials()
     if (!credentials.apiKey && credentials.provider !== 'oauth') {
       return { success: false, servers: [], error: 'API key not configured' }
     }
@@ -260,36 +289,22 @@ async function runMcpConnectionTest(): Promise<McpConnectionTestResult> {
     // Use the same electron path as sendMessage (prevents Dock icon on macOS)
     const electronPath = getHeadlessElectronPath()
 
-    // Route through OpenAI compat router for non-Anthropic providers
-    let anthropicBaseUrl = credentials.baseUrl
-    let anthropicApiKey = credentials.apiKey
-    let sdkModel = resolveModelId(credentials.model)
-    let delegatedRoutingHeader: string | undefined
-
-    // Delegated sources carry no key, so the shared resolver owns their env
-    // shape — duplicating it here would let the two drift.
-    if (credentials.delegatedAuth) {
-      const resolved = await resolveCredentialsForSdk(credentials)
-      anthropicBaseUrl = resolved.anthropicBaseUrl
-      sdkModel = resolved.sdkModel
-      delegatedRoutingHeader = resolved.delegatedRoutingHeader
-      console.log(`[Agent] MCP test: delegated credential via ${anthropicBaseUrl}`)
-    } else if (credentials.provider !== 'anthropic') {
-      // For non-Anthropic providers (openai or oauth), use the OpenAI compat router
-      const router = await ensureOpenAICompatRouter({ debug: false })
-      anthropicBaseUrl = router.baseUrl
-
-      // Use apiType from credentials (set by provider), fallback to inference
-      const apiType = credentials.apiType
-        || (credentials.provider === 'oauth' ? 'chat_completions' : inferOpenAIWireApi(credentials.baseUrl))
-
-      anthropicApiKey = encodeBackendConfig(credentialsToBackendConfig(credentials, { apiType }))
-      console.log(`[Agent] MCP test: ${credentials.provider} provider enabled via ${anthropicBaseUrl}, apiType=${apiType}`)
-    }
-
+    // Resolved and given an environment exactly as a conversation's engine
+    // process is: Halo's Claude config directory (which holds a Claude Code
+    // CLI login), the proxy policy, the routing a delegated source needs.
+    const resolved = await resolveCredentialsForSdk(credentials)
+    const env = buildSdkEnv({
+      anthropicApiKey: resolved.anthropicApiKey,
+      anthropicBaseUrl: resolved.anthropicBaseUrl,
+      delegatedRoutingHeader: resolved.delegatedRoutingHeader,
+      capabilities: resolved.capabilities,
+      sourceId: resolved.sourceId,
+      // The servers under test are themselves part of the proxy policy: an
+      // http/sse server on a direct-route host must not be sent via the proxy.
+      mcpServers: enabledMcpServers,
+    })
+    console.log(`[Agent] MCP test: ${credentials.provider} credential via ${resolved.anthropicBaseUrl}${resolved.delegatedRoutingHeader ? ' (delegated)' : ''}`)
     console.log('[Agent] MCP test config:', JSON.stringify(enabledMcpServers, null, 2))
-
-    const noProxy = buildSubprocessNoProxy(anthropicBaseUrl, enabledMcpServers)
 
     // Create query with proper configuration (matching sendMessage)
     // Use a simple prompt that will get a quick response
@@ -299,27 +314,15 @@ async function runMcpConnectionTest(): Promise<McpConnectionTestResult> {
       options: {
         // A delegated run must reach the CLI with no key at all: any value here
         // makes it authenticate as an API-key user and ignore its own credential.
-        ...(delegatedRoutingHeader ? {} : { apiKey: anthropicApiKey }),
-        model: sdkModel,
-        anthropicBaseUrl,
+        ...(resolved.delegatedRoutingHeader ? {} : { apiKey: resolved.anthropicApiKey }),
+        model: resolved.sdkModel,
+        apiCredentials: credentials,
+        credentialsGeneration: credentials.credentialsGeneration,
+        anthropicBaseUrl: resolved.anthropicBaseUrl,
         cwd,
         executable: electronPath,
         executableArgs: ['--no-warnings'],
-        env: {
-          ...getCleanUserEnv(),
-          ELECTRON_RUN_AS_NODE: '1',
-          ELECTRON_NO_ATTACH_CONSOLE: '1',
-          ...(delegatedRoutingHeader
-            ? { ANTHROPIC_CUSTOM_HEADERS: delegatedRoutingHeader }
-            : { ANTHROPIC_API_KEY: anthropicApiKey }),
-          ANTHROPIC_BASE_URL: anthropicBaseUrl,
-          NO_PROXY: noProxy,
-          no_proxy: noProxy,
-          // Disable unnecessary API requests
-          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-          DISABLE_TELEMETRY: '1',
-          DISABLE_COST_WARNINGS: '1'
-        },
+        env,
         permissionMode: 'bypassPermissions',
         abortController,
         mcpServers: enabledMcpServers,

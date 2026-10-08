@@ -80,10 +80,11 @@ describe('isInsideSpace', () => {
 })
 
 describe('logWriteOutsideSpace', () => {
-  let warn: ReturnType<typeof vi.spyOn>
+  const silenceWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => {})
+  let warn: ReturnType<typeof silenceWarn>
 
   beforeEach(() => {
-    warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    warn = silenceWarn()
   })
 
   it('warns about a Write aimed outside the space', () => {

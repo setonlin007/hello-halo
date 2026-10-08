@@ -10,6 +10,15 @@
 import { describe, it, expect } from 'vitest'
 import {
   ALL_BUILTIN_TOOLS,
+  ALWAYS_AVAILABLE_BUILTIN_TOOLS,
+  DEFAULT_GUEST_ALLOWED_TOOLS,
+  SKILL_TOOL,
+  allowsBuiltinAtCallTime,
+  allowsSkill,
+  canonicalBuiltinTool,
+  capabilityPolicyFromPreset,
+  defaultGuestPolicy,
+  withGuestAccess,
   DELEGABLE_BUILTIN_TOOLS,
   allowsCapability,
   buildAllowedToolRules,
@@ -27,7 +36,6 @@ import {
 
 const ALL_MCP = {
   'web-search': {},
-  'halo-memory': {},
   'ocr': {},
   'ai-browser': {},
   'ai-terminal': {},
@@ -62,7 +70,9 @@ describe('built-in tool restriction', () => {
   })
 
   it('grants a guest nothing it was not explicitly given', () => {
-    expect(computeDisallowedBuiltins(undefined, 'strict').sort()).toEqual([...ALL_BUILTIN_TOOLS].sort())
+    // The task list is the one exception: it touches nothing outside the turn.
+    expect(computeDisallowedBuiltins(undefined, 'strict').sort())
+      .toEqual([...ALL_BUILTIN_TOOLS].filter(name => name !== 'TodoWrite').sort())
     expect(computeDisallowedBuiltins({ allowedTools: ['Read'] }, 'strict')).not.toContain('Read')
     expect(computeDisallowedBuiltins({ allowedTools: ['Read'] }, 'strict')).toContain('Bash')
   })
@@ -138,10 +148,22 @@ describe('MCP server injection', () => {
       .not.toHaveProperty('some-future-capability')
   })
 
+  it('never lends another caller the conversation tools, whatever they were granted', () => {
+    // Reading and messaging the owner's other conversations is the owner's own
+    // decision per digital human; no delegated switch reaches it.
+    const withTools = { ...ALL_MCP, 'halo-conversations': {} }
+    const everything = fullCapabilityPolicy()
+
+    expect(filterMcpServersByPolicy(withTools, DB_MCP, undefined, 'permissive', TEAM_CHANNEL)).not.toHaveProperty('halo-conversations')
+    expect(filterMcpServersByPolicy(withTools, DB_MCP, everything, 'permissive', TEAM_CHANNEL)).not.toHaveProperty('halo-conversations')
+    expect(filterMcpServersByPolicy(withTools, DB_MCP, {}, 'strict')).not.toHaveProperty('halo-conversations')
+    expect(filterMcpServersByPolicy(withTools, DB_MCP, everything, 'strict')).not.toHaveProperty('halo-conversations')
+  })
+
   it('gives a guest only the always-safe servers by default', () => {
     const out = filterMcpServersByPolicy(ALL_MCP, DB_MCP, {}, 'strict')
 
-    expect(Object.keys(out).sort()).toEqual(['halo-memory', 'web-search'])
+    expect(Object.keys(out).sort()).toEqual(['web-search'])
   })
 
   it('keeps a guest away from OCR until the host allows it', () => {
@@ -169,25 +191,34 @@ describe('who a delegated policy holds', () => {
   // is who started the turn — not whether a person or a model typed it.
   it('does not restrict the owner talking to their own digital human', () => {
     // The owner's chat is delivered straight to the session and carries no kind.
-    expect(isBorrowedTeamTurn(undefined, false)).toBe(false)
+    expect(isBorrowedTeamTurn(undefined, false, false)).toBe(false)
   })
 
   it('restricts another PERSON reaching it from a different machine', () => {
-    expect(isBorrowedTeamTurn('human_message', false)).toBe(true)
+    expect(isBorrowedTeamTurn('human_message', false, true)).toBe(true)
   })
 
   it('restricts a teammate’s digital human', () => {
-    expect(isBorrowedTeamTurn('message', false)).toBe(true)
+    expect(isBorrowedTeamTurn('message', false, false)).toBe(true)
   })
 
   it('restricts the turns the runtime starts on the team’s behalf', () => {
-    expect(isBorrowedTeamTurn('run_start', false)).toBe(true)
-    expect(isBorrowedTeamTurn('periodic_check', false)).toBe(true)
+    expect(isBorrowedTeamTurn('run_start', false, false)).toBe(true)
+    expect(isBorrowedTeamTurn('periodic_check', false, false)).toBe(true)
   })
 
-  it('leaves an IM-backed turn to the IM hardening decision', () => {
-    expect(isBorrowedTeamTurn('human_message', true)).toBe(false)
-    expect(isBorrowedTeamTurn('message', true)).toBe(false)
+  it('leaves the person in an IM chat a member fronts to that chat’s owner/guest rules', () => {
+    expect(isBorrowedTeamTurn('human_message', true, false)).toBe(false)
+    expect(isBorrowedTeamTurn('human_message', true, true)).toBe(false)
+  })
+
+  it('leaves a front-desk turn woken by work started here as it was', () => {
+    expect(isBorrowedTeamTurn('message', true, false)).toBe(false)
+  })
+
+  it('restricts a front-desk turn woken to continue work that entered from outside', () => {
+    expect(isBorrowedTeamTurn('message', true, true)).toBe(true)
+    expect(isBorrowedTeamTurn('periodic_check', true, true)).toBe(true)
   })
 })
 
@@ -205,7 +236,7 @@ describe('how far the command tool reaches', () => {
     // "anything goes" — the safe reading of an unfinished decision.
     const access = resolveBashAccess({ allowedTools: ['Bash'], bashScope: 'listed' }, 'permissive')
     expect(access).toEqual({ scope: 'listed', rules: [] })
-    expect(buildAllowedToolRules({ allowedTools: ['Bash'], bashScope: 'listed' }, 'strict')).toEqual([])
+    expect(buildAllowedToolRules({ allowedTools: ['Bash'], bashScope: 'listed' }, 'strict')).toEqual(['TodoWrite'])
   })
 
   it('narrowing reach cannot resurrect a withheld tool', () => {
@@ -271,7 +302,34 @@ describe('when a policy is enforced at all', () => {
 
     expect(options.permissionMode).toBe('default')
     expect(options.extraArgs['dangerously-skip-permissions']).toBeUndefined()
-    expect(options.allowedTools).toEqual(['Read'])
+    expect(options.allowedTools).toEqual(['TodoWrite', 'Read'])
+    expect(options.disallowedTools).toContain('Bash')
+  })
+})
+
+describe('a policy never re-opens a tool the session already withholds', () => {
+  it('keeps the user\'s disabled tools when it grants them', () => {
+    // The policy allows Read and Grep, but the user disabled Grep everywhere.
+    const options: Record<string, any> = { disallowedTools: ['Grep', 'TeamCreate'] }
+    applyCapabilityPolicy(options, {
+      policy: { allowedTools: ['Read', 'Grep'] },
+      mode: 'strict',
+      mcpServers: ALL_MCP,
+      dbMcpServers: DB_MCP,
+    })
+
+    expect(options.disallowedTools).toEqual(expect.arrayContaining(['Grep', 'TeamCreate', 'Bash']))
+    expect(new Set(options.disallowedTools).size).toBe(options.disallowedTools.length)
+  })
+
+  it('withholds the policy\'s own tools when the session withheld nothing', () => {
+    const options: Record<string, any> = {}
+    applyCapabilityPolicy(options, {
+      policy: { allowedTools: ['Read'] },
+      mode: 'strict',
+      mcpServers: ALL_MCP,
+      dbMcpServers: DB_MCP,
+    })
     expect(options.disallowedTools).toContain('Bash')
   })
 })
@@ -284,5 +342,114 @@ describe('where a request came from decides how silence reads', () => {
   it('does not put a lock between two of the owner’s own digital humans', () => {
     expect(resolveDelegationMode({ external: false })).toBe('permissive')
     expect(resolveDelegationMode({})).toBe('permissive')
+  })
+})
+
+describe('always-available tools', () => {
+  it('keeps the task list for every caller, whatever the policy', () => {
+    expect(computeDisallowedBuiltins({ allowedTools: [] }, 'strict')).not.toContain('TodoWrite')
+    expect(allowsBuiltinAtCallTime({ allowedTools: [] }, 'TodoWrite', 'strict')).toBe(true)
+    expect(DELEGABLE_BUILTIN_TOOLS.map(t => t.name)).not.toContain('TodoWrite')
+  })
+
+  it('defaults a newly opened guest access to looking at files', () => {
+    expect([...DEFAULT_GUEST_ALLOWED_TOOLS]).toEqual(['Read', 'Glob', 'Grep'])
+  })
+
+  it('a build default wins, an explicit empty list included', () => {
+    expect(defaultGuestPolicy(undefined)).toEqual({ allowedTools: ['Read', 'Glob', 'Grep'] })
+    expect(defaultGuestPolicy({})).toEqual({ allowedTools: ['Read', 'Glob', 'Grep'] })
+    expect(defaultGuestPolicy({ allowedTools: ['WebSearch'] })).toEqual({ allowedTools: ['WebSearch'] })
+    expect(defaultGuestPolicy({ allowedTools: [] })).toEqual({ allowedTools: [] })
+    // A copy: editing it never edits the default.
+    expect(defaultGuestPolicy(undefined).allowedTools).not.toBe(DEFAULT_GUEST_ALLOWED_TOOLS)
+  })
+
+  it('turning guest access off and on again restores the choices made', () => {
+    const chosen = { allowedTools: ['Read', 'WebFetch'], allowOcr: true }
+    const off = withGuestAccess({ id: 'x', guestPolicy: chosen }, false, { allowedTools: [] })
+    expect(off).toEqual({ id: 'x', guestPolicy: undefined, savedGuestPolicy: chosen })
+    const on = withGuestAccess(off, true, { allowedTools: [] })
+    expect(on).toEqual({ id: 'x', guestPolicy: chosen })
+    expect('savedGuestPolicy' in on).toBe(false)
+  })
+
+  it('a first turn-on starts from the build default', () => {
+    expect(withGuestAccess({ id: 'x', guestPolicy: undefined }, true, null).guestPolicy).toEqual({ allowedTools: ['Read', 'Glob', 'Grep'] })
+    expect(withGuestAccess({ id: 'x', guestPolicy: undefined }, true, { allowedTools: [] }).guestPolicy).toEqual({ allowedTools: [] })
+  })
+
+  it('the read-only preset grants viewing and the internet only', () => {
+    expect(capabilityPolicyFromPreset('read_only').allowedTools).toEqual(
+      DELEGABLE_BUILTIN_TOOLS.filter(t => t.group === 'file' || t.group === 'network').map(t => t.name)
+    )
+  })
+})
+
+describe('the sub-agent switch', () => {
+  // The engine still answers to the tool's old name, "Task", and a rule naming
+  // it acts on the sub-agent tool. Left without a switch, "Task" stayed withheld
+  // and took the tool away whatever the owner ticked.
+  it('grants the tool under both of its names once a guest is allowed sub-agents', () => {
+    const withheld = computeDisallowedBuiltins({ allowedTools: ['Read', 'Agent'] }, 'strict')
+
+    expect(withheld).not.toContain('Agent')
+    expect(withheld).not.toContain('Task')
+    expect(allowsBuiltinAtCallTime({ allowedTools: ['Agent'] }, 'Task', 'strict')).toBe(true)
+  })
+
+  it('withholds both names while the switch is off', () => {
+    const withheld = computeDisallowedBuiltins({ allowedTools: ['Read'] }, 'strict')
+
+    expect(withheld).toEqual(expect.arrayContaining(['Agent', 'Task']))
+    expect(allowsBuiltinAtCallTime({ allowedTools: ['Read'] }, 'Task', 'strict')).toBe(false)
+  })
+})
+
+describe('skills', () => {
+  it('gives a guest the skill tool only once some skill was allowed', () => {
+    // It was withheld from every guest whatever the owner did: there was no
+    // switch for it, and a strict policy withholds what no switch grants.
+    expect(computeDisallowedBuiltins({ allowedTools: ['Read'], allowedSkills: ['weekly-report'] }, 'strict'))
+      .not.toContain('Skill')
+    expect(computeDisallowedBuiltins({ allowedTools: ['Read'] }, 'strict')).toContain('Skill')
+    expect(computeDisallowedBuiltins({ allowedTools: ['Read'], allowedSkills: [] }, 'strict')).toContain('Skill')
+  })
+
+  it('reads silence like the other lists: none for a guest, all for a teammate', () => {
+    expect(allowsSkill(undefined, 'weekly-report', 'strict')).toBe(false)
+    expect(allowsSkill({ allowedSkills: ['weekly-report'] }, 'weekly-report', 'strict')).toBe(true)
+    expect(allowsSkill({ allowedSkills: ['weekly-report'] }, 'place-order', 'strict')).toBe(false)
+    expect(allowsSkill(undefined, 'place-order', 'permissive')).toBe(true)
+    expect(allowsSkill({ allowedSkills: [] }, 'place-order', 'permissive')).toBe(false)
+  })
+
+  it('leaves a teammate with every skill until skills are listed, and enforces a list once there is one', () => {
+    expect(computeDisallowedBuiltins(fullCapabilityPolicy(), 'permissive')).toEqual([])
+    expect(computeDisallowedBuiltins({ allowedSkills: [] }, 'permissive')).toEqual(['Skill'])
+    expect(isRestrictivePolicy({ ...fullCapabilityPolicy(), allowedSkills: ['weekly-report'] }, 'permissive')).toBe(true)
+  })
+
+  it('is never auto-allowed: each call is decided per skill by the gate', () => {
+    const policy = { allowedTools: ['Read'], allowedSkills: ['weekly-report'] }
+
+    expect(buildAllowedToolRules(policy, 'strict').some(rule => rule.startsWith(SKILL_TOOL))).toBe(false)
+    expect(allowsBuiltinAtCallTime(policy, SKILL_TOOL, 'strict')).toBe(false)
+  })
+})
+
+describe('the switches and the withheld list are one definition', () => {
+  it('a guest with every switch on is withheld only the tools no switch offers', () => {
+    const everySwitch = { ...fullCapabilityPolicy(), allowedSkills: ['weekly-report'] }
+    const offered = (name: string) =>
+      ALWAYS_AVAILABLE_BUILTIN_TOOLS.includes(name) ||
+      name === SKILL_TOOL ||
+      DELEGABLE_BUILTIN_TOOLS.some(t => t.name === canonicalBuiltinTool(name))
+
+    const withheld = computeDisallowedBuiltins(everySwitch, 'strict')
+
+    expect(withheld.sort()).toEqual(ALL_BUILTIN_TOOLS.filter(name => !offered(name)).sort())
+    expect(withheld).not.toContain('Task')
+    expect(withheld).not.toContain('Skill')
   })
 })

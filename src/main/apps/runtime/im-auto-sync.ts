@@ -23,17 +23,7 @@
 
 import { getImSessionRegistry } from './im-session-registry'
 import { getActiveImChannelManager } from './im-channels'
-import { truncateUtf16Safe } from './text-truncate'
-
-/**
- * Maximum text body length sent to IM. WeCom markdown messages cap around
- * 4096 bytes; keeping body under 4000 characters leaves headroom for the
- * truncation marker without risk of platform-side rejection.
- */
-const MAX_PUSH_LENGTH = 4000
-
-/** Marker appended when text is truncated. */
-const TRUNCATION_MARKER = '\n\n...(truncated, see Halo for full content)'
+import { recordChatPush } from './chat-push'
 
 export interface AutoSyncInput {
   appId: string
@@ -88,10 +78,6 @@ export async function autoSyncRunResult(input: AutoSyncInput): Promise<AutoSyncR
     return report
   }
 
-  const body = text.length > MAX_PUSH_LENGTH
-    ? truncateUtf16Safe(text, MAX_PUSH_LENGTH) + TRUNCATION_MARKER
-    : text
-
   // Sequential dispatch preserves message ordering on the same IM connection
   // and matches the legacy behavior. The subscriber count is small (typically
   // single-digit) so the latency impact is negligible.
@@ -115,9 +101,20 @@ export async function autoSyncRunResult(input: AutoSyncInput): Promise<AutoSyncR
         continue
       }
 
-      const ok = instance.pushToChat(session.chatId, body, session.chatType)
+      // Handed over whole: how much one message carries is each channel's to
+      // know, and it sends a longer result in parts (im-channels/message-parts).
+      const ok = instance.pushToChat(session.chatId, text, session.chatType)
       if (ok) {
         report.sent++
+        recordChatPush({
+          appId: session.appId,
+          channel: session.channel,
+          chatType: session.chatType,
+          chatId: session.chatId,
+          text,
+          via: 'result',
+          pushedBy: input.appId,
+        })
       } else {
         console.warn(
           `[Runtime][${input.runTag}] Auto-sync push rejected: chat=${session.chatId} ` +

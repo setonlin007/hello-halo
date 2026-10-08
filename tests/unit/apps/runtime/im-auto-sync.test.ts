@@ -6,7 +6,8 @@
  *   - no proactive sessions → no-op
  *   - registry / manager unavailable → safe no-op or skip count
  *   - per-session outcomes (sent / disconnected / instance missing / error)
- *   - truncation at MAX_PUSH_LENGTH
+ *   - a long result handed over whole (the channel sends it in parts)
+ *   - what was sent kept in the record of each chat it went to
  *   - never throws even when transport throws
  */
 
@@ -18,6 +19,7 @@ import type { ImSessionRecord } from '../../../../src/shared/types/im-channel'
 
 const mockGetProactiveSessions = vi.fn()
 const mockGetInstance = vi.fn()
+const { mockRecordChatPush } = vi.hoisted(() => ({ mockRecordChatPush: vi.fn() }))
 
 vi.mock('../../../../src/main/apps/runtime/im-session-registry', () => ({
   getImSessionRegistry: () => ({
@@ -30,6 +32,8 @@ vi.mock('../../../../src/main/apps/runtime/im-channels', () => ({
     getInstance: mockGetInstance,
   }),
 }))
+
+vi.mock('../../../../src/main/apps/runtime/chat-push', () => ({ recordChatPush: mockRecordChatPush }))
 
 import { autoSyncRunResult } from '../../../../src/main/apps/runtime/im-auto-sync'
 
@@ -72,6 +76,7 @@ const baseInput = {
 beforeEach(() => {
   mockGetProactiveSessions.mockReset()
   mockGetInstance.mockReset()
+  mockRecordChatPush.mockReset()
 })
 
 // ============================================
@@ -134,20 +139,20 @@ describe('autoSyncRunResult', () => {
       expect(instB.pushToChat).toHaveBeenCalledTimes(1)
     })
 
-    it('truncates body exceeding the length cap and appends marker', async () => {
+    it('hands a long result over whole: the channel sends it in parts, as every other reply', async () => {
+      // A fixed cut here dropped everything past 4000 characters before the
+      // channel's own splitting could send it.
       const session = makeSession()
       const instance = makeInstance()
       mockGetProactiveSessions.mockReturnValue([session])
       mockGetInstance.mockReturnValue(instance)
 
-      const longText = 'a'.repeat(5000)
+      const longText = '结果的每一段都要送达。'.repeat(900)
       const report = await autoSyncRunResult({ ...baseInput, finalText: longText })
 
       expect(report.sent).toBe(1)
       const [, body] = instance.pushToChat.mock.calls[0]
-      expect(body.length).toBeLessThanOrEqual(5000)
-      expect(body.startsWith('a'.repeat(4000))).toBe(true)
-      expect(body.endsWith('(truncated, see Halo for full content)')).toBe(true)
+      expect(body).toBe(longText)
     })
   })
 
@@ -204,6 +209,32 @@ describe('autoSyncRunResult', () => {
       const report = await autoSyncRunResult({ ...baseInput, finalText: 'hi' })
 
       expect(report).toEqual({ subscribed: 3, sent: 2, skipped: 0, failed: 1 })
+    })
+  })
+
+  describe('the record of the chats it went to', () => {
+    it('keeps the whole result in each chat it was sent to, and in no other', async () => {
+      const sent = makeSession({ chatId: 'chat-a', instanceId: 'inst-a', chatType: 'direct' })
+      const offline = makeSession({ chatId: 'chat-b', instanceId: 'inst-b' })
+      const rejected = makeSession({ chatId: 'chat-c', instanceId: 'inst-c' })
+      // Another digital human's chat, reached through a push link (#135).
+      const linked = makeSession({ appId: 'app-2', chatId: 'chat-d', instanceId: 'inst-d' })
+      mockGetProactiveSessions.mockReturnValue([sent, offline, rejected, linked])
+      const instances: Record<string, ReturnType<typeof makeInstance>> = {
+        'inst-a': makeInstance(),
+        'inst-b': makeInstance({ connected: false }),
+        'inst-c': makeInstance({ pushReturns: false }),
+        'inst-d': makeInstance(),
+      }
+      mockGetInstance.mockImplementation((id: string) => instances[id])
+
+      const result = 'Nightly report\n\n' + '每一行都要留下。'.repeat(600)
+      await autoSyncRunResult({ ...baseInput, finalText: result })
+
+      expect(mockRecordChatPush.mock.calls.map(([push]) => push)).toEqual([
+        { appId: 'app-1', channel: 'wecom-bot', chatType: 'direct', chatId: 'chat-a', text: result, via: 'result', pushedBy: 'app-1' },
+        { appId: 'app-2', channel: 'wecom-bot', chatType: 'group', chatId: 'chat-d', text: result, via: 'result', pushedBy: 'app-1' },
+      ])
     })
   })
 

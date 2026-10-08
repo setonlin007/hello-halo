@@ -18,6 +18,7 @@
  */
 
 import { createSdkMcpServer } from '../agent/resolved-sdk'
+import { markMcpServerSettings } from '../agent'
 import type { EmailChannelConfig } from '../../../shared/types/notification-channels'
 import { getServiceDefaults } from '../../foundation/product-config'
 import { ImapClient } from './imap-client'
@@ -79,9 +80,13 @@ function resolveAdvancedDefaults(userConfig: EmailChannelConfig): EmailChannelCo
  * - CalDAV: only registered when config.caldavUrl is set
  *
  * @param rawConfig - Email channel config from config.notificationChannels.email
+ * @param opts.refuseAttachment - Why a local file may not be attached, or null
  * @returns An SDK MCP server instance
  */
-export function createEmailMcpServer(rawConfig: EmailChannelConfig): SdkMcpServer {
+export function createEmailMcpServer(
+  rawConfig: EmailChannelConfig,
+  opts: { refuseAttachment?: (filePath: string) => string | null } = {}
+): SdkMcpServer {
   const config = resolveAdvancedDefaults(rawConfig)
   const userEmail = config.smtp.user
 
@@ -97,7 +102,7 @@ export function createEmailMcpServer(rawConfig: EmailChannelConfig): SdkMcpServe
     createEmailListTool(imap),
     createEmailReadTool(imap),
     createEmailSearchTool(imap),
-    createEmailSendTool(smtp),
+    createEmailSendTool(smtp, opts.refuseAttachment),
     createEmailReplyTool(imap, smtp, userEmail),
     createEmailForwardTool(imap, smtp),
     createEmailMoveTool(imap),
@@ -116,9 +121,10 @@ export function createEmailMcpServer(rawConfig: EmailChannelConfig): SdkMcpServe
     )
   }
 
-  return createSdkMcpServer({
+  // The clients above keep these settings, so changed settings need a new session.
+  return markMcpServerSettings(createSdkMcpServer({
     name: 'halo-email',
     version: '1.0.0',
     tools,
-  })
+  }), config)
 }

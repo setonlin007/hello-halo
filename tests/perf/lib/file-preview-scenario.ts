@@ -11,11 +11,15 @@ import { ProcessMetricsSampler } from './process-metrics'
 import { installUnresponsiveTracker, readUnresponsiveCount, readCrashCount } from './unresponsive'
 import { installReloadGuard } from './reload-guard'
 import { sampleIdleCpu } from './idle-cpu'
-import { seedArtifact, beginOpenObservation, clickArtifactByName, waitForCanvasLoaded, waitForPdfLoaded } from './open-artifact'
+import { seedArtifact, beginOpenObservation, clickArtifactByName, waitForCanvasLoaded, waitForPdfLoaded, isolatedPreviewNodeCount, hasDecodedImage } from './open-artifact'
 import { writeResult, beginScenario, currentLabel, currentThrottle } from './result-writer'
 import { getBuildIdentity } from './build-identity'
 import { fixturePath } from './fixture-store'
+import { beginHtmlPreviewEvidence, captureHtmlPreviewEvidence, HtmlPreviewVerificationError } from './html-preview-evidence'
 import type { PerfResult } from '../types'
+
+const IMAGE_FIXTURE = /\.(png|jpe?g|gif|webp)$/i
+const HTML_FIXTURE = /\.html?$/i
 
 export interface FilePreviewScenarioOptions {
   scenario: string
@@ -27,10 +31,16 @@ export interface FilePreviewScenarioOptions {
   toleratesHang?: boolean
   /** How long to sample idle CPU after render settles. 0 skips it. */
   idleCpuMs?: number
-  /** Also record a per-pid breakdown (e.g. S5 pdf's separate BrowserView process). */
+  /** Also record a per-pid breakdown (e.g. the PDF guest renderer). */
   includePerProcess?: boolean
   /** pdf/browser tabs bypass ContentCanvas's "Loading..." branch (own "Opening..." overlay). */
   loadingKind?: 'canvas' | 'pdf'
+  /**
+   * Text that must be on screen in the canvas once the open settles — e.g. a
+   * cell value from the fixture's first rows, proving a grid rendered its data
+   * and not just its chrome.
+   */
+  expectVisibleText?: string[]
 }
 
 /**
@@ -79,6 +89,7 @@ export async function runFilePreviewScenario(opts: FilePreviewScenarioOptions): 
     await cdp.setCpuThrottlingRate(throttle)
 
     await resetRenderObservers(window)
+    const htmlBaseline = HTML_FIXTURE.test(opts.fixtureFileName) ? await beginHtmlPreviewEvidence(app, window) : undefined
     const heapStart = await cdp.snapshot()
 
     const sampler = new ProcessMetricsSampler(app)
@@ -156,13 +167,75 @@ export async function runFilePreviewScenario(opts: FilePreviewScenarioOptions): 
       }
     }
 
+    let htmlPreview: PerfResult['htmlPreview']
+    let htmlPreviewFailure: PerfResult['htmlPreviewFailure']
+    if (htmlBaseline && !heapEnd && status === 'ok') {
+      status = 'precondition-failed'
+      note = 'HTML renderer ownership cannot be measured without the original parent end counter.'
+    }
+    if (htmlBaseline && heapEnd && status === 'ok') {
+      try {
+        htmlPreview = await captureHtmlPreviewEvidence({ app, window, baseline: htmlBaseline, fixturePath: fixture,
+          parentNodes: { start: heapStart.nodes, end: heapEnd.nodes, delta: heapEnd.nodes - heapStart.nodes },
+          label: currentLabel(), scenario: opts.scenario, openedAt: t0 })
+      } catch (error) {
+        if (error instanceof HtmlPreviewVerificationError) htmlPreviewFailure = error.failure
+        status = 'precondition-failed'
+        note = `HTML content, pixel or renderer ownership verification failed: ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+
     // "The wait resolved without error" is not proof the file rendered.
     // Opening any real file adds at least one DOM node; a zero/negative delta
     // means nothing rendered — the same "plausible number, scenario never did
     // its job" failure mode as a premature stream-completion detector.
-    if (status === 'ok' && heapEnd && heapEnd.nodes - heapStart.nodes <= 0) {
-      status = 'precondition-failed'
-      note = `nodes.delta was ${heapEnd.nodes - heapStart.nodes} (<= 0) after opening ${opts.fixtureFileName} — this does not look like the file actually rendered.`
+    // A viewer isolated in its own origin renders in an out-of-process frame
+    // whose nodes this window's CDP session cannot count, so for it the proof
+    // is the frame's own document having content.
+    // An image viewer adds a handful of nodes, fewer than layout churn elsewhere
+    // can remove, so the node delta cannot prove it rendered; a decoded <img>
+    // at the fixture's size can.
+    if (status === 'ok' && heapEnd) {
+      const isolated = await isolatedPreviewNodeCount(window)
+      if (htmlBaseline) {
+        if (!htmlPreview) {
+          status = 'precondition-failed'
+          note = 'The HTML preview has no complete content, pixel and renderer evidence.'
+        }
+      } else if (opts.loadingKind === 'pdf') {
+        // The PDF renders in its guest, outside this window's DOM.
+        const loaded = await app.evaluate(({ webContents }) =>
+          webContents.getAllWebContents().some((wc) => /\.pdf($|[?#])/i.test(wc.getURL()) && !wc.isLoading())
+        ).catch(() => false)
+        if (!loaded) {
+          status = 'precondition-failed'
+          note = `No loaded web contents shows ${opts.fixtureFileName} — the PDF did not open.`
+        }
+      } else if (IMAGE_FIXTURE.test(opts.fixtureFileName)) {
+        if (!(await hasDecodedImage(window, 1000))) {
+          status = 'precondition-failed'
+          note = `No decoded image of at least 1000px width is on screen after opening ${opts.fixtureFileName} — the image did not render.`
+        }
+      } else if (isolated !== null) {
+        if (isolated <= 0) {
+          status = 'precondition-failed'
+          note = `The isolated preview frame for ${opts.fixtureFileName} has an empty document — the file did not render.`
+        }
+      } else if (heapEnd.nodes - heapStart.nodes <= 0) {
+        status = 'precondition-failed'
+        note = `nodes.delta was ${heapEnd.nodes - heapStart.nodes} (<= 0) after opening ${opts.fixtureFileName} — this does not look like the file actually rendered.`
+      }
+    }
+    if (status === 'ok' && opts.expectVisibleText?.length) {
+      const content = window.locator('.canvas-tab-bar + *')
+      const missing: string[] = []
+      for (const text of opts.expectVisibleText) {
+        if ((await content.getByText(text, { exact: true }).count().catch(() => 0)) === 0) missing.push(text)
+      }
+      if (missing.length > 0) {
+        status = 'precondition-failed'
+        note = `Expected ${missing.map((m) => JSON.stringify(m)).join(', ')} on screen after opening ${opts.fixtureFileName} — its content did not render.`
+      }
     }
 
     const { cpu, mem } = sampler.summarize()
@@ -229,6 +302,15 @@ export async function runFilePreviewScenario(opts: FilePreviewScenarioOptions): 
       warnings: warnings.length ? warnings : undefined,
       idleCpu
     }
+
+    if (htmlPreview) {
+      result.htmlPreview = htmlPreview
+      result.perProcess = sampler.summarizeByPid()
+      result.unmeasuredMetrics = [...(result.unmeasuredMetrics ?? []), 'htmlPreview.initialLongtasks']
+      warnings.push('HTML preview initial longtasks are not observed by the parent window PerformanceObserver; parent render metrics above retain their original scope.')
+      result.warnings = warnings
+    }
+    if (htmlPreviewFailure) result.htmlPreviewFailure = htmlPreviewFailure
 
     if (opts.includePerProcess) {
       result.perProcess = sampler.summarizeByPid()

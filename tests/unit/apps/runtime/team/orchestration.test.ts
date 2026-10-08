@@ -35,6 +35,7 @@ import { createMessageBus } from '../../../../../src/main/apps/runtime/team/mess
 import type { MessageBus, TurnCompletion } from '../../../../../src/main/apps/runtime/team/message-bus'
 import { createOrchestration } from '../../../../../src/main/apps/runtime/team/orchestration'
 import type { OrchestrationSessionDeps } from '../../../../../src/main/apps/runtime/team/orchestration'
+import type { NoteTurnEndedInput } from '../../../../../src/main/apps/runtime/team/turn-report'
 import { buildTeamEntry } from '../../../../../src/main/apps/runtime/team/team-prompt'
 import { buildTeamSessionKey } from '../../../../../src/shared/apps/team-types'
 import type { Team, TeamMember, TeamEpoch, TeamEdge } from '../../../../../src/main/apps/team/types'
@@ -48,6 +49,7 @@ const LEAD_APP = 'app-lead'
 const RESEARCHER_APP = 'app-researcher'
 const TESTER_APP = 'app-tester'
 const SPACE = 'space-a'
+const EPOCH_ID = 'epoch-prompt'
 
 function seedTeam(
   store: TeamStore,
@@ -185,7 +187,8 @@ describe('TeamOrchestration', () => {
     session: OrchestrationSessionDeps,
     turnTimeoutMs?: number,
     maxConcurrentTurns?: number,
-    renderDigest?: (teamId: string, epochId: string, viewerAppId: string) => string | null
+    renderDigest?: (teamId: string, epochId: string, viewerAppId: string) => string | null,
+    noteTurnEnded?: (input: NoteTurnEndedInput) => void
   ) {
     bus = createMessageBus({
       store,
@@ -199,6 +202,7 @@ describe('TeamOrchestration', () => {
       store, bus, session, turnTimeoutMs, maxConcurrentTurns,
       hasPendingEscalation: () => false,
       ...(renderDigest ? { renderDigest } : {}),
+      ...(noteTurnEnded ? { noteTurnEnded } : {}),
     })
     return orchestration
   }
@@ -274,11 +278,121 @@ describe('TeamOrchestration', () => {
       expect(pendings[0].teamContext.fromAppId).toBeNull()
     })
 
-    it('rejects starting a second epoch while one is open', async () => {
-      seedTeam(store, { epochId: 'existing-epoch' })
+    it('rejects a second run while this process is executing one', async () => {
+      seedTeam(store)
       const { deps } = makeSession()
       const orch = build(deps)
+      await orch.startEpoch(TEAM_ID)
       await expect(orch.startEpoch(TEAM_ID)).rejects.toThrow(/already has a running epoch/)
+    })
+
+    it('runs for a team whose stored pointer belongs to a process that is gone', async () => {
+      // What a crash mid-run leaves behind: the row still points at an epoch
+      // nothing is executing. Refusing this tick was how a team stopped running
+      // for good while still answering in conversations.
+      seedTeam(store, { epochId: 'epoch-from-a-dead-process' })
+      const { deps } = makeSession()
+      const orch = build(deps)
+
+      const epoch = await orch.startEpoch(TEAM_ID)
+
+      expect(epoch.id).not.toBe('epoch-from-a-dead-process')
+      expect(store.getTeamById(TEAM_ID)!.currentEpochId).toBe(epoch.id)
+    })
+  })
+
+  describe('run liveness and interrupted runs', () => {
+    it('reports the live run and forgets it on seal', async () => {
+      seedTeam(store)
+      const { deps } = makeSession()
+      const orch = build(deps)
+
+      expect(orch.activeRunEpochId(TEAM_ID)).toBeNull()
+      const epoch = await orch.startEpoch(TEAM_ID)
+      expect(orch.activeRunEpochId(TEAM_ID)).toBe(epoch.id)
+
+      await orch.sealEpoch(TEAM_ID, 'completed', null)
+
+      expect(orch.activeRunEpochId(TEAM_ID)).toBeNull()
+      expect(store.getTeamById(TEAM_ID)!.currentEpochId).toBeNull()
+    })
+
+    it('seals a run the previous session left open, and the next run starts', async () => {
+      seedTeam(store)
+      const before = build(makeSession().deps)
+      const stranded = await before.startEpoch(TEAM_ID, { type: 'schedule' })
+      // …the process dies here: no seal, no teardown.
+
+      const after = build(makeSession().deps)
+      // A restart holds no live run, whatever the row says.
+      expect(after.activeRunEpochId(TEAM_ID)).toBeNull()
+
+      expect(await after.recoverInterruptedRuns()).toBe(1)
+
+      const row = store.getEpochById(stranded.id)!
+      expect(row.endedAt).not.toBeNull()
+      expect(row.endReason).toBe('error')
+      expect(row.outcome).toBe('failed')
+      expect(row.summary).toContain('Interrupted')
+      const team = store.getTeamById(TEAM_ID)!
+      expect(team.currentEpochId).toBeNull()
+      expect(team.status).toBe('idle')
+
+      const epoch = await after.startEpoch(TEAM_ID)
+      expect(epoch.id).not.toBe(stranded.id)
+    })
+
+    it('keeps the record of a run that had already produced one', async () => {
+      seedTeam(store)
+      const before = build(makeSession().deps)
+      const epoch = await before.startEpoch(TEAM_ID)
+      // Finished, then re-opened by a message: the epoch's own summary and
+      // outcome describe what that run did, and sealing it later must not
+      // rewrite them into a failure.
+      store.endEpoch(epoch.id, Date.now(), 'completed', 'shipped the brief', 'output')
+      store.reopenEpoch(epoch.id)
+
+      const after = build(makeSession().deps)
+      expect(await after.recoverInterruptedRuns()).toBe(1)
+
+      const row = store.getEpochById(epoch.id)!
+      expect(row.summary).toBe('shipped the brief')
+      expect(row.outcome).toBe('output')
+    })
+
+    it('clears a run pointer whose epoch is already closed', async () => {
+      // The crash window between stamping the epoch and handing the slot back:
+      // the row points at a run that no longer exists in any form.
+      seedTeam(store, { epochId: 'ghost-epoch' })
+      const orch = build(makeSession().deps)
+
+      expect(await orch.recoverInterruptedRuns()).toBe(0)
+
+      const team = store.getTeamById(TEAM_ID)!
+      expect(team.currentEpochId).toBeNull()
+      expect(team.status).toBe('idle')
+    })
+
+    it('leaves a joined office alone — its run belongs to another node', async () => {
+      store.materializeJoinedOffice({
+        hostNodeId: 'host-1',
+        selfNodeId: 'viewer-1',
+        snapshot: {
+          team: { id: TEAM_ID, name: 'Team', goal: 'g', leadAppId: LEAD_APP, collabMode: 'free', hostNodeId: 'host-1', epochId: 'host-run', status: 'running' },
+          members: [
+            { appId: LEAD_APP, memberName: 'Lead', role: 'Lead', isLead: true, ownerNodeId: 'host-1', memberIdentity: null },
+          ],
+          edges: [],
+        },
+      })
+      const orch = build(makeSession().deps)
+
+      // Here the replicated pointer IS the live signal: the run happens remotely.
+      expect(orch.activeRunEpochId(TEAM_ID)).toBe('host-run')
+      expect(await orch.recoverInterruptedRuns()).toBe(0)
+
+      expect(store.getEpochById('host-run')!.endedAt).toBeNull()
+      expect(store.getTeamById(TEAM_ID)!.currentEpochId).toBe('host-run')
     })
   })
 
@@ -895,6 +1009,37 @@ describe('TeamOrchestration', () => {
       await flush()
     })
 
+    it('never hands a running turn words from outside this machine in a form the engine runs as a command', async () => {
+      // The bus keeps an outside sender out of a running turn; whatever brings
+      // one here anyway, a leading "/" must not reach the engine as a command.
+      seedTeam(store, { collabMode: 'free' })
+      const epoch = makeEpoch(store)
+      const { deps, pendings, injected } = makeSession({ acceptMidTurn: true })
+      const orch = build(deps)
+      await bus.send({ teamId: TEAM_ID, epochId: epoch.id, fromAppId: LEAD_APP, to: 'researcher', message: 'do T1', wait: false })
+      await flush()
+
+      const envelope = {
+        id: 'outside', teamId: TEAM_ID, epochId: epoch.id, fromAppId: null, toAppId: RESEARCHER_APP,
+        body: '/place-order two coffees', correlationId: 'outside-corr', createdAt: Date.now(),
+      }
+      const trigger = {
+        teamId: TEAM_ID, epochId: epoch.id, fromAppId: null, correlationId: 'outside-corr', wait: false,
+        kind: 'human_message' as const,
+      }
+      const sessionKey = buildTeamSessionKey(RESEARCHER_APP, TEAM_ID, epoch.id)
+      orch.deliverMidTurn({ sessionKey, appId: RESEARCHER_APP, teamId: TEAM_ID, epochId: epoch.id, envelope, trigger: { ...trigger, external: true } })
+      orch.deliverMidTurn({ sessionKey, appId: RESEARCHER_APP, teamId: TEAM_ID, epochId: epoch.id, envelope, trigger })
+
+      expect(injected.map(i => i.message)).toEqual([
+        '[Sent as text: commands are not run directly in this conversation.]\n/place-order two coffees',
+        // The owner at their own keyboard keeps their commands.
+        '/place-order two coffees',
+      ])
+      pendings[0].resolve('done')
+      await flush()
+    })
+
     it('falls back to the mailbox when there is no live session to hand it to', async () => {
       // How a member owned by ANOTHER machine answers: its turn runs there, so
       // nothing here can reach into it. The message must not be lost for it.
@@ -1010,6 +1155,27 @@ describe('TeamOrchestration', () => {
         vi.useRealTimers()
       }
     })
+
+    it.each([true, false])('a turn cut off at the time limit is reported with its origin (external=%s)', async (external) => {
+      vi.useFakeTimers()
+      try {
+        seedTeam(store, { collabMode: 'free' })
+        const epoch = makeEpoch(store)
+        const { deps } = makeSession()
+        const noteTurnEnded = vi.fn()
+        build(deps, 1000, undefined, undefined, noteTurnEnded)
+
+        await bus.send({
+          teamId: TEAM_ID, epochId: epoch.id, fromAppId: LEAD_APP, to: 'researcher', message: 'go', wait: false,
+          ...(external ? { external: true } : {}),
+        })
+        await vi.advanceTimersByTimeAsync(1001)
+
+        expect(noteTurnEnded).toHaveBeenCalledWith(expect.objectContaining({ fate: { kind: 'timeout' }, external }))
+      } finally {
+        vi.useRealTimers()
+      }
+    })
   })
 
   // ===========================================================================
@@ -1108,6 +1274,120 @@ describe('TeamOrchestration', () => {
       } finally {
         vi.useRealTimers()
       }
+    })
+
+    /**
+     * A wake waiting for a slot has been decided but not started. A message
+     * reaching the same session another way — the IM chat a member fronts —
+     * must find it busy, or it starts a turn of its own and the wake starts a
+     * second one on the same session once its slot frees.
+     */
+    function holdRecorder(deps: OrchestrationSessionDeps) {
+      const held = new Map<string, number>()
+      const holds: Array<{ cancelled: boolean; end(): void }> = []
+      deps.holdTurn = (sessionKey) => {
+        let ended = false
+        held.set(sessionKey, (held.get(sessionKey) ?? 0) + 1)
+        const hold = {
+          cancelled: false,
+          end: () => {
+            if (ended) return
+            ended = true
+            held.set(sessionKey, (held.get(sessionKey) ?? 0) - 1)
+          },
+        }
+        holds.push(hold)
+        return hold
+      }
+      return { isHeld: (sessionKey: string) => (held.get(sessionKey) ?? 0) > 0, holds }
+    }
+
+    function wakeMember(orch: ReturnType<typeof build>, epochId: string, appId: string, corr: string) {
+      return orch.wakeTarget({
+        sessionKey: buildTeamSessionKey(appId, TEAM_ID, epochId),
+        appId,
+        teamId: TEAM_ID,
+        epochId,
+        envelope: { id: corr, teamId: TEAM_ID, epochId, fromAppId: LEAD_APP, toAppId: appId, body: 'go', correlationId: corr, createdAt: Date.now() },
+        trigger: { teamId: TEAM_ID, epochId, correlationId: corr, fromAppId: LEAD_APP, wait: false, kind: 'message' },
+      })
+    }
+
+    it('holds a session while its turn waits for a slot, and hands that hold to the turn', async () => {
+      seedTeam(store, { collabMode: 'free' })
+      const epoch = makeEpoch(store)
+      const { deps, pendings } = makeSession()
+      const { isHeld, holds } = holdRecorder(deps)
+      const orch = build(deps, undefined, 1)
+      const testerKey = buildTeamSessionKey(TESTER_APP, TEAM_ID, epoch.id)
+
+      await wakeMember(orch, epoch.id, RESEARCHER_APP, 'c1')
+      await wakeMember(orch, epoch.id, TESTER_APP, 'c2')
+      await flush()
+
+      expect(deps.sendAppChatMessage).toHaveBeenCalledTimes(1)
+      expect(isHeld(testerKey)).toBe(true)
+
+      pendings[0].resolve('done')
+      await flush()
+
+      const handed = vi.mocked(deps.sendAppChatMessage).mock.calls[1][0]
+      expect(handed.conversationId).toBe(testerKey)
+      expect(handed.turnStart).toBe(holds[1])
+
+      pendings[1].resolve('done')
+      await flush()
+      expect(isHeld(testerKey)).toBe(false)
+    })
+
+    it('a turn given up while queued lets go of the session once it reaches a slot', async () => {
+      vi.useFakeTimers()
+      try {
+        seedTeam(store, { collabMode: 'free' })
+        const epoch = makeEpoch(store)
+        const { deps, pendings } = makeSession()
+        const { isHeld } = holdRecorder(deps)
+        const orch = build(deps, 1000, 1)
+        const testerKey = buildTeamSessionKey(TESTER_APP, TEAM_ID, epoch.id)
+
+        await wakeMember(orch, epoch.id, RESEARCHER_APP, 'c1')
+        await wakeMember(orch, epoch.id, TESTER_APP, 'c2')
+        await vi.advanceTimersByTimeAsync(1001)
+        expect(isHeld(testerKey)).toBe(true)
+
+        pendings[0].resolve('done')
+        await vi.advanceTimersByTimeAsync(0)
+
+        expect(isHeld(testerKey)).toBe(false)
+        expect(deps.sendAppChatMessage).toHaveBeenCalledTimes(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('a turn stopped while queued gives the session back on reaching a slot, without setting up', async () => {
+      // A person's stop reaches a wake still waiting for its slot. Running it
+      // anyway only to halt it at the last step would keep the chat busy — and
+      // the person's next message waiting — through a whole session setup.
+      seedTeam(store, { collabMode: 'free' })
+      const epoch = makeEpoch(store)
+      const { deps, pendings } = makeSession()
+      const { isHeld, holds } = holdRecorder(deps)
+      const orch = build(deps, undefined, 1)
+      const testerKey = buildTeamSessionKey(TESTER_APP, TEAM_ID, epoch.id)
+      const completeTurn = spyCompleteTurn(bus)
+
+      await wakeMember(orch, epoch.id, RESEARCHER_APP, 'c1')
+      await wakeMember(orch, epoch.id, TESTER_APP, 'c2')
+      await flush()
+      holds[1].cancelled = true
+
+      pendings[0].resolve('done')
+      await flush()
+
+      expect(deps.sendAppChatMessage).toHaveBeenCalledTimes(1)
+      expect(isHeld(testerKey)).toBe(false)
+      expect(lastOutcome(completeTurn, testerKey)).toEqual({ kind: 'undelivered', reason: 'Stopped before it could run' })
     })
   })
 
@@ -1415,16 +1695,40 @@ describe('TeamOrchestration', () => {
       const { deps } = makeSession()
       const orch = build(deps)
 
-      const ctx = orch.buildPromptContext(TEAM_ID, RESEARCHER_APP)!
+      const ctx = orch.buildPromptContext(TEAM_ID, RESEARCHER_APP, EPOCH_ID)!
       expect(ctx.selfMemberName).toBe('researcher')
       expect(ctx.collabMode).toBe('structured')
       // researcher has no outgoing edges → nobody contactable in structured mode.
       expect(ctx.roster.every((m) => m.contactable === false)).toBe(true)
 
       // The lead, by contrast, may contact researcher + tester.
-      const leadCtx = orch.buildPromptContext(TEAM_ID, LEAD_APP)!
+      const leadCtx = orch.buildPromptContext(TEAM_ID, LEAD_APP, EPOCH_ID)!
       const contactable = leadCtx.roster.filter((m) => m.contactable).map((m) => m.memberName).sort()
       expect(contactable).toEqual(['researcher', 'tester'])
+    })
+
+    it('gives the member its team folder for the epoch its session serves', () => {
+      seedTeam(store)
+      const { deps } = makeSession()
+      const asked: Array<[string, string, string]> = []
+      const folders = {
+        forMember: (teamId: string, epochId: string, appId: string) => {
+          asked.push([teamId, epochId, appId])
+          return { shared: `/tf/${epochId}`, self: `/tf/${epochId}/${appId}` }
+        },
+        ofTaskAssignee: () => null,
+        sharedDir: () => '',
+        remove: async () => {},
+        prune: async () => {},
+      }
+      const orch = createOrchestration({ store, bus: createMessageBus({ store, hooks: {} as never }), session: deps, teamFolders: folders })
+
+      expect(orch.buildPromptContext(TEAM_ID, RESEARCHER_APP, 'epoch-9')!.teamFolder).toEqual({
+        shared: '/tf/epoch-9',
+        self: `/tf/epoch-9/${RESEARCHER_APP}`,
+      })
+      expect(asked).toEqual([[TEAM_ID, 'epoch-9', RESEARCHER_APP]])
+      expect(build(deps).buildPromptContext(TEAM_ID, RESEARCHER_APP, 'epoch-9')!.teamFolder).toBeNull()
     })
 
     // What app-chat withholds memory and the digital-human tools on. True only
@@ -1435,17 +1739,17 @@ describe('TeamOrchestration', () => {
 
       it('is true for a member the temporary collaboration built', () => {
         seedTeam(store, { ephemeral: true, aiProvisioned: true, collabMode: 'free' })
-        expect(make().buildPromptContext(TEAM_ID, RESEARCHER_APP)!.selfIsDisposable).toBe(true)
+        expect(make().buildPromptContext(TEAM_ID, RESEARCHER_APP, EPOCH_ID)!.selfIsDisposable).toBe(true)
       })
 
       it('is false for a digital human the person installed, even in a temporary collaboration', () => {
         seedTeam(store, { ephemeral: true, aiProvisioned: false, collabMode: 'free' })
-        expect(make().buildPromptContext(TEAM_ID, RESEARCHER_APP)!.selfIsDisposable).toBe(false)
+        expect(make().buildPromptContext(TEAM_ID, RESEARCHER_APP, EPOCH_ID)!.selfIsDisposable).toBe(false)
       })
 
       it('is false for an AI-built member of a persistent team — the team outlives the work', () => {
         seedTeam(store, { aiProvisioned: true })
-        expect(make().buildPromptContext(TEAM_ID, RESEARCHER_APP)!.selfIsDisposable).toBe(false)
+        expect(make().buildPromptContext(TEAM_ID, RESEARCHER_APP, EPOCH_ID)!.selfIsDisposable).toBe(false)
       })
     })
   })
@@ -1500,7 +1804,7 @@ describe('TeamOrchestration', () => {
       const epoch = makeEpoch(store)
       const { deps, pendings } = makeSession()
       const orch = build(deps)
-      const researcherEntry = () => buildTeamEntry(orch.buildPromptContext(TEAM_ID, RESEARCHER_APP)!)
+      const researcherEntry = () => buildTeamEntry(orch.buildPromptContext(TEAM_ID, RESEARCHER_APP, EPOCH_ID)!)
 
       // Turn 1: the lead sends.
       await bus.send({

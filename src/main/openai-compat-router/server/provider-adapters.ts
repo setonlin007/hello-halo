@@ -15,8 +15,13 @@
 import type { AnthropicRequest } from '../types'
 import { inlineToolSchemaRefs } from '../utils/json-schema'
 import { CODEX_ADAPTER_ID } from '../../../shared/constants/codex-models'
-import { getCodexModelCapability } from './codex-capabilities'
+import type { CodexModelCapability } from '../../../shared/types/ai-sources'
 import { isThinkingEffort } from '../converters/reasoning-effort'
+import {
+  CODEX_REASONING_EFFORT_LEVELS,
+  clampReasoningEffort,
+  isReasoningEffortLevel,
+} from '../../../shared/constants/reasoning-effort'
 
 // ============================================================================
 // Types
@@ -37,6 +42,7 @@ export interface AdapterContext {
    * already uses for its own affinity.
    */
   readonly sessionId?: string
+  readonly codexModelCapabilities?: CodexModelCapability
 }
 
 export interface ProviderAdapter {
@@ -349,6 +355,32 @@ function applyReasoningSummary(body: Record<string, unknown>, supported: boolean
 }
 
 /**
+ * Hold `reasoning.effort` to the levels this model takes.
+ *
+ * The backend rejects a level the model does not list, and the catalog says
+ * which those are; before it has been read, the Codex CLI's own enum bounds
+ * the ladder. A value off the ladder (`none`) is an off switch: kept where the
+ * catalog cannot rule on it, else replaced by the model's lowest level when
+ * the catalog does not list it.
+ */
+function applyReasoningLevels(body: Record<string, unknown>, supported: readonly string[] | undefined): void {
+  const reasoning = body.reasoning as { effort?: string } | undefined
+  const effort = reasoning?.effort
+  if (!reasoning || !effort) return
+  const listed = supported?.filter(isReasoningEffortLevel) ?? []
+
+  if (!isReasoningEffortLevel(effort) || effort === 'off') {
+    if (listed.length > 0 && !supported!.includes(effort)) {
+      reasoning.effort = clampReasoningEffort('minimal', listed) ?? effort
+    }
+    return
+  }
+
+  const clamped = clampReasoningEffort(effort, listed.length > 0 ? listed : CODEX_REASONING_EFFORT_LEVELS)
+  if (clamped) reasoning.effort = clamped
+}
+
+/**
  * Give every function tool its `strict` flag, which the CLI's tool struct
  * requires. Halo's converter forwards whatever the Anthropic side declared, and
  * that is usually absent — an omission this backend does not expect.
@@ -384,9 +416,10 @@ function applyToolStrictness(body: Record<string, unknown>): void {
  *   request struct, not only when tools were supplied.
  * - `prompt_cache_key` mirrors the per-conversation session id the CLI also
  *   sends as headers. Unset, every turn is a cache miss.
- * - `reasoning.summary` is requested whenever thinking is on, and tool `strict`
- *   flags are always present. Both come from {@link getCodexModelCapability},
- *   which the provider fills from the catalog.
+ * - `reasoning.effort` is held to the model's catalog levels,
+ *   `reasoning.summary` is requested whenever thinking is on, and tool
+ *   `strict` flags are always present. The account's selected-model capabilities
+ *   travel with the request, never through a process-wide catalog.
  * - Models flagged `use_responses_lite` take the system prompt as a leading
  *   `developer` item and must not receive `instructions`.
  *
@@ -418,7 +451,7 @@ const openAICodexAdapter: ProviderAdapter = {
       body.input = remainder
     }
 
-    const capability = getCodexModelCapability(body.model)
+    const capability = context?.codexModelCapabilities
     const systemPrompt = instructions.join('\n')
 
     if (capability?.responsesLite) {
@@ -444,6 +477,7 @@ const openAICodexAdapter: ProviderAdapter = {
     body.tool_choice = 'auto'
     body.parallel_tool_calls = true
 
+    applyReasoningLevels(body, capability?.reasoningLevels)
     applyReasoningSummary(body, capability?.reasoningSummary)
     applyToolStrictness(body)
 

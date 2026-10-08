@@ -72,6 +72,26 @@
     "path": "/api/spaces/:spaceId"
   },
   {
+    "method": "PUT",
+    "path": "/api/spaces/:spaceId/working-dir"
+  },
+  {
+    "method": "GET",
+    "path": "/api/spaces/:spaceId/preferences"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/spaces/:spaceId/preferences"
+  },
+  {
+    "method": "GET",
+    "path": "/api/spaces/:spaceId/memory"
+  },
+  {
+    "method": "POST",
+    "path": "/api/spaces/:spaceId/memory/consolidate"
+  },
+  {
     "method": "DELETE",
     "path": "/api/spaces/:spaceId"
   },
@@ -146,6 +166,10 @@
   {
     "method": "GET",
     "path": "/api/spaces/:spaceId/artifacts"
+  },
+  {
+    "method": "GET",
+    "path": "/api/spaces/:spaceId/artifacts/query"
   },
   {
     "method": "GET",
@@ -261,6 +285,14 @@
   },
   {
     "method": "GET",
+    "path": "/api/im-sessions/linked"
+  },
+  {
+    "method": "POST",
+    "path": "/api/im-sessions/set-push-link"
+  },
+  {
+    "method": "GET",
     "path": "/api/auth/providers"
   },
   {
@@ -298,6 +330,22 @@
   {
     "method": "POST",
     "path": "/api/apps/:appId/clear-memory"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/memory"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/memory/consolidate"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/reminders"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/apps/:appId/reminders/:reminderId"
   },
   {
     "method": "POST",
@@ -382,6 +430,14 @@
   {
     "method": "POST",
     "path": "/api/apps/:appId/chat/restart"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/chats/clearable"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/chats/clear-all"
   },
   {
     "method": "POST",
@@ -554,6 +610,10 @@
   {
     "method": "DELETE",
     "path": "/api/tlon/:kbId/linked-dirs/:linkId"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tlon/:kbId/linked-dirs/:linkId/retry"
   },
   {
     "method": "POST",

@@ -28,12 +28,17 @@ Apps Layer (src/main/apps)
 
 Services Layer (src/main/services)
   - domain services: agent, ai-browser, ai-sources, space, conversation,
-    artifact, analytics, remote, etc.
+    artifact, analytics, remote, git, etc.
   - app-bridge.ts   : DI seam so services reach Apps data without importing up
+  - memory-consolidation: background agent that reorganises an oversized memory
+                    (digital human or space) into topics; space turns reach it
+                    via the onAgentEvent turn-end signal, never from services/agent
   - openai-compat-router (src/main/openai-compat-router) sits in this tier:
     services/agent starts it and encodes backend configs through its index;
     it depends on services only through the standalone proxy-fetch utility,
-    never through a domain service. It owns the Claude Code identity sent
+    never through a domain service. Its one runtime seam is the request
+    credential resolver ai-sources registers at bootstrap, which gives each
+    proxied request its account's current token. It owns the Claude Code identity sent
     upstream (utils/claude-code-identity), which services/agent reads
     through the router's index.
 
@@ -41,14 +46,19 @@ Platform Layer (src/main/platform)
   - store       : SQLite manager + migrations foundation
   - scheduler   : persistent job engine
   - event       : event routing/filter/dedup
-  - memory      : scoped memory tools + files (SDK primitives injected via memory/sdk)
+  - memory      : memory.md + topic wiki per owner (digital human, space): layouts,
+                  turn rendering, write lock + engine-hook write guard, file side
+                  of consolidation; standing conventions shared across owners
   - background  : keep-alive + tray + daemon browser
   - turn-gate   : generic "one turn per session key" lock + FIFO mailbox
                   (shared by apps/runtime/team and services/agent; see its DESIGN.md)
+  - file-cache  : caches of values derived from files, valid while the file's
+                  stamp (size + mtime + inode) is unchanged (`createStampedLru`)
 
 Foundation Layer (src/main/foundation)  ← bedrock, zero upward deps
   - config.service, config-encryption, crypto-envelope, credential-safety
   - secure-storage, window, protocol, logging/, product-config
+  - path-containment (how file-tool path arguments resolve; containment checks)
 ```
 
 ## 2) Dependency Direction (Must Hold)
@@ -58,6 +68,9 @@ Foundation Layer (src/main/foundation)  ← bedrock, zero upward deps
 - **foundation** is the bedrock: it imports only Electron/Node/`shared` — never
   `platform/services/apps/http`. Anything config/log/window/crypto/product-config
   belongs here. A foundation file importing an upper tier is always a bug.
+- File-picker calls use `foundation/file-dialog` to retain their last successful
+  directory across launches. The lazy, bounded native-dialog state lives in
+  Electron userData; explicit caller paths retain precedence.
 - `apps/runtime` is the orchestration boundary; do not push runtime orchestration
   into transport layers.
 - `platform/*` stay generic infrastructure (not renderer-specific, not UI-coupled),
@@ -70,9 +83,11 @@ Foundation Layer (src/main/foundation)  ← bedrock, zero upward deps
   - `services/app-bridge.ts` — the agent engine and space service reach the App
     manager / `halo-apps` MCP server / MCP-change events through this seam;
     `apps/runtime` registers the concrete impls at startup (`registerAppBridge`).
-  - `platform/memory/sdk.ts` — the agent-SDK `tool()`/`createSdkMcpServer()`
-    primitives are injected by bootstrap (`setMemorySdk`) so memory never imports
-    `services/agent`.
+  - `services/conversation-interop/source.ts` — the conversation directory behind
+    `conversation_read`/`conversation_send` is a set of registered
+    `ConversationSource`s; the space's own conversations are built in and
+    `apps/runtime` registers the digital-human source from `bootstrap/extended.ts`
+    (`registerConversationSource`). No ordering constraint; see the module DESIGN §9.
   - Pattern mirrors `apps/runtime/im-channels`'s `setActiveImChannelManager`.
   - Type-only imports across a boundary are erased at runtime and are allowed.
 - Shared renderer-safe types belong in `src/shared/*`.
@@ -94,11 +109,14 @@ src/
 │   ├── foundation/                    # Bedrock tier (zero upward deps): config.service,
 │   │                                  #   config-encryption, crypto-envelope,
 │   │                                  #   credential-safety, secure-storage, window,
-│   │                                  #   protocol, logging/, product-config
+│   │                                  #   protocol, logging/, product-config,
+│   │                                  #   path-containment (file-tool path boundaries)
 │   ├── controllers/                   # Business logic shared by IPC & HTTP
 │   ├── http/                          # Remote Access: Express + WebSocket
 │   │   ├── routes/                    #   Per-domain route modules (*.routes.ts) +
 │   │   │                              #   _shared.ts (imports/helpers barrel) +
+│   │   │                              #   _path-guard.ts (which paths a remote client may
+│   │   │                              #   read/write; validateFilePath) +
 │   │   │                              #   index.ts (thin aggregator). NO business logic.
 │   │   │                              #   *.routes.meta.ts declare each route's AI exposure
 │   │   │                              #   (ai/wrapped/internal); _meta-types.ts + _meta-groups.ts
@@ -133,7 +151,14 @@ src/
 │       │                              #   resources/api-ref/ by scripts/gen-api-ref.mjs.
 │       │                              #   Reads generated files only: the coupling to the
 │       │                              #   transport layer is build-time, never runtime.
+│       ├── code-review/               # The changes view's review buttons: snapshot, background review
+│       │                              #   conversation, built-in review task, latest review per
+│       │                              #   repository. See code-review/DESIGN.md
 │       ├── email-mcp/                 # Email-as-MCP tool server
+│       ├── git/                       # git CLI for a space's repositories (its folder + direct sub-folders):
+│       │                              #   status, change lists for four compare scopes, file sides,
+│       │                              #   working-tree snapshots, stage/discard/commit/sync. Reads take
+│       │                              #   no index lock. No agent/conversation deps. See git/DESIGN.md
 │       ├── git-bash/                   # Windows bash env for Claude Code CLI (detection + installer + mock fallback)
 │       ├── health/                    # Diagnostics & recovery
 │       ├── logging/                   # Logging subsystem: controller (Developer Mode toggle)
@@ -149,19 +174,25 @@ src/
 │       ├── remote/                     # Remote Access: HTTP-server + Cloudflare tunnel coordination (service + tunnel + issuer-client)
 │       ├── stealth/                   # Anti-detection evasions
 │       ├── web-search/                # Web search MCP server
+│       ├── workday-calendar/          # Mainland China holiday calendar for "working days only"
+│       │                              #   schedules: downloaded (product.json `workdayCalendarUrl`)
+│       │                              #   at most daily via proxy-fetch, kept in the Halo dir,
+│       │                              #   each day decided locally; apps/runtime consults it
 │       ├── updater/                   # Auto-update. Two paths behind one surface:
 │       │                              #   electron-updater (mac/linux/win installer) and
 │       │                              #   the Windows staged path (background unpack +
 │       │                              #   directory swap). See updater/DESIGN.md
 │       └── *.service.ts + utilities   # Domain singletons: config, conversation, space,
 │                                      #   artifact, artifact-cache, search,
-│                                      #   window, overlay, onboarding, notification,
+│                                      #   window, onboarding, notification,
 │                                      #   announcement (static-feed poll → toast; the only
 │                                      #     server→client push that is not version-coupled),
 │                                      #   protocol, api-validator, model-capabilities,
 │                                      #   secure-storage, browser-view, browser-policy,
 │                                      #   watcher-host
-│                                      #   (+ utilities: browser-login-pages, proxy-fetch)
+│                                      #   (+ utilities: browser-login-pages, proxy-fetch,
+│                                      #    proxy-policy — the one place proxy and NO_PROXY
+│                                      #    decisions are made, for fetch, browser and child envs)
 │
 ├── worker/                            # Utility processes (file-watcher)
 ├── shared/                            # Cross-process types, constants, protocols
@@ -172,7 +203,8 @@ src/
 │   │                                  #   and teammates; enforced in apps/runtime/capability-policy)
 │   └── constants/                     # providers, ignore-patterns, display-scale,
 │                                      #   model-capabilities (wire-id → capability
-│                                      #   inference), model-runtime-limits,
+│                                      #   inference), model-pricing (wire-id → list
+│                                      #   price; data in shared/data), model-runtime-limits,
 │                                      #   reasoning-effort
 │
 ├── preload/
@@ -198,8 +230,12 @@ src/
     ├── components/                    # UI sub-components by domain (NOT full-screen views):
     │   ├── apps/                      #   Apps management
     │   ├── canvas/                    #   Content Canvas + viewers/
-    │   ├── chat/                      #   Chat stream + tool-result/
-    │   ├── layout/                    #   Header, ModelSelector, SpaceSelector, etc.
+    │   ├── chat/                      #   Chat stream + tool-result/ + transcript/ (native
+    │   │                              #   transcript scrolling for every chat surface — no
+    │   │                              #   list virtualization; see transcript/DESIGN.md)
+    │   ├── ai-config/                 #   Model/source controls: ModelSelector + thinking
+    │   │                              #   slider, quota ring, provider picker
+    │   ├── layout/                    #   Header, NavRail, SpaceSelector, TaskPanel, etc.
     │   ├── settings/                  #   Settings sections
     │   ├── setup/                     #   Sub-components: LoginSelector, SetupProviderConfig, ServerConnect
     │   ├── store/                     #   App Store UI
@@ -213,11 +249,25 @@ src/
     │   │                              #   settings and the team member settings
     │   ├── brand/, icons/, tool/, updater/, notification/
     │   ├── team/                      #   Digital team / office UI (board, member chat, join)
+    │   ├── references/                #   Unified references: content → the composer beside
+    │   │                              #   the canvas and back. One public surface (index.ts):
+    │   │                              #   adapters (CodeMirror incl. merge sides — comments as
+    │   │                              #   cards under their lines —, rendered text, xterm), the
+    │   │                              #   page's ReferenceLayer (floating bar, comment box,
+    │   │                              #   comment markers, floating comment card), chips with
+    │   │                              #   their lists, reveal (going back), `path:line` links.
+    │   │                              #   References wait in stores/composer-references.store.ts
+    │   │                              #   (memory only; comments being written in
+    │   │                              #   comment-edits.ts) and travel on the user message's
+    │   │                              #   metadata.references
     │   ├── diff/, search/, pulse/, onboarding/, artifact/
     │   └── ErrorBoundary.tsx
     ├── stores/                        # Zustand stores (one per domain: app, chat, space, canvas,
     │   │                              # search, apps, apps-page, ai-browser, notification,
-    │   │                              # onboarding, perf, server, team)
+    │   │                              # onboarding, perf, server, team). The chat store serves
+    │   │                              # space AND digital-human conversations through one page
+    │   │                              # (ChatView) — `chat/backend/` dispatches by conversation id;
+    │   │                              # see stores/chat/DESIGN.md before touching either
     │   └── server.store.ts            # Multi-server list for Capacitor (ServerEntry[])
     ├── hooks/                         # useIsMobile, useCanvasLifecycle, useLayoutPreferences,
     │                                  # useConfirmDialog, useFileOperations, useRemoteSubscription,
@@ -234,7 +284,9 @@ Outside `src/`: `gateway/` is a standalone Go module (the federation relay gatew
 a dumb frame router for off-LAN offices; see §24), `win-update-helper/` is a standalone
 Go module shipping two binaries (the Windows update helper that performs the directory
 swap, and the packer that builds update archives — see `services/updater/DESIGN.md`),
-and `tests/decentralized/` is the cluster regression tier that boots REAL multi-process
+`runtimes/` holds the runtimes that ship inside the installer with their own dependency
+manifest (`dsh/`, `office/`; one self-contained directory each, output in
+`resources/<name>-runtime/`, see its README.md), and `tests/decentralized/` is the cluster regression tier that boots REAL multi-process
 nodes (see its README.md).
 
 ## 5) Data Types
@@ -250,7 +302,7 @@ Key types:
 | `AuthType` | `api-key` \| `oauth` \| `delegated` — see the delegated note below |
 | `ConversationMeta` | Lightweight list item (no messages) |
 | `Conversation` | Full conversation with `messages`, `sessionId`, `version` |
-| `Message` | Contains `content`, `toolCalls`, `thoughts` (null=separated), `images`, `tokenUsage`, `thoughtsSummary`, `metadata.fileChanges`, `error` |
+| `Message` | Contains `content`, `toolCalls`, `thoughts` (null=separated), `images`, `tokenUsage`, `thoughtsSummary`, `metadata.fileChanges`, `metadata.references` / `metadata.task` (user messages), `error` |
 | `Thought` | Agent reasoning: `thinking`, `text`, `tool_use`, `tool_result`, `system`, `result`, `error` |
 | `ThoughtsSummary` | Lightweight summary: `count`, `types`, `duration` (for collapsed display without loading thoughts) |
 | `ToolCall` | Tool invocation: `id`, `name`, `status`, `input`, `output`, `requiresApproval`, `description` |
@@ -263,6 +315,29 @@ Key types:
 | `TokenUsage` | Token usage stats: input/output/cache/cost |
 | `CompactInfo` | Context compression notification |
 | `FileChangesSummary` | Lightweight file changes in message metadata |
+| `ContentReference` | A place the user pointed at and sent with a message (file lines, a diff side, terminal output, a message passage, a local path): location + excerpt as it was + note. The transcript keeps the record; the model reads it expanded as `<halo_references>` (`services/agent/references.ts`) |
+| `MessageTask` | A built-in task a user message starts (today: code review from the changes view). Set only in the main process; the model reads it as `<halo_task>` |
+
+**Managed OAuth accounts** are independent `AISource` records, not one record per
+provider. Login without a target adds an account (a verified stable account id may
+match an existing record); targeted reauthentication preserves the source id and
+rejects a known account mismatch. An optional provider `getAccountId` verifies a
+legacy identity from that source's credential before an id migration; labels never
+prove identity. ChatGPT separates user/workspace identity from the provider-owned
+`accountId` used by inference and catalog routing; workspace membership alone is
+not proof of the same user. Providers receive only the selected source's legacy
+config slice. Credentials, temporary provider tokens, catalogs and request
+capabilities must never be shared between accounts. Async credential and catalog
+writes are single-flight per source and discard obsolete results. Model-bound
+credentials are prepared for the same captured effective model used to resolve the
+backend descriptor. Every engine receives the same captured account snapshot;
+alternate engines never re-read global selection during creation. Source changes
+rebuild only sessions using that source, at the existing safe boundaries; an unavailable explicit source must fail rather than
+silently use another account. CLI-delegated credentials remain a single external
+slot. Generic client config snapshots preserve live managed source metadata,
+credentials and selection; account edits and lifecycle operations use targeted
+source APIs, so stale snapshots cannot delete/revive accounts or roll back edits. OAuth tokens are masked at IPC/HTTP
+boundaries, and login responses never expose provider token payloads.
 
 **`delegated` auth type** (`claude-cli` source): Halo holds no credential — the
 bundled Claude Code CLI authenticates itself from its own store, keyed by
@@ -292,8 +367,8 @@ All channels follow `module:action` format. Modules are organized by functional 
 | Auth & config | `auth`, `config`, `cli-config`, `model-capabilities` |
 | Conversation & agent | `conversation`, `agent` (incl. `agent:toolsets-*` + `toolsets:changed` event) |
 | Terminal | `terminal` (`terminal:list/create/input/resize/kill/replay` + `terminal:data`/`terminal:lifecycle` events) |
-| Space & artifact | `space`, `artifact`, `search` |
-| Browser | `browser`, `browser-policy`, `ai-browser`, `overlay` |
+| Space & artifact | `space`, `artifact`, `search`, `git` (the changes view: `git:*` typed-RPC channels, failures carry a `GitErrorCode`; remote twin `POST /api/git/*`), `code-review` (the changes view's review buttons: `code-review:start/get-latest/availability`; remote twin `/api/code-review/*`) |
+| Browser | `browser`, `browser-host`, `browser-policy`, `ai-browser` |
 | Apps & store | `app`, `store`, `onboarding` |
 | IM channels | `im-channels`, `im-sessions`, `wecom-bot`, `weixin-ilink` |
 | Digital team | `team` (offices, members + per-team duty/capability policy, blackboard, periodic checks, invites, federation presence) |
@@ -393,6 +468,7 @@ export const api = {
 3. Token stored in localStorage
 4. All API requests include `Authorization: Bearer <token>`
 5. On 401: Remote reloads page; Capacitor dispatches `halo:auth-expired` → server list
+6. Download links (remote page, mobile app) carry a two-minute single-file ticket from `POST /api/artifacts/download-ticket`, never the token (`http/auth/download-ticket.ts`)
 
 ### Capacitor Mobile App
 
@@ -425,8 +501,8 @@ Services use a **callback registration pattern** to avoid circular dependencies:
 
 - `config.service.ts` provides `onApiConfigChange(callback)` registration
 - `agent` service registers the callback at module load
-- When API config changes (provider/apiKey/apiUrl), agent is automatically notified to clean up all V2 Sessions
-- User's next message automatically creates a new Session with the updated config
+- V2 credential/routing/capability changes notify agent with affected source ids; only those sessions rebuild at safe boundaries. Legacy API changes invalidate all sessions.
+- User's next message automatically creates a Session with the updated source config
 
 **BrowserWindow lifecycle**: Always check `!mainWindow.isDestroyed()` before accessing `mainWindow`, especially in async callbacks and event listeners (the window may already be destroyed).
 
@@ -435,30 +511,31 @@ Services use a **callback registration pattern** to avoid circular dependencies:
 ### Components
 
 ```
-ContentCanvas.tsx          # Main container + tab switching
+ContentCanvas.tsx          # Main container; renders <TabContent key={tab.id}>
 ├── CanvasTabs.tsx         # Tab bar (VS Code style)
 └── viewers/
-    ├── CodeViewer.tsx     # CodeMirror 6 with syntax highlighting
-    ├── MarkdownViewer.tsx # react-markdown
-    ├── HtmlViewer.tsx     # iframe srcdoc (avoids CSP issues)
+    ├── CodeViewer.tsx     # CodeMirror 6; also json/text and unknown types
+    ├── MarkdownViewer.tsx # Streamdown (static mode)
+    ├── HtmlViewer.tsx     # halo-preview:// origin for files in a space; opaque srcdoc otherwise
     ├── ImageViewer.tsx    # Zoom/pan
-    ├── JsonViewer.tsx     # Format/minify
     ├── CsvViewer.tsx      # Table view
-    ├── TextViewer.tsx
-    ├── BrowserViewer.tsx  # Live web pages
+    ├── BrowserViewer.tsx  # Chrome and a presentation anchor for a persistent webview guest
     ├── XlsxViewer.tsx     # SheetJS parse in a Web Worker + virtualized table
-    ├── DocxViewer.tsx     # docx-preview
-    ├── PdfViewer.tsx      # pdfjs-dist; remote/web only (desktop uses BrowserView)
+    ├── DocxViewer.tsx     # docx-preview (patched: blob URLs revoked on dispose)
+    ├── PdfViewer.tsx      # pdfjs-dist; remote/web only (desktop uses Chromium webview)
     ├── PptxViewer.tsx     # Placeholder — no renderer; open externally / download
+    ├── TerminalViewer.tsx / TeamViewer.tsx
+    ├── changes/           # Code changes read-only as diffs (@codemirror/merge): a space's Git repositories
+    │                      # (scopes, staging, commit, AI review) or one AI reply's edits; entry ChangesViewer.tsx
     └── OfficeFallback.tsx # Shared unreadable/unsupported state with escape hatches
 ```
 
-The four document viewers are `React.lazy` chunks (SheetJS / docx-preview / pdfjs
-are large) behind `ViewerSuspense`, which pairs Suspense with a scoped
-ErrorBoundary — a chunk that fails to load must cost one pane, not the window.
-They are also the only viewers keyed on `tab.id`, because this switch reuses one
-component instance per type and their per-document state (page, zoom, active
-sheet) would otherwise bleed across tabs.
+Viewers are looked up in a registry that is exhaustive over `ContentType` (unknown or
+legacy persisted types render as text) and every viewer is mounted by a host that owns the
+Suspense + ErrorBoundary and one instance per tab (`key={tab.id}`). The viewer contract —
+per-tab disposable resources, no canvas store access, immutable `TabState`, budgets, hidden
+= unmounted — is in `src/renderer/components/canvas/DESIGN.md`; the rules that are enforced
+by guards are summarized in `references/performance-and-scale.md` §4.
 
 ### Two content channels per tab
 
@@ -496,7 +573,7 @@ thing the cap exists to prevent.
 ### Layout Modes
 
 - **No Canvas**: Full-width chat
-- **With Canvas**: Narrow chat (user-configurable, stored in space preferences) + Canvas + ArtifactRail
+- **With Canvas**: Narrow chat (user-configurable, stored in space preferences) + Canvas + ArtifactRail. The rail steps aside, without changing the user's setting, while the active tab's viewer brings its own file list (`bringsFileList` in the viewer registry) or an open rail would leave the canvas under 480 px; opening it by hand keeps it until the active tab changes or the canvas closes (`hooks/useRailYield`, rules in `utils/rail-yield`)
 
 ### Interface Layout
 
@@ -507,11 +584,19 @@ thing the cap exists to prevent.
 ### Technical Decisions
 
 - **HTML preview**: Uses `<iframe srcdoc>` instead of blob URLs (avoids CSP restrictions)
-- **Fullscreen**: Calls `BrowserWindow.maximize()` for window-level maximization
+- **Canvas fullscreen**: Uses renderer layout state to expand the Canvas and hide the composer. Native window maximization/fullscreen is a separate window concern.
 
 ## 10) AI Browser Module
 
-AI-controlled embedded browser for web automation. Uses Electron BrowserView + CDP.
+AI-controlled embedded browser for web automation. Uses Electron webview guests + main-process CDP. The browser manager owns policy,
+identity and page state; `services/browser-host` owns fixed guest attachment.
+Interactive and watchable AI pages share a permanent main-renderer host; pure
+automation and search use a minimal hidden host. Viewers only borrow presentation
+and may unmount without destroying pages. See `services/browser-host/DESIGN.md`.
+`services/browser-input` owns keyboard/text delivery and operation-scoped frame
+routing. `BrowserInputOperation` holds the debugger resources and pressed input of
+one operation; opaque iframe DOM references select local isolated worlds or owned
+child debugger sessions, without URL matching or global target enumeration.
 
 ### 14 Browser Tools (consolidated from 28)
 
@@ -576,19 +661,23 @@ Do not create new CSS files unless the above exceptions apply.
 ### 12.1) Window Chrome & Top Overlays (Non-Negotiable)
 
 The desktop window is frameless: native controls are painted by the OS compositor
-*above* all page content and cannot be covered by z-index. macOS shows traffic
-lights top-left; Windows/Linux use `titleBarOverlay` top-right. The whole top
-strip is also the OS drag region.
+*above* all page content and cannot be covered by z-index. macOS traffic lights
+sit above the NavRail; Windows uses right-side `titleBarOverlay` controls. Linux
+follows the native control layout, which can place controls on either side.
+The title strip also contains the OS drag region.
 
 Any component fixed to the top of the window (headers, and full-width alert/
 notification banners such as `CredentialAlertBanner`) **must**:
 
-- **Reserve the native-control space** so its own interactive elements never sit
-  under the OS buttons (where clicks are swallowed). Mirror `Header`'s
-  convention, gated on `isElectron() && !isCapacitor()`:
-  - macOS → `pl-20 pr-4` (left traffic lights)
-  - Windows/Linux → `pl-4 pr-36` (right titleBarOverlay buttons)
-  - remote/browser/Capacitor → plain `px-4` (no overlay)
+- **Reserve the actual native-control overlap** so interactive elements never sit
+  under OS buttons. Gate desktop handling on `isElectron() && !isCapacitor()`:
+  - macOS → the rail reserves traffic-light space; a full-width banner reserves
+    its own left inset. A header starting after the rail needs no duplicate inset.
+  - Windows → reserve the right-side controls, accounting for display scale.
+  - Linux → use `env(titlebar-area-x)` and `env(titlebar-area-width)` to reserve
+    left/right overlap; do not assume a right-side control group. The rail also
+    accounts for the native title-bar height.
+  - remote/browser/Capacitor → no desktop native-control reservation.
 - **Declare drag regions explicitly**: put `drag-region` on the container that
   overlaps the title strip, and `no-drag` on every button/link inside it.
   Without `no-drag`, clicks over the drag strip are consumed as window drags.
@@ -667,6 +756,23 @@ Spaces have two distinct paths:
 
 For default spaces (no custom path), `workingDir` is undefined and `path` serves both purposes.
 
+Changing `workingDir` (Edit Workspace, or the chat's "change working
+directory" when a turn cannot start because the folder is gone) goes through
+`controllers/space.controller.ts` `changeSpaceWorkingDir`, which only re-points:
+the engine's stored sessions are copied to the new folder's project-dir name
+first (`services/agent/stored-session.ts`, newer copy wins), then the record
+(meta.json before the index, so a failed write changes nothing), the digital
+humans' pinned environments (apps/runtime DESIGN §2.28), resident sessions and
+the file panel and file triggers (`rerootSpaceWatcher`, `rerootSpaceCache`).
+What is written to the old folder after the copy would be lost to the new one,
+so the change is refused while anything in the space runs, and again if any
+session of the space was asked for during the copy (even one finished by
+then); after it, no session of the space starts in a folder it left (apps/runtime
+DESIGN §2.28). One change per space at a time. Nothing in either folder is
+moved, created or deleted; folders inside Halo's and the engine's own data
+cannot be chosen, except the space's own data folder (where a space without a
+project folder works), and the default space's folder cannot be changed.
+
 Notes:
 - **Legacy custom-path spaces**: Created before centralized storage, `path` points to the project directory with `.halo/` inside it. These continue to work without migration.
 - **Lazy-loaded conversations**: `conversation.service.ts` uses `index.json` for fast listing; full conversation data is loaded only when entering a conversation.
@@ -732,6 +838,10 @@ that reaches one and not the other is worse than one that reaches neither.
 - **Renderer transport mode switch**: `src/renderer/api/transport.ts`
 
 Desktop mode: renderer -> preload -> IPC -> main.
+First-render reads of extended IPC services share `api/bootstrap-ready`'s
+bounded Pull+Push barrier. It observes the existing bootstrap status and ready
+event once, and releases all concurrent reads when registration is complete.
+It does not start domain services or poll for readiness.
 Remote mode: renderer -> HTTP/WS -> main.
 
 ### 17.1 Self-API (the agent operating Halo)
@@ -783,6 +893,18 @@ from `createOfficialDocsSession()` and hands the callback to
 `createHaloAppsMcpServer`. Session-scoped by closure, never process-wide: one
 conversation consulting the guide must not unlock spec authoring in another.
 
+### Browser attachment transport
+
+`browser:host-ready` (snapshot), `browser:host-command` (upsert/remove),
+`browser:host-failed` and `browser:host-frame-ready` (frame-lease
+acknowledgement) form a desktop-only DOM attachment protocol. It is registered
+before the main window loads; the hidden host uses a minimal sandbox-compatible
+preload with this protocol alone. Guest attachment is authorized in main; guests
+never receive Halo's preload. The `browser:page-gone` event tells the main
+renderer that a page was closed or lost, so Canvas can drop or recreate its tab.
+Existing `browser:*` business methods retain their legacy names and response
+shapes. The fullscreen chat capsule is ordinary DOM.
+
 ## 18) Logging
 
 **Production logging requirements:**
@@ -796,13 +918,13 @@ conversation consulting the guide must not unlock spec authoring in another.
 
 | Layer | Technology |
 |-------|------------|
-| Framework | Electron 29 |
+| Framework | Electron 43 (macOS 12+) |
 | UI | React 18 + TailwindCSS 3.4 |
 | State | Zustand 4.5 |
 | i18n | i18next 25.7 |
 | Code Editor | CodeMirror 6 |
 | Markdown | react-markdown 10 + remark-gfm + rehype-highlight |
-| Diff | diff + react-diff-viewer-continued |
+| Diff | @codemirror/merge |
 | HTTP | Express 5 |
 | WebSocket | ws 8 |
 | Agent | @anthropic-ai/claude-code (claude-agent-sdk) |
@@ -820,6 +942,9 @@ When touching a module, read its design doc first:
 - `src/main/services/updater/DESIGN.md` — Auto-update: the two apply paths, why staged update descriptions are signed at build time, and the reversal contract with the native helper
 - `src/main/services/agent/toolsets/DESIGN.md` — Toolset Broker (on-demand in-process MCP loading; how tool capabilities enter a session, including the self-API switch — see §17.1)
 - `src/main/services/ai-terminal/DESIGN.md` — AI Terminal (pty + xterm headless, MCP tools, xterm.js viewer)
+- `src/main/services/git/DESIGN.md` — Git for the changes view: how git is run and located (Windows included), the request gate, compare scopes, snapshots, writes, measured costs
+- `src/main/services/code-review/DESIGN.md` — Starting an AI review of a repository's changes as a background conversation, its built-in task, and the latest review per repository
+- `src/main/services/conversation-interop/DESIGN.md` — Cross-conversation read/send/wait: delivery rules, circuit breaker, and the `ConversationSource` contract (space conversations built in, digital-human chats registered by `apps/runtime`)
 - `src/main/apps/spec/DESIGN.md`
 - `src/main/apps/manager/DESIGN.md`
 - `src/main/apps/runtime/DESIGN.md`
@@ -831,6 +956,8 @@ When touching a module, read its design doc first:
 - `src/main/platform/background/DESIGN.md`
 - `src/main/apps/runtime/federation/DESIGN.md` — cross-node office federation (read before any team/federation change)
 - `src/main/apps/runtime/federation/log/DESIGN.md` — unified feed substrate (durable outbox / replication)
+- `src/renderer/stores/chat/DESIGN.md` — chat store: one page over space and digital-human conversations (conversation sources, active conversation, turn settle, cache)
+- `src/renderer/components/chat/transcript/DESIGN.md` — transcript scrolling primitives (no virtualization)
 
 ## 22) IM Integration (Plugin Architecture)
 
@@ -881,7 +1008,8 @@ InboundMessage / ReplyHandle  — normalized upward protocol
 3. Extend the `ImChannelType` union in `src/shared/types/im-channel.ts`.
 4. If the brand has unique setup/auth flow (QR, OAuth, token refresh): add `ipc/<brand>.ts` + preload + renderer API + a setup UI component. Keep this file minimal — only brand-unique flows belong here.
 5. If the provider writes temp files: add a cleanup call in `cleanupImChannelTempFiles()`.
-6. Do NOT change `manager.ts`, `dispatch-inbound.ts`, or any other existing provider.
+6. If the platform caps one message: state the cap once in the provider and send text (replies, pushes, a stream's final answer) through `im-channels/message-parts.ts`. Callers hand over text of any length.
+7. Do NOT change `manager.ts`, `dispatch-inbound.ts`, or any other existing provider.
 
 ### 22.5 Inter-Module Access
 
@@ -944,7 +1072,7 @@ model and where things are:
 | Coordination kernel | `apps/runtime/team/` | message-bus (send/wait/turn-complete), blackboard (tasks/findings/activity), board-digest (what a member missed, rendered into its turn input), orchestration, artifact-read (location-transparent `team_read_artifact` for agents, and the opener behind a person clicking a shared file — one resolution for both). **Never imports the federation transport** — cross-node behavior arrives only through bootstrap-injected seams. |
 | Team persistence | `apps/team/` | teams/members (incl. per-team duty + delegated capability policy)/edges/epochs/triggers/checks/activity (SQLite, `app_team`) + published-ref semantics SSOT (`artifact-refs.ts`, shared with the federation owner-serve gate) |
 | Federation runtime | `apps/runtime/federation/` | join/presence coordinator, per-node manager (host+joiner roles), M2 authority (election/replication/handover), activity relay |
-| Feed substrate | `apps/runtime/federation/log/` + `ctrl-feed.ts` + `session-feed.ts` | per-author append-only feeds: durable ctrl outbox (effectively-once wake/turn-complete) + multi-replica session transcripts (local-first history) |
+| Feed substrate | `apps/runtime/federation/log/` + `ctrl-feed.ts` + `session-feed.ts` | per-author append-only feeds: durable ctrl outbox (effectively-once wake/turn-complete; per-target to capable peers) + session transcripts held by the authority and by every node that wants them (lazy replication) |
 | Federation persistence | `apps/federation/` | office nodes/credentials/authority + FeedStore (`app_federation`) |
 | Relay gateway | `gateway/` (repo-root Go module) | dumb frame router for off-LAN offices; never interprets payloads |
 | Transport seams | injected by `bootstrap/extended.ts` | federation imports no `http/*`; WS server routes inbound frames via `setFederationInbound` |
@@ -968,6 +1096,7 @@ Key invariants (violating these is an architecture bug):
   Never reintroduce a "first/newest publisher wins" pick — a model handed the
   wrong file has no way to notice it got one.
 - Star topology: joiners talk only to the office authority; joiner↔joiner traffic is relayed/mirror-served by it.
-- Directed control messages ride the durable feed outbox (no fire-and-forget); transcripts are multi-replica (every node keeps a local copy).
+- Directed control messages ride the durable feed outbox (no fire-and-forget). Transcripts are multi-replica as "the office authority + every node that showed them in a panel", not every node. History is guaranteed readable while the authority is online. A copy that is not local is fetched on demand and reads as "unavailable right now", never as "this member said nothing".
+- A node receives what it owns, what it shows, and a digest of the rest: streams by subscription, run state as versioned deltas, wakes on its own ctrl feed, transcripts lazily. There is one protocol, gated by `FEDERATION_PROTOCOL_VERSION` (a peer on another version is refused at join; see federation DESIGN "Compatibility policy"). Subscriptions are soft state, re-declared after every (re)join or election.
 - Office-shared rows outside the board (member profile, periodic checks) ride the same single-writer log; a member's delegated capability policy never leaves the machine it guards.
 - Team/federation changes additionally require the cluster tier: `npm run build` then `npm run test:team -- federation` (never in parallel with other suites).

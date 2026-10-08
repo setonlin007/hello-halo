@@ -30,6 +30,12 @@
   /* Dark theme (default). Neutrals carry a cool (blue-adjacent, H~220) tint
      rather than pure gray — matched to the prototype's own token values. */
   --background: 220 20% 6%;
+  /* Browser gutters match Chromium's default page surface in either theme. */
+  --browser-background: 0 0% 100%;
+  /* Blocking portals cover resource sheets and the search overlay (100/101). */
+  --layer-workspace-trigger: 60;
+  --layer-workspace-sheet: 70;
+  --layer-global-modal: 120;
   --foreground: 223 17% 92%;
   --card: 220 18% 10%;
   --card-foreground: 223 17% 92%;
@@ -46,6 +52,10 @@
      against --background and 3.71 against --card, below WCAG AA for the 10–12px
      labels this token is used on. 52% clears 4.5 on both surfaces. */
   --subtle-foreground: 220 9% 52%;
+  /* Low-frequency icon controls only (never text): recedes until hovered.
+     Kept at the 3:1 floor for interactive graphics, including on the
+     secondary-tinted toolbars and hovered rows it sits on. */
+  --faint-foreground: 220 8% 44%;
   --accent: 217 91% 60%;
   --accent-foreground: 0 0% 100%;
   --accent-on-dark: 212 96% 78%;
@@ -56,6 +66,9 @@
   --input: 220 19% 13%;
   --ring: 217 91% 60%;
   --radius: 0.75rem;
+  /* Chat transcript and composer column. Fixed, not fluid: on wide screens a
+     fluid column makes lines too long to read comfortably. */
+  --chat-reading-width: 800px;
 
   --shadow-soft: 0 12px 32px -12px rgba(0, 0, 0, .55);
   --shadow-pop: 0 20px 48px -16px rgba(0, 0, 0, .7);
@@ -69,6 +82,18 @@
   --halo-success: 142 71% 45%;
   --halo-warning: 38 92% 50%;
   --halo-error: 0 62% 50%;
+
+  /* Diff text (+N / −N, status letters) and, at low alpha, line and word
+     backgrounds. Separate from the brand colors because small text on the
+     card surface must clear 4.5:1 in both themes. */
+  --diff-add: 142 71% 45%;
+  --diff-del: 0 72% 63%;
+  --diff-mod: 38 92% 50%;
+  /* Diff-only syntax, contrasted against layered line and word tints. */
+  --diff-syntax-keyword: 277 45% 75%;
+  --diff-syntax-function: 213 65% 74%;
+  --diff-syntax-string: 146 40% 70%;
+  --diff-syntax-number: 32 50% 72%;
 
   /* App type accent colors (skill = cyan, mcp = amber). Brightened for the
      dark default; .light carries the source values. */
@@ -102,6 +127,7 @@
   /* Darkened from the prototype's 58%, which scores only 2.98 on light
      surfaces — see the dark-theme note above. 46% clears 4.5. */
   --subtle-foreground: 221 10% 46%;
+  --faint-foreground: 220 9% 52%;
   --accent: 217 91% 55%;
   --accent-foreground: 0 0% 100%;
   /* Falls back to --primary in light mode, matching the prototype's
@@ -123,6 +149,14 @@
   --halo-warning: 38 92% 45%;
   --halo-error: 0 72% 51%;
 
+  --diff-add: 142 72% 29%;
+  --diff-del: 0 72% 45%;
+  --diff-mod: 32 100% 32%;
+  --diff-syntax-keyword: 277 55% 32%;
+  --diff-syntax-function: 213 70% 30%;
+  --diff-syntax-string: 146 20% 28%;
+  --diff-syntax-number: 32 50% 28%;
+
   /* App type accent colors — light values (skill #0d9488, mcp #b26a00) */
   --app-skill: 175 84% 32%;
   --app-mcp: 36 100% 35%;
@@ -130,6 +164,11 @@
 
 * {
   border-color: hsl(var(--border));
+}
+
+/* Tailwind's preflight gives buttons a pointer but not selects. */
+select:not(:disabled) {
+  cursor: pointer;
 }
 
 html {
@@ -152,10 +191,12 @@ body {
 }
 
 /* Safe area inset variables.
- * On Android 15+ (edge-to-edge enforced), env(safe-area-inset-*) returns 0px in WebView.
- * Capacitor 8's built-in SystemBars plugin injects --safe-area-inset-* CSS custom properties
- * with the correct pixel values. We use those as primary source, falling back to env() for
- * iOS Safari and other platforms where env() works natively. */
+ * In the Android app's WebView env(safe-area-inset-*) can report 0px, so the
+ * --safe-area-inset-* custom properties carry the real values: Capacitor 8's
+ * built-in SystemBars plugin writes them from Android 15 on, the app's own
+ * SafeArea plugin writes the top one below that (see api/safe-area.ts). We use
+ * those as primary source, falling back to env() for iOS Safari and other
+ * platforms where env() works natively. */
 :root {
   --sat: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
   --sar: var(--safe-area-inset-right, env(safe-area-inset-right, 0px));
@@ -205,6 +246,43 @@ body {
     height: 100%;
     overflow: hidden;
   }
+}
+
+/* The phone app keeps clear of the system bars at any width: a phone turned
+ * sideways or a tablet is wider than the mobile breakpoint above. */
+html.platform-capacitor,
+html.platform-capacitor body {
+  position: fixed;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+html.platform-capacitor #root {
+  position: fixed;
+  top: var(--sat);
+  right: var(--sar);
+  bottom: var(--sab);
+  left: var(--sal);
+  width: auto;
+  height: auto;
+  overflow: hidden;
+}
+
+/* Desktop window edge.
+ * The line between window and desktop is normally the OS's own drop shadow,
+ * which remote-desktop/VDI sessions drop to save bandwidth — leaving the
+ * window with no visible edge at all. Drawing it here keeps the boundary
+ * under any session. Sits above app chrome (NavRail/Header paint to the
+ * window edge and would otherwise cover it) and never takes input, so it
+ * can't interfere with clicks or the title-bar drag region. */
+html.platform-desktop body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px hsl(var(--border));
 }
 
 /* For Portal modals rendered outside #root */
@@ -319,6 +397,20 @@ body {
 
 .scrollbar-overlay::-webkit-scrollbar-thumb:hover {
   background: hsl(var(--muted-foreground) / 0.4);
+}
+
+/* Every scrollbar stays hidden until the pointer is over its scroller. The
+   thumb goes transparent rather than away, so its space never shifts content.
+   Kept after the variants above: equal specificity, so source order wins.
+   The two variants that set `scrollbar-color` need their own rule — Chromium
+   ignores ::-webkit-scrollbar styles on elements that set it. */
+:not(:hover)::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+.scrollbar-thin:not(:hover),
+.scrollbar-overlay:not(:hover) {
+  scrollbar-color: transparent transparent;
 }
 
 /* Light mode: Shiki themes are ['github-dark', 'github-light'].
@@ -579,6 +671,36 @@ body {
 
 .animate-pop-in {
   animation: pop-in var(--dur) var(--ease);
+}
+
+/* Composer "+" panel: rises from the composer's top edge, the mirror of pop-in. */
+@keyframes composer-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-composer-rise {
+  animation: composer-rise var(--dur) var(--ease);
+}
+
+/* A row the AI asked the user to look at: one soft wash that fades out. */
+@keyframes composer-attention {
+  0%, 30% {
+    background-color: hsl(var(--primary) / 0.14);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.animate-composer-attention {
+  animation: composer-attention 2.4s var(--ease);
 }
 
 /* Pulse "seen" item grace-period countdown (PulseList) — the bar drains
@@ -903,21 +1025,6 @@ body {
   color: hsl(var(--muted-foreground));
 }
 
-/* Brand mark — dark/light SVG pair swapped by the .light class, same
-   convention as .login-hero above. Renders the dark-theme asset by default
-   (root has no class in dark mode); .light flips which one is visible. */
-.brand-mark-light {
-  display: none;
-}
-
-.light .brand-mark-dark {
-  display: none;
-}
-
-.light .brand-mark-light {
-  display: inline-block;
-}
-
 /* ============================================
    Message Styles
    ============================================ */
@@ -928,7 +1035,7 @@ body {
 
 .message-assistant {
   background: hsl(var(--card));
-  border: 1px solid hsl(var(--border));
+  border: 1px solid hsl(var(--border) / 0.5);
 }
 
 /* Streaming message style */
@@ -1033,15 +1140,6 @@ body {
   font-family: 'SF Mono', 'Fira Code', ui-monospace, Consolas, monospace;
   font-size: 0.875rem;
   line-height: 1.5;
-}
-
-/* Artifact card hover effect - subtle, no movement to avoid jitter */
-.artifact-card {
-  transition: background-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.artifact-card:hover {
-  box-shadow: 0 2px 8px hsl(var(--foreground) / 0.08);
 }
 
 /* Input focus styles */
@@ -1161,12 +1259,76 @@ body {
   animation: search-highlight-pulse 2s ease-out forwards;
 }
 
+/* The pulse's glow extends past the message; transcript rows clip paint to
+   themselves, so lift that for the row being highlighted. */
+[data-transcript-index]:has(.search-highlight) {
+  content-visibility: visible;
+}
+
 .search-term-highlight {
   background-color: hsl(48 96% 53% / 0.3) !important;
   font-weight: 600 !important;
   padding: 2px 4px;
   border-radius: 2px;
   margin: 0 2px;
+}
+
+/* Unified references in rendered text (CSS Custom Highlight API, so the page's
+   DOM is never rewritten): passages waiting in the composer, and the place a
+   card went back to, lit until the highlight is removed (not an animation, so
+   reduced motion still shows it). */
+::highlight(halo-ref) {
+  background-color: hsl(var(--primary) / 0.2);
+}
+
+::highlight(halo-reveal) {
+  background-color: hsl(var(--halo-warning) / 0.32);
+}
+
+/* A file mention in a reply that names a file of the space. The box stays the
+   inline code's own: only colour and underline change, so nothing moves when
+   a mention turns into a link after the existence check answers. */
+.markdown-content :is(code, span)[data-file-link] {
+  color: hsl(var(--primary));
+  text-decoration: underline dashed hsl(var(--primary) / 0.5);
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.markdown-content :is(code, span)[data-file-link]:hover {
+  text-decoration-style: solid;
+}
+
+.markdown-content :is(code, span)[data-file-link]:focus-visible {
+  outline: 2px solid hsl(var(--primary) / 0.5);
+  outline-offset: 1px;
+}
+
+/* A reference chip's count after a reference joined it. The colour carries it when motion is reduced. */
+@keyframes chip-bump {
+  0% {
+    transform: scale(1);
+    color: hsl(var(--primary));
+  }
+  35% {
+    transform: scale(1.14);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.animate-chip-bump {
+  display: inline-block;
+  animation: chip-bump 420ms var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @keyframes chip-bump {
+    0%, 60% {
+      color: hsl(var(--primary));
+    }
+  }
 }
 
 /* Drag-over state for input area */
@@ -1224,18 +1386,6 @@ body {
    Pulse - Task Status Indicators
    ============================================ */
 
-/* Pulse dot breathe animation */
-@keyframes pulse-dot-breathe {
-  0%, 100% {
-    opacity: 0.6;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 1;
-    transform: scale(1.3);
-  }
-}
-
 /* Pulse dot pop-in */
 @keyframes pulse-dot-appear {
   from {
@@ -1258,12 +1408,10 @@ body {
 
 .pulse-dot-generating {
   background-color: hsl(var(--primary));
-  animation: pulse-dot-breathe 2s ease-in-out infinite;
 }
 
 .pulse-dot-waiting {
   background-color: hsl(var(--halo-warning));
-  animation: pulse-dot-breathe 1.5s ease-in-out infinite;
 }
 
 .pulse-dot-completed {
@@ -1344,8 +1492,8 @@ body {
   width: 1px;
   background: linear-gradient(
     to bottom,
-    hsl(var(--border)),
-    hsl(var(--border) / 0.5)
+    hsl(var(--border) / 0.6),
+    hsl(var(--border) / 0.25)
   );
 }
 
@@ -1398,4 +1546,54 @@ body {
   .ws-steam-2 {
     animation: none;
   }
+}
+
+/* Digital-human avatar that glances and blinks, same rhythm as the animated
+   brand mark (halo-mark-animated.svg). Targets the face group of the
+   boring-avatars "beam" SVG (svg > g[mask] > g > mouth + two eyes); only its
+   children move, since the group's own transform places the face. */
+@keyframes avatar-look { 0%, 100% { translate: -0.8px 0 } 50% { translate: 0.8px 0 } }
+@keyframes avatar-blink { 0%, 44%, 52%, 100% { scale: 1 1 } 48% { scale: 1 .15 } }
+.avatar-alive > svg > g > g > * {
+  animation: avatar-look 2.4s ease-in-out infinite;
+}
+.avatar-alive > svg > g > g > rect {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: avatar-look 2.4s ease-in-out infinite, avatar-blink 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .avatar-alive > svg > g > g > * { animation: none; }
+}
+
+/* Thinking level slider (ThinkingLevelControl): a thick rounded track filled up
+   to the thumb. `--fill` is the filled share, set inline from the value. */
+.thinking-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 16px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    hsl(var(--primary)) 0 var(--fill, 0%),
+    hsl(var(--secondary)) var(--fill, 0%) 100%
+  );
+  outline: none;
+}
+.thinking-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 9999px;
+  background: hsl(var(--background));
+  border: 1px solid hsl(var(--border));
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .18);
+  transition: transform var(--dur-fast) var(--ease);
+}
+.thinking-slider:active::-webkit-slider-thumb {
+  transform: scale(1.1);
+}
+.thinking-slider:focus-visible {
+  box-shadow: 0 0 0 3px hsl(var(--primary) / .25);
 }

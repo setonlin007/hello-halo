@@ -16,6 +16,8 @@ import type { TeamChecks } from './checks'
 import type { BoardDigest } from './board-digest'
 import type { BoardArchive } from './board-archive'
 import type { ReadTeamArtifact } from './index'
+import type { TeamFolderPaths, TeamFolders } from './team-folder'
+import { renderMemberRecord, type ReadTeamMemberRecord } from './member-record'
 import type { CollabMode, TaskStatus, TeamCheckSchedule } from '../../../../shared/apps/team-types'
 
 const LOG_TAG = '[TeamTools]'
@@ -37,11 +39,24 @@ export interface TeamMcpContext {
    */
   callerWorkDir: string
   /**
+   * The caller's team folder for this piece of work — where its reviews and
+   * notes go, and the other place a ref may be published from. Null/absent →
+   * only working-directory files can be published.
+   */
+  callerTeamFolder?: TeamFolderPaths | null
+  /** Resolves a task assignee's folder, so a lead can attach that member's file to its task. */
+  teamFolders?: Pick<TeamFolders, 'ofTaskAssignee'>
+  /**
    * Location-transparent read of a published team artifact. Absent → the tool is
    * still registered but reports the capability is unavailable (non-federated
    * test runtimes).
    */
   readArtifact?: ReadTeamArtifact
+  /**
+   * Location-transparent read of a member's record, for the lead. Absent → the
+   * tool reports the capability is unavailable (non-federated test runtimes).
+   */
+  readMemberRecord?: ReadTeamMemberRecord
   /**
    * Periodic checks on teammates. Absent → the tools report the capability is
    * unavailable rather than silently doing nothing (non-federated test runtimes).
@@ -71,6 +86,13 @@ export interface TeamMcpContext {
    * the owner's own digital humans does not turn it into the owner's.
    */
   external?: boolean
+  /**
+   * The turn serves a guest of an IM chat this member fronts. Periodic checks
+   * are standing instructions that keep spending the owner's model allowance
+   * long after the request, so a guest neither sets nor stops them — a guest of
+   * a digital human's own chat has no such tool either.
+   */
+  servesGuest?: boolean
   /** Deferred: applied after the lead's turn ends, never aborts mid-turn. */
   requestComplete: (summary: string) => void
 }
@@ -127,24 +149,30 @@ function record(ctx: TeamMcpContext, input: Omit<PostActivityInput, 'teamId' | '
  * file and the reader believing it had never been sent — neither holding enough
  * of the truth to fix it. The stored form is the portable one this returns.
  *
- * The uniqueness check has the same shape: a ref is a path inside the publisher's
- * OWN working directory, so two members reach for one name and the board holds a
- * single indistinguishable string. Here is the last instant they can be told
- * apart, and the member holding the file is the one who can rename it.
+ * The uniqueness check has the same shape: a working-directory ref is a path
+ * inside the publisher's OWN working directory, so two members reach for one name
+ * and the board holds a single indistinguishable string. Here is the last instant
+ * they can be told apart, and the member holding the file is the one who can
+ * rename it. A `team:` ref carries its producer's folder and so cannot collide
+ * this way; it still passes through the check, which then costs nothing.
  */
 function acceptRef(
   ctx: TeamMcpContext,
   ref: string,
   claim: PublishedRefClaim
 ): { ok: true; ref: string; receipt: string } | { ok: false; message: string } {
-  const resolved = resolveArtifactRef(ctx.callerWorkDir, ref)
+  const teamFolder = ctx.callerTeamFolder ?? null
+  const claimantFolder =
+    claim.kind === 'task' ? ctx.teamFolders?.ofTaskAssignee(ctx.teamId, ctx.epochId, claim.taskId) ?? null : null
+  const resolved = resolveArtifactRef({ workDir: ctx.callerWorkDir, teamFolder, claimantFolder }, ref)
   if (!resolved.ok) {
     console.warn(
-      `${LOG_TAG} rejected ref="${ref}" from=${ctx.callerAppId} workDir="${ctx.callerWorkDir}": ${resolved.reason}`
+      `${LOG_TAG} rejected ref="${ref}" from=${ctx.callerAppId} workDir="${ctx.callerWorkDir}" ` +
+        `teamFolder="${teamFolder?.self ?? ''}": ${resolved.reason}`
     )
     return {
       ok: false,
-      message: explainArtifactRefRejection(resolved.reason, { ref, workDir: ctx.callerWorkDir }),
+      message: explainArtifactRefRejection(resolved.reason, { ref, workDir: ctx.callerWorkDir, teamFolder }),
     }
   }
   // Compared in the STORED form: two refs collide as the board holds them, not
@@ -335,8 +363,8 @@ function buildUpdateTaskTool(resolve: ResolveTeamMcpContext) {
         .optional()
         .describe(
           'The file this task produced, as a path relative to your working directory (e.g. ' +
-            '"docs/design.md"). It must already exist, and its name must be unused by other ' +
-            'teammates — the update is refused otherwise. ' +
+            '"docs/design.md") or a path in your scratch folder. It must already exist, and its ' +
+            'name must be unused by other teammates — the update is refused otherwise. ' +
             'Omit this when the task produced no file; put the outcome in note instead.'
         ),
       note: z.string().optional().describe('Short note (e.g. rejection reason or blocker).'),
@@ -401,10 +429,10 @@ function buildPostFindingTool(resolve: ResolveTeamMcpContext) {
         .string()
         .optional()
         .describe(
-          'A file inside your working directory, as a path relative to it (e.g. "docs/design.md"). ' +
-            'The file must already exist — it is checked now, and publishing fails if it is not ' +
-            'there or is outside your working directory. The name must also be unused by other ' +
-            'teammates, so prefer one that is clearly yours. Required if content is omitted.'
+          'A file inside your working directory, as a path relative to it (e.g. "docs/design.md"), ' +
+            'or a file in your scratch folder. The file must already exist — it is checked now, and ' +
+            'publishing fails if it is not there or is anywhere else. The name must also be unused ' +
+            'by other teammates, so prefer one that is clearly yours. Required if content is omitted.'
         ),
     },
     async (input) => {
@@ -547,6 +575,66 @@ function buildReadArtifactTool(resolve: ResolveTeamMcpContext) {
           ? `\n\n[Truncated: showing the first part of a ${res.bytes ?? 0}-byte file.]`
           : ''
         return textResult(`Artifact "${input.ref}"${ownerLabel}:\n\n${res.content ?? ''}${truncNote}`)
+      } catch (err) {
+        return busErrorResult(err)
+      }
+    }
+  )
+}
+
+function buildReadMemberTool(resolve: ResolveTeamMcpContext) {
+  return tool(
+    TEAM_TOOL_NAMES.readMember,
+    'Read what a teammate said and was told in this run — its own record, not its ' +
+      'report. Use it to check work against what the member claims, to find out why ' +
+      'something went wrong, or to gather what several members produced. Only the team ' +
+      'lead can use it.\n\n' +
+      'Pages run from the newest message backwards (about 8000 characters each) and show ' +
+      'the messages only — thinking and tool traces are not included, an assistant line ' +
+      'just says how many steps it took. When earlier messages exist the page ends with ' +
+      'the `before` value to pass for the next one. It also works for a member on another ' +
+      'machine; if its owner is unreachable you get a clear message instead of a hang.\n\n' +
+      'Example: { "member": "researcher" } then { "member": "researcher", "before": 31 }',
+    {
+      member: z.string().describe('Teammate whose record to read (member name).'),
+      before: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Read the messages before this message number (the value the previous page gave). Omit for the newest page.'),
+    },
+    async (input) => {
+      const ctx = resolve()
+      if (!ctx) return textResult(NO_TEAM_CONTEXT, true)
+      if (!ctx.selfIsLead) {
+        return textResult('Only the team lead can read a member\u2019s record (team_read_member).', true)
+      }
+      if (ctx.external) {
+        return textResult(
+          'A member\u2019s record is not available in a turn that was started from another machine.',
+          true
+        )
+      }
+      console.log(
+        `${LOG_TAG} ${TEAM_TOOL_NAMES.readMember}: team=${ctx.teamId} epoch=${ctx.epochId} ` +
+          `member="${input.member}" before=${input.before ?? '-'}`
+      )
+      if (!ctx.readMemberRecord) {
+        return textResult('Reading a member\u2019s record is not available in this context.', true)
+      }
+      try {
+        const memberAppId = ctx.bus.resolveMemberAppId(ctx.teamId, input.member)
+        if (memberAppId === ctx.callerAppId) {
+          return textResult('That is you. This tool reads a teammate\u2019s record.', true)
+        }
+        const res = await ctx.readMemberRecord({
+          teamId: ctx.teamId,
+          epochId: ctx.epochId,
+          memberAppId,
+          ...(input.before !== undefined ? { before: input.before } : {}),
+        })
+        return res.ok ? textResult(renderMemberRecord(res)) : textResult(res.message, true)
       } catch (err) {
         return busErrorResult(err)
       }
@@ -734,14 +822,17 @@ export function createTeamMcpServer(context: TeamMcpContext): SdkMcpServer {
     buildPostFindingTool(resolve),
     buildReadBoardTool(resolve),
     buildReadArtifactTool(resolve),
-    buildScheduleTool(resolve),
-    buildUnscheduleTool(resolve),
+    // A member is never the lead of the team it serves in, so it is not offered
+    // a tool it could only be refused.
+    ...(context.selfIsLead ? [buildReadMemberTool(resolve)] : []),
+    ...(context.servesGuest ? [] : [buildScheduleTool(resolve), buildUnscheduleTool(resolve)]),
     buildCompleteTool(resolve),
   ]
 
   console.log(
     `${LOG_TAG} ${TEAM_MCP_SERVER_NAME} created: team=${context.teamId} ` +
-      `caller=${context.callerAppId} collabMode=${context.collabMode}`
+      `caller=${context.callerAppId} collabMode=${context.collabMode}` +
+      `${context.servesGuest ? ' guest=yes (no periodic checks)' : ''}`
   )
 
   return createSdkMcpServer({
@@ -765,6 +856,7 @@ export function buildCoordinationTools(resolve: ResolveTeamMcpContext) {
     buildPostFindingTool(resolve),
     buildReadBoardTool(resolve),
     buildReadArtifactTool(resolve),
+    buildReadMemberTool(resolve),
     buildCompleteTool(resolve),
   ]
 }

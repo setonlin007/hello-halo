@@ -10,13 +10,21 @@
 
 import { describe, it, expect } from 'vitest'
 import {
+  appChatAppId,
+  isSpaceConversationId,
   getAppChatConversationId,
   buildImSessionKey,
   buildLocalSessionKey,
+  isFollowedConversationId,
   buildTeamSessionKey,
   isImSessionKey,
   isLocalSessionKey,
   parseAppChatKey,
+  parseNativeChatKey,
+  nativeChatAppId,
+  buildRunSenderKey,
+  parseRunSenderKey,
+  isAppChatKey,
   resolveHttpConversationId,
 } from '../../../src/shared/apps/im-keys'
 
@@ -177,5 +185,83 @@ describe('im-keys: native local sessions', () => {
       chatType: 'direct',
       chatId: 'uuid-9',
     })
+  })
+})
+
+describe('parseNativeChatKey: the chat-board sessions of a digital human', () => {
+  it('parses the default session and a local session', () => {
+    expect(parseNativeChatKey(getAppChatConversationId('app-1'))).toEqual({ appId: 'app-1', kind: 'default' })
+    expect(parseNativeChatKey(buildLocalSessionKey('app-1', 'sess-1'))).toEqual({ appId: 'app-1', kind: 'local', chatId: 'sess-1' })
+  })
+
+  it('rejects IM, HTTP and team sessions, and anything else', () => {
+    for (const key of [
+      buildImSessionKey('app-1', 'wecom-bot', 'direct', 'u'),
+      'app-chat:app-1:http:direct:client',
+      buildTeamSessionKey('app-1', 'team-1', 'epoch-1'),
+      'app-chat:app-1:local:group:s',
+      'app-chat:',
+      '3a5d77ea-1c2b-4f7e-9d10-0123456789ab',
+      buildRunSenderKey('app-1', 'run-1'),
+    ]) {
+      expect(parseNativeChatKey(key), key).toBeNull()
+      expect(nativeChatAppId(key), key).toBeNull()
+    }
+  })
+
+  it('nativeChatAppId reads the same rule', () => {
+    expect(nativeChatAppId(buildLocalSessionKey('app-1', 's'))).toBe('app-1')
+    expect(nativeChatAppId(getAppChatConversationId('app-2'))).toBe('app-2')
+  })
+})
+
+describe('run sender keys', () => {
+  it('round-trips and never looks like a chat key', () => {
+    const key = buildRunSenderKey('app-1', 'run-1')
+    expect(parseRunSenderKey(key)).toEqual({ appId: 'app-1', runId: 'run-1' })
+    expect(isAppChatKey(key)).toBe(false)
+    expect(parseRunSenderKey(getAppChatConversationId('app-1'))).toBeNull()
+    expect(parseRunSenderKey('app-run:app-1')).toBeNull()
+  })
+})
+
+describe('isFollowedConversationId', () => {
+  it('follows regular conversations and the chat-board sessions of a digital human', () => {
+    expect(isFollowedConversationId('conv-uuid')).toBe(true)
+    expect(isFollowedConversationId(getAppChatConversationId('app-1'))).toBe(true)
+    expect(isFollowedConversationId(buildLocalSessionKey('app-1', 'uuid-1'))).toBe(true)
+  })
+
+  it('does not follow IM or team sessions', () => {
+    expect(isFollowedConversationId('app-chat:app-1:wecom:direct:user1')).toBe(false)
+    expect(isFollowedConversationId('app-chat:app-1:team:team1:epoch1')).toBe(false)
+  })
+})
+
+describe('appChatAppId', () => {
+  it('names the digital human of every app-chat key family', () => {
+    expect(appChatAppId(getAppChatConversationId('app-1'))).toBe('app-1')
+    expect(appChatAppId(buildLocalSessionKey('app-1', 'uuid-1'))).toBe('app-1')
+    expect(appChatAppId(buildImSessionKey('app-1', 'wecom-bot', 'direct', 'u1'))).toBe('app-1')
+    expect(appChatAppId(buildTeamSessionKey('app-1', 'team-1', 'epoch-1'))).toBe('app-1')
+  })
+
+  it('is null for space conversations and a key with no app id', () => {
+    expect(appChatAppId('conv-uuid')).toBeNull()
+    expect(appChatAppId('app-chat:')).toBeNull()
+  })
+})
+
+describe('isSpaceConversationId', () => {
+  it('accepts a space conversation id', () => {
+    expect(isSpaceConversationId('0f8fad5b-d9cb-469f-a165-70867728950e')).toBe(true)
+  })
+
+  it('rejects every digital-human key family and a run sender key', () => {
+    expect(isSpaceConversationId(getAppChatConversationId('app-1'))).toBe(false)
+    expect(isSpaceConversationId(buildLocalSessionKey('app-1', 'uuid-1'))).toBe(false)
+    expect(isSpaceConversationId(buildImSessionKey('app-1', 'wecom-bot', 'direct', 'u1'))).toBe(false)
+    expect(isSpaceConversationId(buildTeamSessionKey('app-1', 'team-1', 'epoch-1'))).toBe(false)
+    expect(isSpaceConversationId(buildRunSenderKey('app-1', 'run-1'))).toBe(false)
   })
 })

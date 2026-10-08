@@ -1,6 +1,6 @@
 # Remote Access — HTTP API, Auth, and the Internet Tunnel
 
-Last updated: 2026-09-03
+Last updated: 2026-10-07
 
 Read this whenever the user wants to control Halo from another device, asks about the HTTP/API
 surface, wants an internet-reachable URL (not just LAN), or reports remote access failing to
@@ -86,6 +86,12 @@ desktop use. Don't conflate this with "regular Halo with Remote Access on":
 - This mode is for scripted/automated deployment, not something a desktop end user toggles from
   Settings — don't suggest `HALO_SERVER_MODE` to a user who's just trying to reach their desktop
   Halo from a phone; that's the ordinary Settings → Remote Access flow in §2.
+- **Deployment files live in the repository** under `deploy/server/` (`Dockerfile`,
+  `docker-entrypoint.sh`, `docker-compose.yml`); `npm run build:server`
+  (`scripts/build-server-halo.sh`) writes the Linux app bundle into `deploy/server/bundle/`, then
+  `docker build -t halo-server deploy/server`. There is no published image and no separate deploy
+  repository — don't send users looking for one. The docs site's "Halo Server" section has the
+  full walkthrough.
 
 ## 4. The HTTP/WebSocket surface
 
@@ -95,6 +101,10 @@ param) except two public ones: `POST /api/remote/login` (validates a submitted t
 bearer token, `src/main/http/auth/middleware.ts:109-143`) and
 `GET /api/remote/status` (liveness probe) — both in `src/main/http/server.ts:194,197-206`.
 `GET /api/security/policy` is also public (renderer-safe policy slice).
+Artifact download links skip the token on purpose: `POST /api/artifacts/download-ticket` (bearer
+required) returns a ticket bound to one file for two minutes, and `GET /api/artifacts/file/:ticket`
+serves that file to whoever holds it, so a link handed to a phone's browser never carries the
+token (`src/main/http/auth/download-ticket.ts`).
 
 Route groups (each in its own file under `src/main/http/routes/`), roughly in the order a client
 would use them:
@@ -112,8 +122,10 @@ would use them:
   humans, chat with an app, IM-channel sessions, escalation responses, spec import/export,
   permission grant/revoke, schedule frequency, pause/resume/trigger.
 - **`artifact.routes.ts`** — file browser/editor over a space's working directory (read, write,
-  rename, move, delete, download), guarded by symlink-resolving path checks in
-  `routes/_shared.ts:143-213` that reject anything outside the space directory.
+  rename, move, delete, download), guarded by the symlink-resolving path checks in
+  `routes/_path-guard.ts` (`validateFilePath`): writes must stay inside a space directory
+  (`isPathAllowed`), and reads may also reach the knowledge base and the team folders
+  (`isReadPathAllowed`).
 - **`terminal.routes.ts`** — remote shell takeover (create/input/resize/kill/replay). The file's
   own header comment is explicit that this adds no *new* privilege beyond what the bearer token
   already grants via the agent, and that remote callers cannot choose an arbitrary shell binary
@@ -185,7 +197,7 @@ is still plain HTTP (§1). LAN-only access (no tunnel) is unencrypted end-to-end
 | Enable fails outright with "no available port" | All 20 fallback ports were also occupied | `Error('Unable to find available port near ${startPort}')`, `server.ts:135` |
 | Remote client can't reach the LAN address at all, no error shown anywhere | Likely a firewall silently dropping inbound connections | **Not detected by Halo** — the server just binds and listens; there is no client-visible error for this case, don't imply one exists |
 | `403 {error:'Terminal is not available on this host'}` | Platform doesn't support the terminal feature | `terminal.routes.ts:19-23` |
-| `403 {error:'Access denied'}` on an Artifacts call | Path resolves outside the space's allowed directory (symlink or `..` traversal) | `routes/_shared.ts:207-209` |
+| `403 {error:'Access denied'}` on an Artifacts call | Path resolves outside the allowed directories (symlink or `..` traversal): a space directory for writes; also the knowledge base and team folders for reads | `validateFilePath` in `routes/_path-guard.ts` |
 | Tunnel fails to start: "the issuing service was unreachable" | Network issue reaching the issuer, or offline | `issuer-client.ts:66-70` |
 | Tunnel fails to start: "Your network reached today's limit..." | Issuer rate-limited this network/device (daily quota) | `issuer-client.ts:74-77` (HTTP 429 from issuer) |
 | Tunnel fails to start: device identity rejected | Issuer returned 403 for this device identity | `issuer-client.ts:79-83` |

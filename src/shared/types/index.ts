@@ -13,6 +13,9 @@ export type {
   LoginStatus,
   ApiProvider,
   ModelOption,
+  CodexCatalogEntry,
+  ModelCatalogCache,
+  ModelRefreshSummary,
   AISourceUser,
   AISource,
   AISourcesConfig,
@@ -51,7 +54,10 @@ export {
   setCurrentSource,
   setCurrentModel,
   getAvailableModels,
-  resolveLocalizedText
+  resolveLocalizedText,
+  isAuthRequestString,
+  toPublicOAuthStartResult,
+  toPublicOAuthCompleteResult,
 } from './ai-sources'
 
 // Health System types

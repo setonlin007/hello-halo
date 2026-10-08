@@ -186,6 +186,13 @@ export interface ImChannelInstanceConfig {
    */
   streaming?: boolean
   /**
+   * Whether a reply sent as one message (streaming off) is preceded by a
+   * "received, working on it" notice when it has not come within a few
+   * seconds. Undefined = on; only an explicit false turns it off. A stream
+   * shows the same status in the reply itself, so this does not apply to it.
+   */
+  processingNotice?: boolean
+  /**
    * Reply scope — controls which chat types this instance responds to.
    *   'all'    — respond to both group and direct messages
    *   'group'  — only respond in group chats (secure)
@@ -227,6 +234,12 @@ export interface ImChannelInstanceConfig {
    * When undefined, guests have no tool or path access (deny-all default).
    */
   guestPolicy?: GuestPolicy
+
+  /**
+   * The guest policy as it was when guest access was last turned off, so
+   * turning it back on restores the owner's choices. Never enforced.
+   */
+  savedGuestPolicy?: GuestPolicy
 }
 
 // ============================================
@@ -366,7 +379,9 @@ export interface ImChannelInstance {
   getConnectionState?(): ImConnectionState
 
   /**
-   * Push a message proactively to a specific chat.
+   * Push a message proactively to a specific chat. `text` may be of any
+   * length: a provider whose platform caps one message sends a longer text as
+   * ordered parts.
    * @returns true if sent successfully, false otherwise
    */
   pushToChat(chatId: string, text: string, chatType: 'direct' | 'group'): boolean
@@ -436,6 +451,9 @@ export interface ImFileCapability {
    * @param file - A SanctionedFile produced by FileExportGate.sanction()
    * @param chatType - Conversation type ('direct' | 'group')
    * @returns true if sent successfully, false on recoverable failure
+   * @throws An Error whose message the caller relays to the user as is, when
+   *   the adapter knows why the file cannot be sent (e.g. it is over the
+   *   platform's size limit, or the platform said why it refused it)
    */
   sendFile(
     chatId: string,
@@ -521,7 +539,7 @@ export interface ImChannelAdapter {
    * in the current request cycle.
    *
    * @param chatId - Platform-side conversation ID
-   * @param text - Message content (Markdown format)
+   * @param text - Message content (Markdown format), of any length
    * @param chatType - Conversation type
    * @returns true if sent successfully, false otherwise
    */
@@ -621,6 +639,12 @@ export interface ImSessionRecord {
   chatId: string
   /** Conversation type */
   chatType: 'direct' | 'group'
+  /**
+   * Direct chats: the person on the other side, by the platform user ID an
+   * owner list holds. Some platforms give a direct chat an ID of its own, so
+   * `chatId` cannot stand in for it there. Absent until they next write.
+   */
+  contactId?: string
   /** Human-readable name for UI display (set once on first registration, never overwritten) */
   displayName: string
   /** User-assigned custom name — highest display priority */
@@ -652,6 +676,14 @@ export interface ImSessionRecord {
    * does not duplicate via notify_bot.
    */
   proactive: boolean
+  /**
+   * Other digital humans the user added this chat to as a push target, from
+   * their own settings — so they can push here through this session's bot
+   * without the chat ever messaging them. Each carries its own auto-sync
+   * choice; replies still go to the digital human the bot answers for. Never
+   * lists the session's own app. IM sessions only.
+   */
+  pushLinks?: ImPushLink[]
   /** Last activity timestamp (epoch ms) */
   lastActiveAt: number
 
@@ -672,6 +704,13 @@ export interface ImSessionRecord {
    * first message captures the new forked session id. Absent thereafter.
    */
   pendingResumeSessionId?: string
+}
+
+/** A digital human that may push to a chat another digital human's bot knows (see {@link ImSessionRecord.pushLinks}). */
+export interface ImPushLink {
+  appId: string
+  /** Push the digital human's final reply here after each successful run, like {@link ImSessionRecord.proactive} */
+  autoSync: boolean
 }
 
 /**

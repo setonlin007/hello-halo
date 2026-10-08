@@ -436,7 +436,7 @@ export function forceReconnectWebSocket(): void {
  * Register event listener (works for IPC, WebSocket, or Capacitor WS)
  */
 // Generic in the payload so a slice can declare the shape its consumers get
-// (see artifactApi.onArtifactChanged) instead of casting at the call site; the
+// (see artifactApi.onArtifactChangedBatch) instead of casting at the call site; the
 // channel is stringly-typed either way, so `T` is the declaration, not a proof.
 export function onEvent<T = unknown>(channel: string, callback: (data: T) => void): () => void {
   const listener = callback as (data: unknown) => void
@@ -455,6 +455,8 @@ export function onEvent<T = unknown>(channel: string, callback: (data: T) => voi
       'agent:ask-question': 'onAgentAskQuestion',
       'agent:session-info': 'onAgentSessionInfo',
       'agent:turn-start': 'onAgentTurnStart',
+      'agent:goal-updated': 'onAgentGoalUpdated',
+      'agent:api-retry': 'onAgentApiRetry',
       'toolsets:changed': 'onToolsetsChanged',
       'toolsets:requested': 'onToolsetsRequested',
       'terminal:data': 'onTerminalData',
@@ -462,11 +464,14 @@ export function onEvent<T = unknown>(channel: string, callback: (data: T) => voi
       'remote:status-change': 'onRemoteStatusChange',
       'credential:decrypt-failed': 'onCredentialDecryptFailed',
       'browser:state-change': 'onBrowserStateChange',
+      'browser:page-gone': 'onBrowserPageGone',
       'browser:zoom-changed': 'onBrowserZoomChanged',
       'canvas:tab-action': 'onCanvasTabAction',
       'ai-browser:active-view-changed': 'onAIBrowserActiveViewChanged',
       'ai-browser:view-gone': 'onAIBrowserViewGone',
+      'ai-browser:conversation-released': 'onAIBrowserConversationReleased',
       'artifact:tree-update': 'onArtifactTreeUpdate',
+      'artifact:changed-batch': 'onArtifactChangedBatch',
       'perf:snapshot': 'onPerfSnapshot',
       'perf:warning': 'onPerfWarning',
       'app:status_changed': 'onAppStatusChanged',
@@ -485,6 +490,7 @@ export function onEvent<T = unknown>(channel: string, callback: (data: T) => voi
       'team:invite-link': 'onTeamInviteLink',
       'team:member-history': 'onTeamMemberHistory',
       'notification:toast': 'onNotificationToast',
+      'app:memory-pressure': 'onMemoryPressure',
       'tlon:stats-updated': 'onTlonStatsUpdated',
       'tlon:ingest-progress': 'onTlonIngestProgress',
       'store:sync-status-changed': 'onStoreSyncStatusChanged',

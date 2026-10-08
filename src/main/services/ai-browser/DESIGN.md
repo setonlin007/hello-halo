@@ -82,7 +82,7 @@ AI turn so the very first `active-view` event reaches the renderer.
 | Path | File | Context |
 |------|------|---------|
 | Main chat | `services/agent/send-message.ts` | Global singleton (no scoped ctx) |
-| App chat | `apps/runtime/app-chat.ts` | Scoped context |
+| App chat | `apps/runtime/app-chat.ts` | Scoped context bound to the chat's conversationId (`apps/runtime/app-chat-browser.ts`) |
 | Automation | `apps/runtime/execute.ts` | Scoped context |
 
 ### Adding new session-level side effects
@@ -98,7 +98,9 @@ of which caller path is used.
 ```
 BrowserContext (singleton)            — the user's own browsing (Content Canvas / IPC)
 BrowserContext (interactive, per-conv) — used by main chat, one per conversation
-BrowserContext (scoped, per-agent)     — used by app-chat / automation (no UI)
+BrowserContext (scoped, per-chat)      — digital-human chat: hidden pages, announced under its conversationId
+BrowserContext (scoped, per-run)       — automation: hidden pages, no conversation, silent;
+                                         a run started with the desktop's Run once is announced under its run key
 ```
 
 Scoped contexts are created via `createScopedBrowserContext()` and passed to
@@ -138,26 +140,62 @@ flag — getting it wrong is silent and destroys the user's work.
 
 The context holds **no BrowserWindow reference**. UI notifications go through a
 process-global event bus (see "View Lifecycle Events"), so delivery is owned by
-the transport layer, not the context. Only the singleton (non-scoped) emits;
-scoped automation contexts stay silent.
+the transport layer, not the context. A context emits iff it has a UI
+(`ctx.hasUi`): the singleton, every interactive per-conversation context, and
+every scoped context created with a `conversationId` (digital-human chat, and a
+run started with the desktop's Run once, under its run key
+`app-run:{appId}:{runId}`). Every other automation run (scoped, no
+conversation) stays silent.
 
 ## View Lifecycle Events
 
-The interactive singleton broadcasts its view lifecycle to `events.ts` (a
+Every context with a UI broadcasts its view lifecycle to `events.ts` (a
 process-global bus, modeled on `ai-terminal/events.ts`). The transport module
 `ipc/ai-browser.ts` subscribes once at startup and fans events to the
 BrowserWindow + remote WebSocket clients:
 
 | Event | Channel | Meaning | Renderer effect |
 |-------|---------|---------|-----------------|
-| active-view | `ai-browser:active-view-changed` | AI created/selected a view | `activeViewId` → "View live feed" attaches the exact view; identity for the operating indicator |
-| gone | `ai-browser:view-gone` | AI's active view destroyed | store clears; live-session tray drops it |
+| active-view | `ai-browser:active-view-changed` | a conversation's AI created/selected a view; payload `{conversationId, spaceId, viewId, url, title}` | renderer store keeps the active view per conversation ("View live feed" and the operating indicator of the conversation on screen) and every page per viewId (the tray) |
+| gone | `ai-browser:view-gone` | a view a UI context held — its active page or any other it opened — was destroyed; payload `{viewId}` | store drops the page and any active entry pointing at it; canvas tabs attached to it close |
+| conversation-released | `ai-browser:conversation-released` | a UI context ended (`release()` or `destroy()`); payload `{conversationId}` | store drops that conversation's views, operating state and owned pages, so a page it only selected (now the user's) is not left listed or stoppable as its own |
 
-`gone` is emitted from `context.handleViewDestroyed(viewId)`, invoked by the
-`browser:destroy` IPC handler (covers canvas-tab close and the live-session tray
-"stop"). This keeps `activeViewId` from dangling on a dead WebContents.
+Payload types live in `shared/types/ai-browser.ts`. The renderer filters by the
+active conversation; events go out with `broadcastToAll` (browser pages are
+desktop-only, so remote clients ignore them). An event only fires on change, so a
+renderer that starts late (reload) seeds itself with the request
+`ai-browser:list-live-pages` (`listLivePages()`: every owned or active page of a
+UI context, `active` marking the one it acts on).
 
-The renderer reveals the AI's view by **viewId identity** (`attachAIBrowserView`),
+**Live-session tray.** Lists every live AI page of the CURRENT space that a
+conversation OPENED ITSELF (`owned` in the event/snapshot), one row each,
+labelled "owner · page" (digital human name — for its chats and for a run
+started from the desktop — or the space conversation's title)
+with its own stop — not only the on-screen conversation's page. Never listed: a
+page the conversation only selected (the user's own tab, another conversation's
+page), and a page another conversation is currently on (`isPageInUseByOthers`,
+re-checked at stop time) — stopping either would close it under someone else.
+Remote clients get no stop control (no browser pages there); a refused stop is
+reported, not swallowed. The decision is the main process's: the tray stop goes
+through `ai-browser:stop-page` (`stopLivePage(viewId, conversationId)`), which
+refuses `not-owned` unless that conversation's context opened the page and
+`in-use` while any other context is on it; the renderer's check is only a fast
+path and can be one event behind. Closing a canvas tab is the user's own action
+and still goes through `browser:destroy` unchecked. The space
+comes from the context (`spaceId`: `getInteractiveBrowserContext(conversationId,
+spaceId)` for space chat, `acquireChatBrowserContext(…, spaceId)` for
+digital-human chat); a page with no space is never listed. Rows are built by
+`renderer/hooks/browser-live-sessions.ts`.
+`gone` is emitted from `notifyViewDestroyed(viewId)`, which reconciles EVERY live
+context and announces once — whenever a context with a UI owned the view or was
+pointing at it, not only for the active page: a page the chat moved away from can
+still be open in a canvas tab. It is wired to `browserViewManager.onViewDestroyed`
+at module load, so whichever path destroyed the view (canvas-tab close, tray
+"stop", an agent closing a tab, window teardown, a context ending) reaches it.
+This keeps `activeViewId` from dangling on a dead WebContents — essential once a
+context outlives a turn.
+
+The renderer reveals the AI's view by **viewId identity** (`attachAIbrowser page`),
 never by re-opening the URL — so the user sees and can take over the exact page
 the AI drives (shared `persist:browser` session across all views).
 
@@ -165,10 +203,62 @@ the AI drives (shared `persist:browser` session across all views).
 
 - **Creation (scoped)**: Caller creates scoped context → passes to MCP server factory
 - **Creation (interactive)**: `getInteractiveBrowserContext(conversationId)`, on demand
-- **Cleanup (scoped)**: Caller calls `ctx.destroy()` when the agent session ends — closes its tabs
+- **Cleanup (scoped)**: Caller calls `ctx.destroy()` when the agent session ends — closes its tabs.
+  Digital-human chat contexts are owned by `apps/runtime/app-chat-browser.ts`,
+  which keeps native chats' contexts resident between turns (idle/cap reaping)
 - **Cleanup (interactive)**: `releaseInteractiveBrowserContext(conversationId)` from the
   toolset broker's per-conversation teardown — leaves the user's tabs open
 - **Cleanup (singleton)**: `cleanupAIBrowser()` called by `bootstrap/extended.ts` on app shutdown
+
+## Live View and Guest Ownership
+
+Pages that a user can watch are created in a permanent main-renderer webview
+host, including digital-human chat pages and the pages of a run the user
+started with the desktop's Run once. Pure unattended runs and temporary
+search pages use the lazy hidden renderer host (`offscreen: !ctx.hasUi`).
+In explicit server mode every page uses that hidden host, including remote
+conversations, because a chat UI does not imply a local main renderer exists.
+A guest never moves between hosts. Showing, hiding, switching tabs and leaving
+Canvas change presentation only, preserving the same WebContents, DOM, form
+state, CDP target and download route. `ctx.hasRevealedView()` still protects a
+watched page from idle reaping.
+
+The browser manager delegates DOM attachment to `services/browser-host` through
+its public surface. Initial attachment is inert and authorized; policy, UA and
+CDP setup precede external navigation. Canvas budgets and AI ownership contracts
+continue to determine actual page destruction. A main-renderer reload loses its
+guests: the manager announces destruction, unregisters download routing and
+rejects pending waits; the next navigation creates a new page. Hidden-host pages
+remain independent of a main-renderer reload.
+
+Keyboard input uses the guest-targeted adapter in `services/browser-input`:
+CDP keyboard dispatch and generic WebContents editing helpers can reach the
+focused host composer. Native `sendInputEvent` / `insertText` target the guest;
+editing shortcuts must operate on that guest's editable DOM. Frame leases cover
+the complete input operation. `sendCDPCommand` routes `Input.*` commands to the
+operation's `BrowserInputOperation`, which records what the page saw pressed and
+releases it on the original page before the lease ends, including cancellation.
+See the browser-host design for targeting and cleanup constraints.
+
+Element helpers in `snapshot.ts` (scroll, box, focus) tolerate only a
+`PageCommandRejectedError`: the operation's still-current page refused that one
+command, as before, so a hidden element degrades to a full screenshot. Any other
+error (cancellation, deadline, page loss) propagates unchanged.
+
+`browser_fill` clears a field with the page's own select-all and types the
+text, then reads back what the element holds one task later (`fill-check.ts`).
+It types only while focus is on the element, inside it, or on the editing host
+or shadow host around it: focus that stayed elsewhere would put the text into
+another field, so that fill fails with nothing typed. Only a match is reported
+as filled. A field holding anything else (reformatted, cut short, refused, or
+appended to old text) is reported with what it holds, a password field by
+length only; an element with nothing to read back is reported as unconfirmed.
+An option chosen from a list is not read back.
+
+On macOS the editing adapter respects the guest's trusted Meta-key handler and
+its `preventDefault`. Its paste fallback delivers a synthetic clipboard event
+and guest-local DOM insertion, including rich HTML; it does not provide a
+trusted native paste event. The browser-host design records this distinction.
 
 ## File Map
 
@@ -176,11 +266,11 @@ the AI drives (shared `persist:browser` session across all views).
 |------|---------------|
 | `index.ts` | Public API: re-exports, system prompt, cleanup, event-bus subscribers |
 | `sdk-mcp-server.ts` | MCP server factory (primary entry point) |
-| `events.ts` | Process-global view-lifecycle bus (active-view / gone); transport subscribes here |
+| `events.ts` | Process-global view-lifecycle bus (active-view / gone); transport subscribes here. Payload types: `shared/types/ai-browser.ts` |
 | `context.ts` | BrowserContext class (state, CDP, element ops, downloads); emits view lifecycle |
 | `snapshot.ts` | Accessibility tree snapshot creation |
+| `fill-check.ts` | Reads back what a fill left in the field and compares it with the requested text |
 | `download-handler.ts` | Session-level `will-download` handler for silent AI downloads |
-| `download-utils.ts` | Shared filename sanitization / unique path resolution |
 | `types.ts` | Type definitions |
 | `tools/` | Tool implementations by category (14 active tools) |
 | `tools/index.ts` | Tool aggregation (`buildAllTools`) |
@@ -201,6 +291,17 @@ wc.downloadURL(url)
 
 The routing uses `contextsByWebContentsId` Map (webContents ID → BrowserContext),
 populated by `ctx.trackView()` when `browser_navigate` or `browser_tab` creates a view.
+
+The saved name is the server's name, sanitized (`foundation/file-naming`) and
+made unique. A name an agent engine reads as its instructions
+(`shared/engine-control-files`, compared the way Windows reads a name) is saved
+as `CLAUDE (downloaded).md` and so on, in every turn: downloads land in the
+workspace the engine works in. `browser_download` reports the name actually
+saved.
+
+In a restricted turn the browser's local file arguments and the addresses it
+opens are judged by `apps/runtime` (`turn-file-access`, through the per-call
+gate and pre-tool hook), not by the tools themselves.
 
 ## Design Principles
 

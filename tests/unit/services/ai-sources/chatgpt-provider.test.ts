@@ -36,7 +36,6 @@ import {
   CODEX_SUBSCRIPTION_MODELS,
   CODEX_DEFAULT_MODEL
 } from '../../../../src/shared/constants/codex-models'
-import { getCodexModelCapability } from '../../../../src/main/openai-compat-router/server/codex-capabilities'
 import type { AISourcesConfig } from '../../../../src/shared/types'
 
 function escapeRegExp(value: string): string {
@@ -135,6 +134,23 @@ describe('ChatGPTProvider', () => {
   it('omits the account header rather than sending it empty', () => {
     const config = getChatGPTProvider().getBackendConfig(configWith({ user: undefined }))
     expect(config!.headers!['ChatGPT-Account-ID']).toBeUndefined()
+  })
+
+  it('routes using workspace context instead of the composite user identity', async () => {
+    const provider = getChatGPTProvider()
+    const config = configWith({ accountId: 'workspace-1', user: { uid: JSON.stringify(['user-1', 'workspace-1']), name: 'User' } })
+    expect(provider.getBackendConfig(config)!.headers!['ChatGPT-Account-ID']).toBe('workspace-1')
+    proxyFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ models: [{ slug: 'model', visibility: 'list' }] }) })
+    await provider.refreshConfig(config)
+    expect(proxyFetch.mock.calls[0][1].headers['ChatGPT-Account-ID']).toBe('workspace-1')
+  })
+
+  it('recovers workspace routing from legacy credentials without treating the user uid as a header', () => {
+    const accessToken = `header.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': {
+      chatgpt_user_id: 'user-1', chatgpt_account_id: 'workspace-1'
+    } })).toString('base64url')}.signature`
+    const config = configWith({ accessToken, user: { uid: 'old-workspace-id', name: 'User' } })
+    expect(getChatGPTProvider().getBackendConfig(config)!.headers!['ChatGPT-Account-ID']).toBe('workspace-1')
   })
 
   it('falls back to the catalog default model', () => {
@@ -242,12 +258,12 @@ describe('ChatGPTProvider', () => {
         ])
       )
 
-      await getChatGPTProvider().refreshConfig(configWith())
-
-      // Silence in the catalog is assent: the wire field only states a false.
-      expect(getCodexModelCapability('model-plain')).toEqual({ reasoningSummary: true, responsesLite: false })
-      expect(getCodexModelCapability('model-no-summary')).toEqual({ reasoningSummary: false, responsesLite: false })
-      expect(getCodexModelCapability('model-lite')).toEqual({ reasoningSummary: true, responsesLite: true })
+      const result = await getChatGPTProvider().refreshConfig(configWith())
+      const cache = (result.data as any)[CHATGPT_PROVIDER_ID].modelCatalogCache
+      const capability = (model: string) => getChatGPTProvider().getBackendConfig(configWith({ model, modelCatalogCache: cache }))!.codexModelCapabilities
+      expect(capability('model-plain')).toEqual({ reasoningSummary: true, responsesLite: false })
+      expect(capability('model-no-summary')).toEqual({ reasoningSummary: false, responsesLite: false })
+      expect(capability('model-lite')).toEqual({ reasoningSummary: true, responsesLite: true })
     })
 
     /**
@@ -305,8 +321,11 @@ describe('ChatGPTProvider', () => {
       // priority; the hidden entry is dropped and the shipped models the
       // backend did not mention survive.
       expect(availableModels).toEqual([
+        'gpt-6.1-sol',
         'gpt-6-astra',
         'model-second',
+        'gpt-6-sol',
+        'gpt-6-luna',
         'gpt-5.6-sol',
         'gpt-5.6-terra',
         'gpt-5.6-luna',
@@ -323,7 +342,15 @@ describe('ChatGPTProvider', () => {
 
       const { availableModels } = modelsOf(await getChatGPTProvider().refreshConfig(configWith()))
 
-      expect(availableModels).toEqual(['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])
+      expect(availableModels).toEqual([
+        'gpt-6.1-sol',
+        'gpt-6-astra',
+        'gpt-6-sol',
+        'gpt-6-luna',
+        'gpt-5.6-sol',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna'
+      ])
     })
 
     it('queries the catalog endpoint with the CLI version and identity headers', async () => {
@@ -340,10 +367,6 @@ describe('ChatGPTProvider', () => {
       expect(init.headers['Accept']).toBeUndefined()
     })
 
-    /**
-     * A fetch that fails must not look like "this account has no models" — the
-     * manager reads `degraded` and keeps what is already stored.
-     */
     it('degrades instead of clearing the list when the catalog cannot be read', async () => {
       proxyFetch.mockResolvedValueOnce({ ok: false, status: 503, text: async () => 'unavailable' } as unknown as Response)
 
@@ -352,7 +375,90 @@ describe('ChatGPTProvider', () => {
       expect(result.success).toBe(true)
       const payload = (result.data as Record<string, { degraded?: boolean; availableModels?: string[] }>)[CHATGPT_PROVIDER_ID]
       expect(payload.degraded).toBe(true)
-      expect(payload.availableModels).toBeUndefined()
+      expect(payload.availableModels).toEqual(CODEX_SUBSCRIPTION_MODELS.map(model => model.slug))
+    })
+
+    it('reconstructs an upgraded legacy snapshot offline without losing metadata', async () => {
+      proxyFetch.mockRejectedValueOnce(new Error('offline'))
+      const result = await getChatGPTProvider().refreshConfig(configWith({
+        availableModels: ['gpt-5.5', 'account-only'],
+        modelNames: { 'account-only': 'Account model' },
+        modelCapabilities: { 'account-only': { contextWindow: 345678 } },
+        modelVision: { 'account-only': false }
+      }))
+      const payload = (result.data as any)[CHATGPT_PROVIDER_ID]
+      expect(payload.availableModels).toEqual(expect.arrayContaining(['gpt-6-sol', 'gpt-6-luna', 'account-only']))
+      expect(payload.modelNames['account-only']).toBe('Account model')
+      expect(payload.modelCapabilities['account-only']).toEqual({ contextWindow: 345678 })
+      expect(payload.modelVision['account-only']).toBe(false)
+      expect(payload.catalogReconciled).toBe(true)
+      expect(payload.modelCatalogCache).toBeUndefined()
+      expect(payload.model).toBeUndefined()
+    })
+
+    it('persists only normalized overlay fields and replays hidden models and adapter capabilities offline', async () => {
+      proxyFetch.mockResolvedValueOnce(catalogResponse([
+        {
+          slug: 'gpt-6-sol', visibility: 'hide', supports_reasoning_summary_parameter: false, use_responses_lite: true,
+          supported_reasoning_levels: [{ effort: 'low', description: 'Fast' }, { effort: 'xhigh', description: 'Deep' }],
+          unused: 'not persisted'
+        },
+        { slug: 'remote-only', display_name: 'Remote model', visibility: 'list', priority: -1, input_modalities: ['text'], context_window: 345678 }
+      ]))
+      const provider = getChatGPTProvider()
+      const fresh = (await provider.refreshConfig(configWith())).data as any
+      const cache = fresh[CHATGPT_PROVIDER_ID].modelCatalogCache
+      expect(cache).toMatchObject({ provider: 'chatgpt', version: 1 })
+      expect(cache.entries[0]).not.toHaveProperty('unused')
+      expect(cache.entries[0].supported_reasoning_levels).toEqual(['low', 'xhigh'])
+      expect(Number.isFinite(Date.parse(cache.fetchedAt))).toBe(true)
+      proxyFetch.mockRejectedValueOnce(new Error('offline'))
+      const offline = (await provider.refreshConfig(configWith({ modelCatalogCache: cache }))).data as any
+      const payload = offline[CHATGPT_PROVIDER_ID]
+      expect(payload.availableModels).not.toContain('gpt-6-sol')
+      expect(payload.availableModels).toContain('gpt-6-luna')
+      expect(payload.availableModels[0]).toBe('remote-only')
+      expect(payload.modelCapabilities['remote-only']).toEqual({ contextWindow: 345678 })
+      expect(payload.modelVision['remote-only']).toBe(false)
+      expect(payload.modelCatalogCache).toBeUndefined()
+      expect(provider.getBackendConfig(configWith({ model: 'gpt-6-sol', modelCatalogCache: cache }))!.codexModelCapabilities)
+        .toEqual({ reasoningSummary: false, responsesLite: true, reasoningLevels: ['low', 'xhigh'] })
+    })
+
+    it.each([null, {}, [{ slug: '' }], [{ slug: 123 }]])('uses cached metadata on a malformed remote catalog: %j', async (models) => {
+      proxyFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ models }) })
+      const result = await getChatGPTProvider().refreshConfig(configWith())
+      expect((result.data as any)[CHATGPT_PROVIDER_ID].degraded).toBe(true)
+      expect(modelsOf(result).availableModels).toContain('gpt-6-sol')
+    })
+
+    it('falls back to legacy metadata when its persisted cache is invalid', async () => {
+      proxyFetch.mockRejectedValueOnce(new Error('offline'))
+      const result = await getChatGPTProvider().refreshConfig(configWith({
+        availableModels: ['old-model'],
+        modelCatalogCache: { provider: 'chatgpt', version: 1, entries: [{}] }
+      }))
+      expect(modelsOf(result).availableModels).toEqual(expect.arrayContaining(['old-model', 'gpt-6-sol']))
+    })
+
+    it('resolves cached capabilities independently without startup registration', () => {
+      const cache = { provider: 'chatgpt', version: 1, fetchedAt: '2026-01-01', entries: [
+        { slug: 'gpt-6-sol', supports_reasoning_summary_parameter: false, use_responses_lite: true }
+      ] }
+      const a = configWith({ model: 'gpt-6-sol', modelCatalogCache: cache })
+      const b = configWith({ model: 'gpt-6-sol', accessToken: 'account-b', modelCatalogCache: {
+        ...cache, entries: [{ slug: 'gpt-6-sol', supports_reasoning_summary_parameter: true, use_responses_lite: false }]
+      } })
+      expect(getChatGPTProvider().getBackendConfig(a)!.codexModelCapabilities).toEqual({ reasoningSummary: false, responsesLite: true })
+      expect(getChatGPTProvider().getBackendConfig(b)!.codexModelCapabilities).toEqual({ reasoningSummary: true, responsesLite: false })
+      expect(getChatGPTProvider().getBackendConfig(a)!.codexModelCapabilities).toEqual({ reasoningSummary: false, responsesLite: true })
+    })
+
+    it('reconstructs locally without making a request when authentication is unavailable', () => {
+      const result = getChatGPTProvider().getOfflineConfig(configWith({ accessToken: undefined })) as any
+      expect(result[CHATGPT_PROVIDER_ID].availableModels).toContain('gpt-6-sol')
+      expect(result[CHATGPT_PROVIDER_ID].degraded).toBe(true)
+      expect(proxyFetch).not.toHaveBeenCalled()
     })
 
     it('degrades when the catalog comes back empty', async () => {

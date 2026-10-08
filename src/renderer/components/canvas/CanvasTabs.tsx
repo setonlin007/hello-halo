@@ -23,19 +23,21 @@
  * - Middle-click: Close tab
  */
 
-import { useState, useRef, useCallback, useEffect, forwardRef } from 'react'
-import { X, Loader2, AlertCircle, Plus, XCircle, Maximize2, Minimize2, RefreshCw } from 'lucide-react'
+import { useState, useRef, useCallback, useEffect, forwardRef, type ReactNode } from 'react'
+import { X, Loader2, AlertCircle, Plus, XCircle, Maximize2, Minimize2, RefreshCw, Target, GitCompareArrows } from 'lucide-react'
 import { type TabState } from '../../services/canvas-lifecycle'
-import { useCanvasLifecycle } from '../../hooks/useCanvasLifecycle'
+import { useActiveTabId, useCanvasActions, useTabList } from '../../hooks/useCanvasLifecycle'
 import { useCanvasStore } from '../../stores/canvas.store'
 import { useWindowMaximize } from './viewers/useWindowMaximize'
 import { FileIcon } from '../icons/ToolIcons'
 import { api } from '../../api'
 import { useTranslation } from '../../i18n'
 import { getBrowserHomepage } from '../../utils/browser-homepage'
+import { trackToolOpen } from '../../services/tool-session-telemetry'
+import { CanvasToggleButton } from './CanvasToggleButton'
 
 interface CanvasTabsProps {
-  tabs: TabState[]
+  tabs: readonly TabState[]
   activeTabId: string | null
   onTabClick: (tabId: string) => void
   onTabClose: (tabId: string) => void
@@ -44,6 +46,8 @@ interface CanvasTabsProps {
   onCloseAll?: () => void
   isMaximized?: boolean
   onToggleMaximize?: () => void
+  /** Hides the canvas while keeping its tabs; placed before "close all". */
+  collapseControl?: ReactNode
 }
 
 export function CanvasTabs({
@@ -56,9 +60,10 @@ export function CanvasTabs({
   onCloseAll,
   isMaximized = false,
   onToggleMaximize,
+  collapseControl,
 }: CanvasTabsProps) {
   const { t } = useTranslation()
-  const { reorderTabs } = useCanvasLifecycle()
+  const { reorderTabs } = useCanvasActions()
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null)
   const [dropTargetIndex, setDropTargetIndex] = useState<number | null>(null)
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(new Set())
@@ -67,7 +72,7 @@ export function CanvasTabs({
   const tabListRef = useRef<HTMLDivElement>(null)
   const tabRefs = useRef<Map<string, HTMLDivElement>>(new Map())
   // Ref to store latest tabs for stable callbacks (avoids event listener recreation)
-  const tabsRef = useRef<TabState[]>(tabs)
+  const tabsRef = useRef<readonly TabState[]>(tabs)
   tabsRef.current = tabs
 
   // Track new tabs for appear animation and auto-scroll
@@ -332,6 +337,8 @@ export function CanvasTabs({
           </button>
         )}
 
+        {collapseControl}
+
         {/* Close all tabs button */}
         {onCloseAll && tabs.length > 0 && (
           <button
@@ -429,6 +436,10 @@ const TabItem = forwardRef<HTMLDivElement, TabItemProps>(function TabItem({
           <Loader2 className="w-4 h-4 animate-spin text-primary" />
         ) : tab.error ? (
           <AlertCircle className="w-4 h-4 text-destructive" />
+        ) : tab.type === 'goal' ? (
+          <Target className="w-4 h-4 text-primary" />
+        ) : tab.type === 'changes' ? (
+          <GitCompareArrows className="w-4 h-4 text-primary" />
         ) : (
           <FileIcon
             extension={extension}
@@ -439,7 +450,7 @@ const TabItem = forwardRef<HTMLDivElement, TabItemProps>(function TabItem({
       </div>
 
       {/* Title */}
-      <span className="canvas-tab-title">
+      <span className="canvas-tab-title" title={tab.title}>
         {tab.title}
       </span>
 
@@ -472,7 +483,9 @@ const TabItem = forwardRef<HTMLDivElement, TabItemProps>(function TabItem({
  */
 export function CanvasTabBar() {
   const { t } = useTranslation()
-  const { tabs, activeTabId, switchTab, closeTab, closeAllTabs, refreshTab, openUrl } = useCanvasLifecycle()
+  const tabs = useTabList()
+  const activeTabId = useActiveTabId()
+  const { switchTab, closeTab, closeAllTabs, refreshTab, openUrl } = useCanvasActions()
   const isCanvasMaximized = useCanvasStore(state => state.isMaximized)
   const toggleCanvasMaximized = useCanvasStore(state => state.toggleMaximized)
   const { isMaximized: isWindowMaximized, toggleMaximize: toggleWindowMaximize } = useWindowMaximize()
@@ -482,7 +495,7 @@ export function CanvasTabBar() {
 
   // Handle new tab - opens configured homepage (respects browser policy)
   const handleNewTab = useCallback(() => {
-    getBrowserHomepage().then(url => openUrl(url, t('New Tab')))
+    trackToolOpen('browser', 'canvas_new_tab', getBrowserHomepage().then(url => openUrl(url, t('New Tab'))))
   }, [openUrl, t])
 
   // Handle combined maximize toggle: window maximize + canvas fullscreen
@@ -513,6 +526,7 @@ export function CanvasTabBar() {
       onCloseAll={closeAllTabs}
       isMaximized={isFullyMaximized}
       onToggleMaximize={handleToggleMaximize}
+      collapseControl={<CanvasToggleButton placement="tab-bar" />}
     />
   )
 }

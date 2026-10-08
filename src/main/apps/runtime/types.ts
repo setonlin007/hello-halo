@@ -7,6 +7,7 @@
 
 import type { RunOutcome, AppStatus } from '../manager'
 import type { AppRunStartInfo } from '../../../shared/apps/app-types'
+import type { ContentReference } from '../../../shared/types/content-reference'
 
 // ============================================
 // Trigger Types
@@ -43,6 +44,8 @@ export interface TriggerContext {
     sessionId?: string
     /** Free-text follow-up to send as the resumed turn. Falls back to "Continue." */
     userMessage?: string
+    /** Places the user pointed at with the follow-up, in the order they added them. */
+    references?: ContentReference[]
     /**
      * True when this is a free-text follow-up to a run that already completed
      * successfully (report_to_user was called). Such a turn is conversational,
@@ -53,6 +56,12 @@ export interface TriggerContext {
      */
     interactive?: boolean
   }
+  /**
+   * The user started this run from the desktop and can watch it: its browser
+   * pages open in the main window and appear in the live-session tray instead
+   * of the hidden host every other run uses.
+   */
+  watchable?: boolean
 }
 
 // ============================================
@@ -72,6 +81,8 @@ export interface AppRunResult {
   finishedAt: number
   durationMs: number
   tokensUsed?: number
+  /** What the model processed, cache included; `tokensUsed` counts input and output only. */
+  tokenUsage?: import('../../../shared/apps/app-types').RunTokenUsage
   errorMessage?: string
   /** Final text output from the AI (used for fallback activity entry) */
   finalText?: string
@@ -108,6 +119,8 @@ export interface AutomationRun {
   errorMessage?: string
   /** V2 session ID for escalation context recovery */
   sessionId?: string
+  /** When the retention rule deleted its process transcript and engine session; it can no longer be continued. */
+  transcriptClearedAt?: number
 }
 
 /**
@@ -173,6 +186,8 @@ export interface ActivationState {
   eventUnsubscribers: Array<() => void>
   /** Keep-alive disposer from background service */
   keepAliveDisposer: (() => void) | null
+  /** Space whose file watcher this App holds for its file subscriptions */
+  fileWatchSpaceId?: string | null
 }
 
 // ============================================
@@ -229,8 +244,15 @@ export interface AppRuntimeDeps {
   memory: import('../../platform/memory').MemoryService
   background: import('../../platform/background').BackgroundService
   getSpacePath: (spaceId: string) => string | null
-  /** IM session registry for proactive push routing (null if not initialized) */
-  imSessionRegistry?: import('./im-session-registry').ImSessionRegistry | null
+  /**
+   * Hold a space's file watcher while an activated App has a file subscription
+   * there. Watchers are reference-counted; without a hold, file events only
+   * flow while the user happens to have the space open.
+   */
+  fileWatch?: {
+    retain(spaceId: string, holder: string): void
+    release(spaceId: string, holder: string): void
+  }
   /**
    * @deprecated IM forwarding is now AI-driven via notify_bot tool.
    * Retained for backward compatibility — no longer used at runtime.
@@ -294,8 +316,10 @@ export interface AppRuntimeService {
    *
    * Admission checks (app runnable, per-app dedup) still reject before the run
    * starts, so a caller learns about those the same way `triggerManually` does.
+   *
+   * `watchable` is for the desktop's own Run once action (see TriggerContext).
    */
-  startManually(appId: string): Promise<AppRunStartInfo>
+  startManually(appId: string, options?: { watchable?: boolean }): Promise<AppRunStartInfo>
 
   // ── State Queries ───────────────────────────
 
@@ -315,6 +339,16 @@ export interface AppRuntimeService {
    */
   retryEscalationContinuation(appId: string, entryId: string): Promise<void>
   confirmEscalationDeadline(appId: string, entryId: string, deadlineAt: number | null): void
+
+  /**
+   * Switch fields an author's upgrade kept at the user's version to the
+   * author's version, from that upgrade's activity note. Only fields the note
+   * lists are switched; it records them and is published again.
+   *
+   * @returns the updated note
+   * @throws Error if the note does not exist, or the result is invalid
+   */
+  adoptAuthorVersion(appId: string, entryId: string, fields: string[]): ActivityEntry
   /** Decline ONE unanswered request; the run it belongs to keeps going. */
   dismissEscalation(appId: string, entryId: string): Promise<void>
   closeRun(appId: string, runId: string): Promise<void>
@@ -346,9 +380,12 @@ export interface AppRuntimeService {
    * - Finished run: reopens the run and resumes its session so the user can keep
    *   talking to it with full context (e.g. "this part is wrong, fix it").
    *
+   * `references` are files and folders the user attached; the text may be empty
+   * when they carry the message.
+   *
    * @throws Error if the run/app is not found, or the app is busy with another run.
    */
-  injectIntoRun(appId: string, runId: string, text: string): Promise<void>
+  injectIntoRun(appId: string, runId: string, text: string, references?: ContentReference[]): Promise<void>
 
   // ── Activity Queries ────────────────────────
 

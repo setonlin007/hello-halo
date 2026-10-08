@@ -13,6 +13,7 @@
  *   human on the main board, mirroring what the input's own selector does.
  */
 
+import { useEffect } from 'react'
 import { Bot } from 'lucide-react'
 import { useAppsStore } from '../../stores/apps.store'
 import { useAppsPageStore } from '../../stores/apps-page.store'
@@ -26,14 +27,25 @@ import { SpaceResourceRow } from './SpaceResourceRow'
 import { navigateToAppChat, startDigitalHumanConversation } from '../../utils/conversation-navigation'
 import { useSpaceDigitalHumans } from '../../hooks/useSpaceDigitalHumans'
 import { api } from '../../api'
+import { markEntry, trackHome, trackNavigate } from '../../services/home-telemetry'
 
-export function DigitalHumansTab() {
+interface DigitalHumansTabProps {
+  onItemsChange?: (count: number) => void
+}
+
+export function DigitalHumansTab({ onItemsChange }: DigitalHumansTabProps) {
   const { t } = useTranslation()
   const spaceId = useSpaceStore(state => state.currentSpace?.id ?? '')
   const appStates = useAppsStore(s => s.appStates)
   const digitalHumans = useSpaceDigitalHumans(spaceId)
 
+  useEffect(() => {
+    onItemsChange?.(digitalHumans.length)
+  }, [onItemsChange, digitalHumans.length])
+
   const handleOpenOverview = (appId: string) => {
+    trackHome('home.rail.item.click', { tab: 'digital-humans', action: 'open', appId })
+    trackNavigate('apps', 'rail_tab', 'home_rail_dh')
     useAppsPageStore.getState().setCurrentTab('my-digital-humans')
     useAppsPageStore.getState().openActivityThread(appId)
     useAppStore.getState().navigate('apps')
@@ -42,7 +54,9 @@ export function DigitalHumansTab() {
   // Starts a fresh session rather than reopening the app's existing one:
   // acting on a digital human from a browsing surface means "talk to it now",
   // and resuming a past conversation is the left list's job.
-  const handleOpenChat = async (appId: string, appSpaceId: string | null) => {
+  const handleOpenChat = async (appId: string, appSpaceId: string) => {
+    trackHome('home.rail.item.click', { tab: 'digital-humans', action: 'chat', appId })
+    markEntry('home_rail_dh')
     const conversationId = await startDigitalHumanConversation(appId)
     if (conversationId) navigateToAppChat(appSpaceId, appId, conversationId)
   }
@@ -68,9 +82,9 @@ export function DigitalHumansTab() {
             bareIcon
             name={name || app.id}
             description={automationStatusLabel(effectiveStatus, t)}
-            scope={app.spaceId === null ? 'global' : 'space'}
+            scope="space"
             onClick={() => handleOpenOverview(app.id)}
-            onUse={() => { void handleOpenChat(app.id, app.spaceId) }}
+            onUse={() => { if (app.spaceId) void handleOpenChat(app.id, app.spaceId) }}
             useLabel={t('Chat')}
           />
         )

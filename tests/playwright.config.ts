@@ -78,8 +78,27 @@ export default defineConfig({
   // Projects - different test configurations
   projects: [
     {
+      // The canvas changes view and reference cards on a seeded git workspace
+      // (fixtures/git-workspace.ts). Each test seeds a fresh repository and
+      // boots its own app instance.
+      name: 'changes-view',
+      testMatch: ['**/changes-view.spec.ts', '**/references.spec.ts'],
+      timeout: 90000,
+      use: { actionTimeout: 15000 }
+    },
+    {
       name: 'people-upgrade',
       testMatch: ['**/people-upgrade.spec.ts', '**/people-capabilities.spec.ts', '**/people-settings.spec.ts', '**/people-tasks.spec.ts'],
+      use: { actionTimeout: 15000 }
+    },
+    {
+      name: 'transcript-scroll',
+      testMatch: ['**/transcript-scroll.spec.ts', '**/token-usage-popup.spec.ts'],
+      use: { actionTimeout: 15000 }
+    },
+    {
+      name: 'digital-human-chat',
+      testMatch: '**/digital-human-chat.spec.ts',
       use: { actionTimeout: 15000 }
     },
     {
@@ -106,10 +125,15 @@ export default defineConfig({
     },
     {
       name: 'browser-view-frame',
-      testMatch: '**/browser-view-frame.spec.ts',
+      testMatch: ['**/browser-view-frame.spec.ts', '**/browser-view-reveal.spec.ts', '**/browser-carrier-server.spec.ts'],
       use: {
         actionTimeout: 10000
       }
+    },
+    {
+      name: 'browser-carrier-packaged',
+      testMatch: '**/browser-carrier-packaged.spec.ts',
+      use: { actionTimeout: 10000 }
     },
     {
       name: 'settings',

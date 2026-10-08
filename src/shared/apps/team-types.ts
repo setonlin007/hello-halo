@@ -539,14 +539,17 @@ export interface TeamTriggerContext {
    */
   forwardDepth?: number
   /**
-   * This turn was set in motion from a machine that is not this one, so it runs
-   * under what the owner granted teammates rather than under the owner's own
-   * reach (`shared/apps/capability-policy`).
+   * This turn was set in motion by someone nobody here vouched for — from a
+   * machine that is not this one, or by a guest of an IM chat a member fronts —
+   * so it runs under what the owner granted others (teammates, or that chat's
+   * guests) rather than under the owner's own reach
+   * (`shared/apps/capability-policy`).
    *
-   * Stamped ONLY where a request crosses into this node — an inbound office wake
-   * and the office-credential 1:1 endpoint — and then carried along every hop it
-   * causes here, because a stranger's request does not become the owner's by
-   * passing through one of the owner's own digital humans on the way.
+   * Stamped ONLY where a request crosses into this node — an inbound office
+   * wake, the office-credential 1:1 endpoint, and a guest's IM message — and
+   * then carried along every hop it causes here, because a stranger's request
+   * does not become the owner's by passing through one of the owner's own
+   * digital humans on the way.
    *
    * A value arriving on the wire is authored by the sender and is therefore
    * overwritten on arrival, never trusted.
@@ -750,6 +753,8 @@ export interface JoinedOfficeSnapshot {
     goal: string
     leadAppId: string | null
     collabMode: CollabMode
+    /** The host's own node id — the authority of this office (persisted as the shadow office's host_node_id). */
+    hostNodeId: string
     /**
      * The office's currently-open run epoch, if any. Persisted as the shadow
      * office's current_epoch_id so a joiner can bind the live run from its own
@@ -965,6 +970,11 @@ export interface TeamDetail {
   pendingEscalations?: TeamPendingEscalation[]
   /** Periodic checks running across this office's open runs and conversations. */
   checks?: TeamCheckView[]
+  /**
+   * The epoch `tasks`/`findings`/`activities` were read from; null when no board
+   * is open. A board event for any other epoch does not belong to this view.
+   */
+  boardEpochId?: string | null
 }
 
 export interface TeamEpochSummary {
@@ -1081,9 +1091,19 @@ export interface CollabSummary {
 
 // ── Observability event payloads ──
 
+/**
+ * What a `team:updated` changed, so a listener reloads only that. 'status' is
+ * the office row alone (carried on the event); 'members' the roster, members and
+ * edges; 'board' the open board's tasks, findings, activity and checks; 'epochs'
+ * the run history; 'conversations' the task list.
+ */
+export type TeamUpdatedChange = 'status' | 'members' | 'board' | 'epochs' | 'conversations'
+
 export interface TeamUpdatedEvent {
   teamId: string
   team?: Team
+  /** Absent → treat everything as changed (every emitter predating the hint). */
+  changed?: TeamUpdatedChange[]
   /**
    * The office's status as a viewer observes it, which `team.status` is not:
    * that field is the persisted RUN status and knows nothing about a member
@@ -1160,10 +1180,12 @@ export interface TeamPresenceEvent {
  *                the same calm way as a reconnect (no user action needed).
  *   'access-lost' — this machine's membership was refused on re-entry;
  *                reconnecting alone cannot fix it, the user needs a fresh invite.
+ *   'update-required' — the office runs another Halo version; this machine (or
+ *                the host) must update before it can rejoin.
  * The renderer maps each kind to humanized, location-free copy; the wire kind
  * itself is code-only and never shown to a user.
  */
-export type TeamOfficeStatusKind = 'paused' | 'resumed' | 'authority-changed' | 'access-lost'
+export type TeamOfficeStatusKind = 'paused' | 'resumed' | 'authority-changed' | 'access-lost' | 'update-required'
 
 export interface TeamOfficeStatusEvent {
   teamId: string
@@ -1210,6 +1232,18 @@ export function parseSpaceCoordinatorAppId(appId: string): string | null {
   return appId.startsWith(SPACE_COORDINATOR_APP_PREFIX)
     ? appId.slice(SPACE_COORDINATOR_APP_PREFIX.length)
     : null
+}
+
+/**
+ * Prefix of a published artifact ref naming a file in the team folder of its
+ * piece of work (`team:<member folder>/<path>`) rather than in the producer's
+ * working directory. A colon cannot appear in a Windows file name, so no real
+ * project path is mistaken for one.
+ */
+export const TEAM_FOLDER_REF_PREFIX = 'team:'
+
+export function isTeamFolderRef(ref: string): boolean {
+  return ref.startsWith(TEAM_FOLDER_REF_PREFIX)
 }
 
 /**
@@ -1308,6 +1342,8 @@ export const TEAM_TOOL_NAMES = {
   postFinding: 'team_post_finding',
   readBoard: 'team_read_board',
   readArtifact: 'team_read_artifact',
+  /** Lead only: read a member's record of the run. */
+  readMember: 'team_read_member',
   complete: 'team_complete',
   schedule: 'team_schedule',
   unschedule: 'team_unschedule',

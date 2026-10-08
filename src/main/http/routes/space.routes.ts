@@ -31,12 +31,6 @@ export function registerSpaceRoutes(app: Express): void {
     res.json(result)
   })
 
-  // Must be before :spaceId route to avoid matching "summaries" as an id
-  app.get('/api/spaces/summaries', async (req: Request, res: Response) => {
-    const result = await spaceController.listSpaceSummaries()
-    res.json(result)
-  })
-
   app.post('/api/spaces', async (req: Request, res: Response) => {
     const { name, icon, color, customPath } = req.body
     const result = spaceController.createSpace({ name, icon, color, customPath })
@@ -58,6 +52,29 @@ export function registerSpaceRoutes(app: Express): void {
   app.put('/api/spaces/:spaceId', async (req: Request, res: Response) => {
     const result = spaceController.updateSpace(req.params.spaceId, req.body)
     res.json(result)
+  })
+
+  // Point the space at another working directory — mirrors space:set-working-dir
+  app.put('/api/spaces/:spaceId/working-dir', async (req: Request, res: Response) => {
+    res.json(await spaceController.changeSpaceWorkingDir(req.params.spaceId, req.body?.workingDir))
+  })
+
+  // Preferences (layout, memory settings) — mirrors space:get/update-preferences
+  app.get('/api/spaces/:spaceId/preferences', async (req: Request, res: Response) => {
+    res.json(spaceController.getSpacePreferences(req.params.spaceId))
+  })
+
+  app.put('/api/spaces/:spaceId/preferences', async (req: Request, res: Response) => {
+    res.json(spaceController.updateSpacePreferences(req.params.spaceId, req.body ?? {}))
+  })
+
+  // Space memory: size, last consolidation, and "consolidate now"
+  app.get('/api/spaces/:spaceId/memory', async (req: Request, res: Response) => {
+    res.json(await spaceController.getSpaceMemoryStatus(req.params.spaceId))
+  })
+
+  app.post('/api/spaces/:spaceId/memory/consolidate', async (req: Request, res: Response) => {
+    res.json(spaceController.consolidateSpaceMemory(req.params.spaceId))
   })
 
   app.delete('/api/spaces/:spaceId', async (req: Request, res: Response) => {
@@ -91,15 +108,16 @@ export function registerSpaceRoutes(app: Express): void {
   })
 
   app.post('/api/spaces/:spaceId/conversations', async (req: Request, res: Response) => {
-    const { title } = req.body
-    const result = conversationController.createConversation(req.params.spaceId, title)
+    const { title, reasoningEffort, ephemeral } = req.body
+    const result = conversationController.createConversation(req.params.spaceId, title, reasoningEffort, { ephemeral: ephemeral === true })
     res.json(result)
   })
 
   app.get('/api/spaces/:spaceId/conversations/:conversationId', async (req: Request, res: Response) => {
     const result = conversationController.getConversation(
       req.params.spaceId,
-      req.params.conversationId
+      req.params.conversationId,
+      typeof req.query.from === 'string' && req.query.from ? req.query.from : undefined
     )
     res.json(result)
   })

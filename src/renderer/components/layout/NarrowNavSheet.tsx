@@ -14,11 +14,13 @@
  */
 
 import { useState } from 'react'
-import { Menu, X, MessageSquare, Bot, BookOpen, Compass, SquareCheckBig, Settings } from 'lucide-react'
+import { Menu, X, Settings } from 'lucide-react'
+import { ChatNavIcon, DigitalHumanNavIcon, KnowledgeNavIcon, StoreNavIcon, TasksNavIcon } from '../icons/NavIcons'
 import { useAppStore } from '../../stores/app.store'
 import { useAppsPageStore } from '../../stores/apps-page.store'
 import { useTaskPanelStore } from '../../stores/taskPanel.store'
-import { useTaskCount } from '../../stores/task.store'
+import { countTaskItems, useTaskCount, useTaskItems } from '../../stores/task.store'
+import { capCount, trackHome, trackNavigate } from '../../services/home-telemetry'
 import { useTranslation } from '../../i18n'
 import { useGoToConversation } from '../../hooks/useGoToConversation'
 
@@ -27,6 +29,7 @@ export function NarrowNavSheet() {
   const navigate = useAppStore(s => s.navigate)
   const goToConversation = useGoToConversation()
   const taskCount = useTaskCount()
+  const taskItems = useTaskItems()
   const openTaskPanel = useTaskPanelStore(s => s.toggle)
   const [isOpen, setIsOpen] = useState(false)
   const [isAnimatingOut, setIsAnimatingOut] = useState(false)
@@ -40,15 +43,40 @@ export function NarrowNavSheet() {
     }, 200)
   }
 
-  const goChat = () => close(goToConversation)
-  const goDigitalHumans = () => close(() => {
-    useAppsPageStore.getState().setCurrentTab('my-digital-humans')
-    navigate('apps')
-  })
-  const goKnowledge = () => close(() => navigate('tlon'))
-  const goStore = () => close(() => navigate('store'))
-  const goSettings = () => close(() => navigate('settings'))
-  const goTasks = () => close(openTaskPanel)
+  const goChat = () => {
+    trackNavigate('space', 'sheet', 'nav_sheet')
+    close(goToConversation)
+  }
+  const goDigitalHumans = () => {
+    trackNavigate('apps', 'sheet', 'nav_sheet')
+    close(() => {
+      useAppsPageStore.getState().setCurrentTab('my-digital-humans')
+      navigate('apps')
+    })
+  }
+  const goKnowledge = () => {
+    trackNavigate('tlon', 'sheet', 'nav_sheet')
+    close(() => navigate('tlon'))
+  }
+  const goStore = () => {
+    trackNavigate('store', 'sheet', 'nav_sheet')
+    close(() => navigate('store'))
+  }
+  const goSettings = () => {
+    trackNavigate('settings', 'sheet', 'nav_sheet')
+    close(() => navigate('settings'))
+  }
+  const goTasks = () => {
+    const counts = countTaskItems(taskItems)
+    trackHome('nav.task_panel.toggle', {
+      open: !useTaskPanelStore.getState().isOpen,
+      surface: 'sheet',
+      continueCount: capCount(counts.continueCount),
+      runningCount: capCount(counts.runningCount),
+      pinnedCount: capCount(counts.pinnedCount),
+    })
+    close(openTaskPanel)
+  }
 
   return (
     <>
@@ -98,7 +126,7 @@ export function NarrowNavSheet() {
                 onClick={goChat}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
-                <MessageSquare className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <ChatNavIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
                 <span className="text-sm text-foreground">{t('Conversation')}</span>
               </button>
 
@@ -106,7 +134,7 @@ export function NarrowNavSheet() {
                 onClick={goDigitalHumans}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
-                <Bot className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <DigitalHumanNavIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
                 <span className="text-sm text-foreground">{t('Digital Humans')}</span>
               </button>
 
@@ -114,7 +142,7 @@ export function NarrowNavSheet() {
                 onClick={goKnowledge}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
-                <BookOpen className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <KnowledgeNavIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
                 <span className="text-sm text-foreground">{t('Knowledge Base')}</span>
               </button>
 
@@ -122,7 +150,7 @@ export function NarrowNavSheet() {
                 onClick={goStore}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
-                <Compass className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <StoreNavIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
                 <span className="text-sm text-foreground">{t('Store')}</span>
               </button>
 
@@ -130,7 +158,7 @@ export function NarrowNavSheet() {
                 onClick={goTasks}
                 className="w-full px-4 py-3 flex items-center gap-3 hover:bg-secondary/80 transition-colors"
               >
-                <SquareCheckBig className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <TasksNavIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
                 <span className="text-sm text-foreground">{t('Tasks')}</span>
                 {taskCount > 0 && (
                   <span className="ml-auto text-xs text-muted-foreground tabular-nums">{taskCount}</span>

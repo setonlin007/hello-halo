@@ -9,6 +9,7 @@ import {
 import type {
   ApiResponse,
 } from './_shared'
+import type { ReasoningEffortLevel } from '../../shared/constants/reasoning-effort'
 
 export const conversationApi = {
   // ===== Conversation =====
@@ -19,21 +20,30 @@ export const conversationApi = {
     return httpRequest('GET', `/api/spaces/${spaceId}/conversations`)
   },
 
-  createConversation: async (spaceId: string, title?: string): Promise<ApiResponse> => {
-    if (isElectron()) {
-      return window.halo.createConversation(spaceId, title)
-    }
-    return httpRequest('POST', `/api/spaces/${spaceId}/conversations`, { title })
-  },
-
-  getConversation: async (
+  /** `ephemeral`: for a view that shows its own transcript — never listed, deleted with the view. */
+  createConversation: async (
     spaceId: string,
-    conversationId: string
+    title?: string,
+    reasoningEffort?: ReasoningEffortLevel,
+    options?: { ephemeral?: boolean }
   ): Promise<ApiResponse> => {
     if (isElectron()) {
-      return window.halo.getConversation(spaceId, conversationId)
+      return window.halo.createConversation(spaceId, title, reasoningEffort, options)
     }
-    return httpRequest('GET', `/api/spaces/${spaceId}/conversations/${conversationId}`)
+    return httpRequest('POST', `/api/spaces/${spaceId}/conversations`, { title, reasoningEffort, ...options })
+  },
+
+  /** `fromMessageId`: return messages from that one on, marked with `messagesFrom` (whole list if unknown). */
+  getConversation: async (
+    spaceId: string,
+    conversationId: string,
+    options?: { fromMessageId?: string }
+  ): Promise<ApiResponse> => {
+    if (isElectron()) {
+      return window.halo.getConversation(spaceId, conversationId, options)
+    }
+    const from = options?.fromMessageId ? `?from=${encodeURIComponent(options.fromMessageId)}` : ''
+    return httpRequest('GET', `/api/spaces/${spaceId}/conversations/${conversationId}${from}`)
   },
 
   updateConversation: async (

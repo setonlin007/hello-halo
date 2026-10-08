@@ -20,6 +20,8 @@ operations on this page:
   POST   /api/apps/<appId>/chat/send                                 Send a message to a digital human and let it reply
   GET    /api/apps/<appId>/chat/status                               Check whether a digital human chat is currently generating a reply
   POST   /api/apps/<appId>/chat/stop                                 Stop a digital human's in-progress chat reply
+  POST   /api/apps/<appId>/chats/clear-all                           Clear the history of all of a digital human's chats at once   !! destructive
+  GET    /api/apps/<appId>/chats/clearable                           Count the conversations clearing all of a digital human's chats would clear
   POST   /api/apps/<appId>/clear-memory                              Delete all of a digital human's memory files   !! destructive
   POST   /api/apps/<appId>/config                                    Replace a digital human's user configuration values
   POST   /api/apps/<appId>/escalation/<entryId>/respond              Answer a digital human's pending question (it stopped to ask a human before continuing)   !! destructive
@@ -27,6 +29,8 @@ operations on this page:
   POST   /api/apps/<appId>/im-chat/clear                             Clear a digital human's chat history in a bound IM chat   !! destructive
   GET    /api/apps/<appId>/im-chat/messages                          Read a digital human's transcript in a bound IM chat
   POST   /api/apps/<appId>/im-chat/stop                              Stop a digital human's in-progress reply in a bound IM chat (keeps history)
+  GET    /api/apps/<appId>/memory                                    Read the state of a digital human's memory
+  POST   /api/apps/<appId>/memory/consolidate                        Consolidate a digital human's memory now
   POST   /api/apps/<appId>/move-space                                Set which space a digital human starts new work in
   PATCH  /api/apps/<appId>/overrides                                 Merge-patch per-installation overrides (notification level, model)
   POST   /api/apps/<appId>/pause                                     Pause a digital human (stops scheduling)
@@ -34,6 +38,8 @@ operations on this page:
   POST   /api/apps/<appId>/permissions/grant                         Grant a named permission to a digital human
   POST   /api/apps/<appId>/permissions/revoke                        Revoke a named permission from a digital human
   POST   /api/apps/<appId>/reinstall                                 Reinstall a previously soft-deleted (uninstalled) digital human
+  GET    /api/apps/<appId>/reminders                                 List the reminders a digital human set in its conversations
+  DELETE /api/apps/<appId>/reminders/<reminderId>                    Cancel a reminder a digital human set in one of its conversations   !! destructive
   POST   /api/apps/<appId>/resume                                    Resume a paused digital human
   POST   /api/apps/<appId>/runs/<runId>/continue                     Resume a run that stopped prematurely on an error   !! destructive
   POST   /api/apps/<appId>/runs/<runId>/inject                       Inject a text message into a currently active run   !! destructive
@@ -48,9 +54,11 @@ operations on this page:
   POST   /api/apps/import-spec                                       Install a digital human (or other app type) from a YAML definition (spec) string
   POST   /api/apps/install                                           Install a digital human (or other app type) from its full definition (spec) object
   GET    /api/im-sessions                                            List every chat thread a digital human has, its own and IM ones
+  GET    /api/im-sessions/linked                                     List the IM chats a digital human pushes to through another digital human's bot
   POST   /api/im-sessions/remove                                     Remove a chat binding from the IM session registry
   POST   /api/im-sessions/set-custom-name                            Set a custom display name for a chat binding
   POST   /api/im-sessions/set-proactive                              Toggle whether a run's result is auto-pushed to this chat when it finishes
+  POST   /api/im-sessions/set-push-link                              Let a digital human push to an IM chat another digital human's bot knows, or stop it
   POST   /api/tlon/<kbId>/bind-app                                   Bind a knowledge collection so a digital human can read it
   POST   /api/tlon/<kbId>/unbind-app                                 Unbind a knowledge collection from a digital human
 
@@ -113,7 +121,7 @@ POST   /api/apps/<appId>/chat/send                                 Send a messag
      # note: Only the "local" and "http" channels are accepted; a thread whose source is "im" is refused, because this API must not put words into a real conversation with a person. 400 with the expected form when the id is malformed, and chatId must match [A-Za-z0-9_-].
      # note: Returns before the digital human has read anything. Poll GET /api/apps/<appId>/chat/status until isGenerating is false, then read the reply with GET /api/apps/<appId>/chat/messages, passing the same conversationId.
      # note: Nothing here paces you: each send starts another full agent process immediately. Send one at a time and wait for the reply — never loop over this route.
-     # note: Optional body fields: thinkingEnabled, images.
+     # note: Optional body fields: thinkingEnabled, reasoningEffort (off|minimal|low|medium|high|xhigh|max; overrides thinkingEnabled, but the digital human's own chatReasoningEffort wins over it), images.
 
 GET    /api/apps/<appId>/chat/status                               Check whether a digital human chat is currently generating a reply
      curl -s "$HALO_API_URL/api/apps/<appId>/chat/status" -H "Authorization: Bearer $HALO_API_TOKEN"
@@ -128,6 +136,17 @@ POST   /api/apps/<appId>/chat/stop                                 Stop a digita
      # body: {"conversationId": "<conversationId — a uuid from GET /api/spaces/$HALO_SPACE_ID/conversations>"}
      # out: {success:true}
      # note: Name the session to stop. Stopping every session at once is a much bigger act, so it must be asked for explicitly: send {"all": true}. Sending neither returns 400 rather than guessing.
+
+POST   /api/apps/<appId>/chats/clear-all                           Clear the history of all of a digital human's chats at once
+     !! DESTRUCTIVE: cannot be undone. Confirm with the user in plain language before running this.
+     curl -sX POST "$HALO_API_URL/api/apps/<appId>/chats/clear-all" -H "Authorization: Bearer $HALO_API_TOKEN"
+     # out: {success:true,data:{cleared:number,failed:number}}
+     # note: Each chat is cleared as /clear clears it and starts afresh with its next message; replies in progress stop. API sessions, team chats, memory and reminders are left alone. Nothing is posted into the chats.
+
+GET    /api/apps/<appId>/chats/clearable                           Count the conversations clearing all of a digital human's chats would clear
+     curl -s "$HALO_API_URL/api/apps/<appId>/chats/clearable" -H "Authorization: Bearer $HALO_API_TOKEN"
+     # out: {success:true,data:{total:number,im:number,teamIm:number}}
+     # note: total: its default and local chats and its IM chats that have history (im of them in IM); API sessions and team chats are not counted. teamIm: IM chats with history that a team answers — a clear-all leaves them alone; /clear in each clears it.
 
 POST   /api/apps/<appId>/clear-memory                              Delete all of a digital human's memory files
      !! DESTRUCTIVE: cannot be undone. Confirm with the user in plain language before running this.
@@ -169,25 +188,36 @@ POST   /api/apps/<appId>/im-chat/clear                             Clear a digit
      curl -sX POST "$HALO_API_URL/api/apps/<appId>/im-chat/clear" \
           -H "Authorization: Bearer $HALO_API_TOKEN" \
           -H "Content-Type: application/json" \
-          -d '{"spaceId":"<spaceId — the app's own spaceId from GET /api/apps>","channel":"wecom","chatType":"direct","chatId":"<chatId — from GET /api/im-sessions>"}'
-     # body: {"spaceId": "<spaceId — the app's own spaceId from GET /api/apps>", "channel": "wecom", "chatType": "direct", "chatId": "<chatId — from GET /api/im-sessions>"}
+          -d '{"spaceId":"<spaceId — the app's own spaceId from GET /api/apps>","channel":"wecom-bot","chatType":"direct","chatId":"<chatId — from GET /api/im-sessions>"}'
+     # body: {"spaceId": "<spaceId — the app's own spaceId from GET /api/apps>", "channel": "wecom-bot", "chatType": "direct", "chatId": "<chatId — from GET /api/im-sessions>"}
      # out: {success:true}
-     # note: All four body fields are required, 400 otherwise. chatType is "direct" or "group".
+     # note: All four body fields are required, 400 otherwise. channel, chatType and chatId are checked as for GET im-chat/messages; chatType is "direct" or "group".
 
 GET    /api/apps/<appId>/im-chat/messages                          Read a digital human's transcript in a bound IM chat
      curl -s "$HALO_API_URL/api/apps/<appId>/im-chat/messages?channel=wecom-bot&chatId=<chatId — from GET /api/im-sessions>&spaceId=<spaceId — the app's own spaceId from GET /api/apps>" -H "Authorization: Bearer $HALO_API_TOKEN" | head -c 4000
      # out: {success:true,data:[{id,role:"user"|"assistant",content,timestamp,thoughts?,thoughtsSummary?,images?}]}
      # note: All three query params are required, 400 otherwise. spaceId must be the app's own — a different but valid one is accepted and reads the wrong space. Optional ?chatType=group, defaults to direct.
+     # note: channel is the session's IM channel (wecom-bot, feishu-bot, dingtalk-bot, weixin-ilink-bot); chatId is taken as GET /api/im-sessions gives it. Any other channel, chatType or a chatId with whitespace, ":", "/", "\" or ".." is a 400. Read "http" and "local" sessions with GET /api/apps/:appId/chat/messages?conversationId=.
      # note: This is real correspondence with a person on the other end — read it only when the task needs it.
 
 POST   /api/apps/<appId>/im-chat/stop                              Stop a digital human's in-progress reply in a bound IM chat (keeps history)
      curl -sX POST "$HALO_API_URL/api/apps/<appId>/im-chat/stop" \
           -H "Authorization: Bearer $HALO_API_TOKEN" \
           -H "Content-Type: application/json" \
-          -d '{"channel":"wecom","chatType":"direct","chatId":"<chatId — from GET /api/im-sessions>"}'
-     # body: {"channel": "wecom", "chatType": "direct", "chatId": "<chatId — from GET /api/im-sessions>"}
+          -d '{"channel":"wecom-bot","chatType":"direct","chatId":"<chatId — from GET /api/im-sessions>"}'
+     # body: {"channel": "wecom-bot", "chatType": "direct", "chatId": "<chatId — from GET /api/im-sessions>"}
      # out: {success:true,data:{stopped:boolean}}
-     # note: chatType is "direct" or "group". Unlike im-chat/clear, this only aborts the current turn — the session and its history continue on the next inbound message.
+     # note: channel, chatType and chatId are checked as for GET im-chat/messages; chatType is "direct" or "group". Unlike im-chat/clear, this only aborts the current turn — the session and its history continue on the next inbound message.
+
+GET    /api/apps/<appId>/memory                                    Read the state of a digital human's memory
+     curl -s "$HALO_API_URL/api/apps/<appId>/memory" -H "Authorization: Bearer $HALO_API_TOKEN"
+     # out: {success:true,data:{exists,totalBytes,topicCount,lastConsolidatedAt,lastAttempt,consolidating}}
+
+POST   /api/apps/<appId>/memory/consolidate                        Consolidate a digital human's memory now
+     # note: reversible — can be undone or corrected afterward.
+     curl -sX POST "$HALO_API_URL/api/apps/<appId>/memory/consolidate" -H "Authorization: Bearer $HALO_API_TOKEN"
+     # out: {success:true,data:{started:boolean,reason?:"already-running"|"empty"|"not-found"}}
+     # note: Returns once started; runs in the background with the digital human's model. Keeps a restorable snapshot.
 
 POST   /api/apps/<appId>/move-space                                Set which space a digital human starts new work in
      # note: reversible — can be undone or corrected afterward.
@@ -207,7 +237,7 @@ PATCH  /api/apps/<appId>/overrides                                 Merge-patch p
           -d '{"notificationLevel":"important"}'
      # body: {"notificationLevel": "important"}
      # out: {success:true}
-     # note: Other fields you can set the same way: modelSourceId, modelId. JSON Merge Patch semantics: send null to clear a field (e.g. {"modelSourceId":null} to fall back to the global model). The run schedule is NOT set here — use POST /:appId/frequency.
+     # note: Other fields you can set the same way: modelSourceId, modelId, spaceMemoryAccess (true lets the digital human read its space's memory topics), chatReasoningEffort (off|minimal|low|medium|high|xhigh|max — how hard it thinks everywhere: its chats, IM replies and scheduled or manual runs; unset, the model's configured effort applies), memory ({enabled, autoConsolidate, cadence: "diligent"|"balanced"|"economical"} — sent as a whole object), disabledTools (MCP servers only: tool names, as the server lists them, to leave out of every session — the whole list each time; [] or null turns them all back on). JSON Merge Patch semantics: send null to clear a field (e.g. {"modelSourceId":null} to fall back to the global model). The run schedule is NOT set here — use POST /:appId/frequency.
 
 POST   /api/apps/<appId>/pause                                     Pause a digital human (stops scheduling)
      # note: reversible — can be undone or corrected afterward.
@@ -244,6 +274,15 @@ POST   /api/apps/<appId>/reinstall                                 Reinstall a p
      # out: {success:true,data:{activationWarning?:string}} — activationWarning is set (non-fatal) if restarting it failed
      # err: 404-equivalent: manager.reinstall throws if appId was never installed or is not currently uninstalled
 
+GET    /api/apps/<appId>/reminders                                 List the reminders a digital human set in its conversations
+     curl -s "$HALO_API_URL/api/apps/<appId>/reminders" -H "Authorization: Bearer $HALO_API_TOKEN" | head -c 4000
+     # out: {success:true,data:[{id,conversationId,conversation:{kind,name?},message,schedule,nextAt,createdAt,setBy?}]}
+
+DELETE /api/apps/<appId>/reminders/<reminderId>                    Cancel a reminder a digital human set in one of its conversations
+     !! DESTRUCTIVE: cannot be undone. Confirm with the user in plain language before running this.
+     curl -sX DELETE "$HALO_API_URL/api/apps/<appId>/reminders/<reminderId>" -H "Authorization: Bearer $HALO_API_TOKEN"
+     # out: {success:true} | {success:false,error:"Reminder not found"}
+
 POST   /api/apps/<appId>/resume                                    Resume a paused digital human
      # note: reversible — can be undone or corrected afterward.
      curl -sX POST "$HALO_API_URL/api/apps/<appId>/resume" -H "Authorization: Bearer $HALO_API_TOKEN"
@@ -272,6 +311,7 @@ GET    /api/apps/<appId>/runs/<runId>/session                      Read what a r
      # note: The transcript behind the "View process" panel — same shape as chat/messages, but for one automation run. It is the only way to see why a run did what it did rather than what it reported.
      # note: Get the runId from GET /api/apps/<appId>/activity. Read this when a run went wrong; for what it concluded, its activity entry is shorter and enough.
      # err: 404 when the app or its space is gone. An empty array means that run left no transcript, not that the ids were wrong.
+     # note: Only a person's newest 200 runs keep their transcript. An older run answers {success:false,code:"RUN_PROCESS_CLEARED"}; its activity entry still says what it did, and it can no longer be continued.
 
 POST   /api/apps/<appId>/sessions/create                           Start a new chat thread with a digital human
      curl -sX POST "$HALO_API_URL/api/apps/<appId>/sessions/create" -H "Authorization: Bearer $HALO_API_TOKEN"
@@ -336,11 +376,16 @@ POST   /api/apps/install                                           Install a dig
 
 GET    /api/im-sessions                                            List every chat thread a digital human has, its own and IM ones
      curl -s "$HALO_API_URL/api/im-sessions" -H "Authorization: Bearer $HALO_API_TOKEN" | head -c 4000
-     # out: {success:true,data:[{appId,channel,source:"local"|"im"|"http",chatType:"direct"|"group",chatId,displayName,customName?,proactive,instanceId}]}
+     # out: {success:true,data:[{appId,channel,source:"local"|"im"|"http",chatType:"direct"|"group",chatId,displayName,customName?,proactive,instanceId,pushLinks?:[{appId,autoSync}]}]}
      # note: Optional ?appId= narrows it to one digital human. This is the only listing of its threads — there is no sessions/list beside sessions/create.
      # note: source says what a thread is: "local" = a named thread the user created in Halo, "im" = a real chat with a person on an IM platform, "http" = created through this API.
      # note: Reading or writing one thread needs a conversationId, which is not a field here — build it from four fields of the record: app-chat:<appId>:<channel>:<chatType>:<chatId>.
      # note: Only "local" and "http" threads accept a message from this API. An "im" thread is refused on send — this API must not put words into a real conversation with a person.
+
+GET    /api/im-sessions/linked                                     List the IM chats a digital human pushes to through another digital human's bot
+     curl -s "$HALO_API_URL/api/im-sessions/linked?appId=<appId — a uuid from GET /api/apps>" -H "Authorization: Bearer $HALO_API_TOKEN" | head -c 4000
+     # out: {success:true,data:[{appId,channel,chatType,chatId,displayName,instanceId,pushLinks:[{appId,autoSync}]}]}
+     # note: Each record is the session as the bot's own digital human holds it (its appId is that one). The asking digital human's entry in pushLinks says whether its run results are auto-pushed there.
 
 POST   /api/im-sessions/remove                                     Remove a chat binding from the IM session registry
      # note: reversible — can be undone or corrected afterward.
@@ -350,7 +395,7 @@ POST   /api/im-sessions/remove                                     Remove a chat
           -d '{"appId":"<appId — a uuid from GET /api/apps>","channel":"wecom-bot","chatId":"<chatId — from GET /api/im-sessions>"}'
      # body: {"appId":"<appId — a uuid from GET /api/apps>","channel":"wecom-bot","chatId":"<chatId — from GET /api/im-sessions>"}
      # out: {success:true,data:{removed:boolean}}
-     # note: removed:false means no matching session was found — not an error. Only removes display metadata (custom name, proactive flag); the chat re-registers itself on its next inbound message, message history is not stored here.
+     # note: removed:false means no matching session was found — not an error. Only removes display metadata (custom name, proactive flag, other digital humans' push links to it); the chat re-registers itself on its next inbound message, message history is not stored here.
 
 POST   /api/im-sessions/set-custom-name                            Set a custom display name for a chat binding
      # note: reversible — can be undone or corrected afterward.
@@ -371,6 +416,17 @@ POST   /api/im-sessions/set-proactive                              Toggle whethe
      # body: {"appId":"<appId — a uuid from GET /api/apps>","channel":"wecom-bot","chatId":"<chatId — from GET /api/im-sessions>","proactive":true}
      # out: {success:true} or {success:false,error}
      # err: 404 if no matching session exists yet — the chat must have messaged the digital human at least once.
+
+POST   /api/im-sessions/set-push-link                              Let a digital human push to an IM chat another digital human's bot knows, or stop it
+     # note: reversible — can be undone or corrected afterward.
+     curl -sX POST "$HALO_API_URL/api/im-sessions/set-push-link" \
+          -H "Authorization: Bearer $HALO_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{"appId":"<appId of the digital human that pushes>","session":{"appId":"<the session's own appId>","channel":"wecom-bot","chatId":"<chatId — from GET /api/im-sessions>"},"link":{"autoSync":false}}'
+     # body: {"appId":"<appId of the digital human that pushes>","session":{"appId":"<the session's own appId>","channel":"wecom-bot","chatId":"<chatId — from GET /api/im-sessions>"},"link":{"autoSync":false}}
+     # out: {success:true} or {success:false,error}
+     # note: link:{autoSync} adds the chat to the digital human's push targets or updates it; autoSync:true also pushes its run results there. link:null removes it.
+     # note: Replies in that chat still go to the digital human the bot answers for. 404 when the session does not exist, is not an IM chat, or is the digital human's own.
 
 POST   /api/tlon/<kbId>/bind-app                                   Bind a knowledge collection so a digital human can read it
      # note: reversible — can be undone or corrected afterward.

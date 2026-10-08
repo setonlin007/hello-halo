@@ -19,6 +19,10 @@
     "group": "settings"
   },
   {
+    "method": "GET",
+    "path": "/api/config/read-failure"
+  },
+  {
     "method": "POST",
     "path": "/api/config/validate"
   },
@@ -86,10 +90,6 @@
     "group": "workspace"
   },
   {
-    "method": "GET",
-    "path": "/api/spaces/summaries"
-  },
-  {
     "method": "POST",
     "path": "/api/spaces",
     "group": "workspace"
@@ -107,6 +107,31 @@
   {
     "method": "PUT",
     "path": "/api/spaces/:spaceId",
+    "group": "workspace"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/spaces/:spaceId/working-dir",
+    "group": "workspace"
+  },
+  {
+    "method": "GET",
+    "path": "/api/spaces/:spaceId/preferences",
+    "group": "workspace"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/spaces/:spaceId/preferences",
+    "group": "workspace"
+  },
+  {
+    "method": "GET",
+    "path": "/api/spaces/:spaceId/memory",
+    "group": "workspace"
+  },
+  {
+    "method": "POST",
+    "path": "/api/spaces/:spaceId/memory/consolidate",
     "group": "workspace"
   },
   {
@@ -173,6 +198,10 @@
   },
   {
     "method": "POST",
+    "path": "/api/agent/inject-message"
+  },
+  {
+    "method": "POST",
     "path": "/api/agent/stop",
     "group": "conversation"
   },
@@ -236,6 +265,14 @@
     "path": "/api/agent/toolsets/close"
   },
   {
+    "method": "POST",
+    "path": "/api/agent/goal/get"
+  },
+  {
+    "method": "POST",
+    "path": "/api/agent/goal/set"
+  },
+  {
     "method": "GET",
     "path": "/api/terminal/list",
     "group": "terminal"
@@ -272,6 +309,15 @@
   },
   {
     "method": "GET",
+    "path": "/api/spaces/:spaceId/artifacts/query",
+    "group": "workspace"
+  },
+  {
+    "method": "POST",
+    "path": "/api/spaces/:spaceId/artifacts/resolve"
+  },
+  {
+    "method": "GET",
     "path": "/api/spaces/:spaceId/artifacts/tree",
     "group": "workspace"
   },
@@ -283,6 +329,14 @@
   {
     "method": "GET",
     "path": "/api/artifacts/download"
+  },
+  {
+    "method": "POST",
+    "path": "/api/artifacts/download-ticket"
+  },
+  {
+    "method": "GET",
+    "path": "/api/artifacts/file/:ticket"
   },
   {
     "method": "GET",
@@ -310,8 +364,20 @@
   },
   {
     "method": "POST",
+    "path": "/api/spaces/:spaceId/artifacts/upload"
+  },
+  {
+    "method": "POST",
     "path": "/api/spaces/:spaceId/artifacts/folder",
     "group": "workspace"
+  },
+  {
+    "method": "POST",
+    "path": "/api/spaces/:spaceId/artifacts/retain"
+  },
+  {
+    "method": "POST",
+    "path": "/api/spaces/:spaceId/artifacts/release"
   },
   {
     "method": "POST",
@@ -472,8 +538,42 @@
   },
   {
     "method": "GET",
+    "path": "/api/im-sessions/linked",
+    "group": "channels"
+  },
+  {
+    "method": "POST",
+    "path": "/api/im-sessions/set-push-link",
+    "group": "channels"
+  },
+  {
+    "method": "GET",
     "path": "/api/auth/providers",
     "group": "settings"
+  },
+  {
+    "method": "POST",
+    "path": "/api/auth/start-login"
+  },
+  {
+    "method": "POST",
+    "path": "/api/auth/complete-login"
+  },
+  {
+    "method": "POST",
+    "path": "/api/auth/cancel-login"
+  },
+  {
+    "method": "POST",
+    "path": "/api/auth/refresh-token"
+  },
+  {
+    "method": "GET",
+    "path": "/api/auth/check-token"
+  },
+  {
+    "method": "POST",
+    "path": "/api/auth/logout"
   },
   {
     "method": "GET",
@@ -511,6 +611,14 @@
   {
     "method": "GET",
     "path": "/api/apps/:appId/activity/:entryId"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/activity/:entryId/adopt-author-version"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/author-spec"
   },
   {
     "method": "POST",
@@ -595,6 +703,26 @@
   {
     "method": "POST",
     "path": "/api/apps/:appId/clear-memory",
+    "group": "digital-human"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/memory",
+    "group": "digital-human"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/memory/consolidate",
+    "group": "digital-human"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/reminders",
+    "group": "digital-human"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/apps/:appId/reminders/:reminderId",
     "group": "digital-human"
   },
   {
@@ -706,6 +834,10 @@
   },
   {
     "method": "POST",
+    "path": "/api/apps/:appId/chat/inject"
+  },
+  {
+    "method": "POST",
     "path": "/api/apps/:appId/chat/stop",
     "group": "digital-human"
   },
@@ -718,6 +850,14 @@
     "method": "GET",
     "path": "/api/apps/:appId/chat/messages",
     "group": "digital-human"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/chat/transcript"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/chat/messages/:messageId/thoughts"
   },
   {
     "method": "GET",
@@ -736,6 +876,16 @@
   {
     "method": "POST",
     "path": "/api/apps/:appId/chat/restart",
+    "group": "digital-human"
+  },
+  {
+    "method": "GET",
+    "path": "/api/apps/:appId/chats/clearable",
+    "group": "digital-human"
+  },
+  {
+    "method": "POST",
+    "path": "/api/apps/:appId/chats/clear-all",
     "group": "digital-human"
   },
   {
@@ -1014,6 +1164,10 @@
     "group": "store"
   },
   {
+    "method": "GET",
+    "path": "/api/store/updates/:appId/preview"
+  },
+  {
     "method": "POST",
     "path": "/api/store/publish/preview",
     "group": "store"
@@ -1099,6 +1253,11 @@
   },
   {
     "method": "POST",
+    "path": "/api/tlon/:kbId/linked-dirs/:linkId/retry",
+    "group": "knowledge-base"
+  },
+  {
+    "method": "POST",
     "path": "/api/tlon/:kbId/files",
     "group": "knowledge-base"
   },
@@ -1156,5 +1315,65 @@
   {
     "method": "POST",
     "path": "/api/task-state/remove"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/repositories"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/status"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/changes"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/file-contents"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/revision-options"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/stage"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/unstage"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/discard"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/commit"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/sync"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/snapshot"
+  },
+  {
+    "method": "POST",
+    "path": "/api/git/count-changed-since"
+  },
+  {
+    "method": "POST",
+    "path": "/api/code-review/start"
+  },
+  {
+    "method": "GET",
+    "path": "/api/code-review/latest"
+  },
+  {
+    "method": "GET",
+    "path": "/api/code-review/availability"
   }
 ]

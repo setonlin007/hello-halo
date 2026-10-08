@@ -4,11 +4,13 @@
  */
 import type { Express, Request, Response } from 'express'
 import {
+  configController,
   getAISourceManager,
   modelCapabilitiesService,
 } from './_shared'
 import { isCatalogModelCapability } from '../../../shared/model-catalog'
 import { validateModelCapabilityOverrides } from '../../../shared/model-capability-overrides'
+import { maskConfigFields } from '../../foundation/config-encryption'
 
 export function registerAiSourcesRoutes(app: Express): void {
   // ===== AI Sources CRUD Routes (atomic operations) =====
@@ -19,11 +21,16 @@ export function registerAiSourcesRoutes(app: Express): void {
       const { sourceId } = req.body
       const manager = getAISourceManager()
       const result = manager.switchCurrentSource(sourceId)
+      const notSaved = configController.notSavedWhileConfigUnreadable()
+      if (notSaved) {
+        res.json(notSaved)
+        return
+      }
       if (result.currentId !== sourceId) {
         res.json({ success: false, error: `Source not found: ${sourceId}` })
         return
       }
-      res.json({ success: true, data: result })
+      res.json({ success: true, data: maskConfigFields({ aiSources: result }).aiSources })
     } catch (error) {
       res.json({ success: false, error: (error as Error).message })
     }
@@ -34,7 +41,8 @@ export function registerAiSourcesRoutes(app: Express): void {
       const { modelId } = req.body
       const manager = getAISourceManager()
       const result = manager.switchCurrentModel(modelId)
-      res.json({ success: true, data: result })
+      res.json(configController.notSavedWhileConfigUnreadable()
+        ?? { success: true, data: maskConfigFields({ aiSources: result }).aiSources })
     } catch (error) {
       res.json({ success: false, error: (error as Error).message })
     }
@@ -44,7 +52,8 @@ export function registerAiSourcesRoutes(app: Express): void {
     try {
       const manager = getAISourceManager()
       const result = manager.addSource(req.body)
-      res.json({ success: true, data: result })
+      res.json(configController.notSavedWhileConfigUnreadable()
+        ?? { success: true, data: maskConfigFields({ aiSources: result }).aiSources })
     } catch (error) {
       res.json({ success: false, error: (error as Error).message })
     }
@@ -54,7 +63,8 @@ export function registerAiSourcesRoutes(app: Express): void {
     try {
       const manager = getAISourceManager()
       const result = manager.updateSource(req.params.sourceId, req.body)
-      res.json({ success: true, data: result })
+      res.json(configController.notSavedWhileConfigUnreadable()
+        ?? { success: true, data: maskConfigFields({ aiSources: result }).aiSources })
     } catch (error) {
       res.json({ success: false, error: (error as Error).message })
     }
@@ -64,7 +74,8 @@ export function registerAiSourcesRoutes(app: Express): void {
     try {
       const manager = getAISourceManager()
       const result = manager.deleteSource(req.params.sourceId)
-      res.json({ success: true, data: result })
+      res.json(configController.notSavedWhileConfigUnreadable()
+        ?? { success: true, data: maskConfigFields({ aiSources: result }).aiSources })
     } catch (error) {
       res.json({ success: false, error: (error as Error).message })
     }

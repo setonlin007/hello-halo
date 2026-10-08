@@ -14,14 +14,17 @@
  */
 
 import { join } from 'path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, renameSync } from 'fs'
-import { getSpace, touchSpaceActivity } from './space.service'
+import { existsSync, statSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, renameSync } from 'fs'
+import { isReasoningEffortLevel, type ReasoningEffortLevel } from '../../shared/constants/reasoning-effort'
+import { getHaloSpace, getSpace, listSpaces, touchSpaceActivity } from './space.service'
 import { getSeedKBIds } from './tlon'
 import { getConfig } from '../foundation/config.service'
 import { v4 as uuidv4 } from 'uuid'
-import type { FileChangesSummary } from '../../shared/file-changes'
-import type { KBSource } from '../../shared/types/tlon'
-import type { ImageAttachment } from '../../shared/types/image-attachment'
+import { previewFromMessages, titleFromFirstMessage } from '../../shared/conversation-title'
+import { DEFAULT_TOOLSETS } from '../../shared/constants/toolsets'
+import { isSpaceConversationId } from '../../shared/apps/im-keys'
+import type { Thought, TranscriptMessage } from '../../shared/types/transcript'
+import { summarizeThoughts } from '../../shared/transcript'
 
 // Re-export for existing consumers
 export type { FileChangesSummary } from '../../shared/file-changes'
@@ -30,98 +33,11 @@ export type { FileChangesSummary } from '../../shared/file-changes'
 // Type Definitions
 // ============================================================================
 
-type ThoughtType = 'thinking' | 'text' | 'tool_use' | 'tool_result' | 'system' | 'result' | 'error'
-
-interface Thought {
-  id: string
-  type: ThoughtType
-  content: string
-  timestamp: string
-  toolName?: string
-  toolInput?: Record<string, unknown>
-  toolOutput?: string
-  isError?: boolean
-  duration?: number
-  isStreaming?: boolean
-  isReady?: boolean
-  toolResult?: {
-    output: string
-    isError: boolean
-    timestamp: string
-  }
-}
-
-interface TokenUsage {
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheCreationTokens: number
-  totalCostUsd: number
-  contextWindow: number
-}
-
-interface ThoughtsSummary {
-  count: number
-  types: Partial<Record<ThoughtType, number>>
-  /** Wall-clock seconds between the first and last thought; absent for a single thought. */
-  duration?: number
-}
-
-export interface Message {
-  id: string
-  role: 'user' | 'assistant' | 'system'
-  content: string
-  timestamp: string
-  toolCalls?: ToolCall[]
-  thoughts?: Thought[] | null  // null = stored separately, undefined = none, Array = loaded/inline
-  thoughtsSummary?: ThoughtsSummary
-  images?: ImageAttachment[]
-  tokenUsage?: TokenUsage
-  metadata?: {
-    fileChanges?: FileChangesSummary
-    /**
-     * Present on a message delivered by another conversation (role:'system',
-     * source:'cross-conversation'). fromConversationTitle is a snapshot taken
-     * at delivery time — the source may since be renamed or deleted, so the
-     * collapsed label falls back to it when the live title can't be resolved.
-     */
-    fromConversationId?: string
-    fromConversationTitle?: string
-    summary?: string
-    /**
-     * Audit trail: the correlation id (if this delivery was a `waitForReply`
-     * call) and the forward-chain depth it carried. Runtime forward-depth
-     * decisions read the in-memory tracking in circuit-breaker.ts, never this
-     * field — it exists for audit/UI display only.
-     */
-    correlationId?: string
-    forwardDepth?: number
-    /**
-     * Present on a message delivered by a team member to the space
-     * conversation coordinating its collaboration (role:'system',
-     * source:'team-message'). fromMemberName is null for system-authored
-     * notices (turn-end reports).
-     */
-    teamId?: string
-    epochId?: string
-    teamName?: string
-    fromMemberName?: string | null
-    teamTriggerKind?: string
-  }
-  error?: string  // Error message when assistant response failed (e.g., 429 rate limit)
-  source?: string  // How the message entered the conversation (e.g., 'injection', 'cross-conversation')
-  sources?: KBSource[]  // Knowledge-base documents the agent Read this turn (clickable citations)
-}
-
-interface ToolCall {
-  id: string
-  name: string
-  status: 'pending' | 'running' | 'success' | 'error' | 'waiting_approval'
-  input: Record<string, unknown>
-  output?: string
-  error?: string
-  progress?: number
-}
+/**
+ * The message shape is shared with the renderer and every transcript reader
+ * (shared/types/transcript.ts); `Message` stays as this module's name for it.
+ */
+export type Message = TranscriptMessage
 
 export interface ConversationMeta {
   id: string
@@ -137,7 +53,22 @@ export interface ConversationMeta {
    * Conversation object by `toMeta()` so the conversation list can render
    * the engine badge without loading the full conversation.
    */
-  engineId?: 'anthropic' | 'halo' | 'codex' | null
+  engineId?: 'anthropic' | 'halo' | 'codex' | 'dsh' | null
+  /**
+   * Set when the title was chosen rather than derived: the user renamed the
+   * conversation, or it was created with a title that must stay (a review).
+   * Suppresses the first-message auto-title, so the title survives even if it
+   * was set before the first user message. Absent on legacy data = auto-title
+   * still applies. Carried in the meta so the renderer can apply the same rule
+   * optimistically.
+   */
+  titleCustomized?: boolean
+  /**
+   * Backs a view that shows its own transcript (the knowledge base chat): kept
+   * in the index but left out of every list and search, deleted when that view
+   * lets go of it, and swept at the next start if Halo quit first.
+   */
+  ephemeral?: boolean
 }
 
 export interface Conversation extends ConversationMeta {
@@ -165,7 +96,7 @@ export interface Conversation extends ConversationMeta {
    * for UI display (EngineBadge) — engine selection at runtime is still
    * process-bound (see resolved-sdk.ts), changing it requires a restart.
    */
-  engineId?: 'anthropic' | 'halo' | 'codex' | null
+  engineId?: 'anthropic' | 'halo' | 'codex' | 'dsh' | null
   /**
    * Per-conversation model pin (Cursor-style). Pins this conversation to a
    * specific AI source + model independent of the global "current" selection,
@@ -184,12 +115,10 @@ export interface Conversation extends ConversationMeta {
   modelSourceId?: string
   modelId?: string
   /**
-   * Set when the user renamed the conversation. Suppresses the first-message
-   * auto-title in addMessage, so a rename survives even if it happens before
-   * the first user message. Absent on legacy data = auto-title still applies
-   * (same behavior as before the field existed).
+   * How hard this conversation's model thinks, picked on the composer's model
+   * card. Wins over the level a send carries; absent until the user picks one.
    */
-  titleCustomized?: boolean
+  reasoningEffort?: ReasoningEffortLevel
 }
 
 // Thoughts file structure
@@ -206,7 +135,6 @@ interface ConversationIndex {
 }
 
 const INDEX_VERSION = 1
-const PREVIEW_LENGTH = 50
 const CONVERSATION_FORMAT_VERSION = 2
 
 // ============================================================================
@@ -426,24 +354,6 @@ function atomicWriteFileSync(filePath: string, data: string): void {
 }
 
 // ============================================================================
-// Thoughts Summary Computation
-// ============================================================================
-
-function computeThoughtsSummary(thoughts: Thought[]): ThoughtsSummary {
-  const types: Partial<Record<ThoughtType, number>> = {}
-  for (const t of thoughts) {
-    types[t.type] = (types[t.type] || 0) + 1
-  }
-  let duration: number | undefined
-  if (thoughts.length >= 2) {
-    const first = new Date(thoughts[0].timestamp).getTime()
-    const last = new Date(thoughts[thoughts.length - 1].timestamp).getTime()
-    duration = (last - first) / 1000
-  }
-  return { count: thoughts.length, types, duration }
-}
-
-// ============================================================================
 // Migration: v1 (inline thoughts) -> v2 (separated thoughts)
 // ============================================================================
 
@@ -469,7 +379,7 @@ function migrateConversationV1toV2(conversationsDir: string, conversation: Conve
   for (const message of conversation.messages) {
     if (Array.isArray(message.thoughts) && message.thoughts.length > 0) {
       thoughtsData[message.id] = message.thoughts
-      message.thoughtsSummary = computeThoughtsSummary(message.thoughts)
+      message.thoughtsSummary = summarizeThoughts(message.thoughts)
       message.thoughts = null
       hasAnyThoughts = true
     }
@@ -541,15 +451,7 @@ function writeIndex(conversationsDir: string, conversations: ConversationMeta[])
 }
 
 function toMeta(conversation: Conversation): ConversationMeta {
-  const lastMessage = conversation.messages[conversation.messages.length - 1]
-  let preview: string | undefined
-
-  if (lastMessage) {
-    preview = lastMessage.content.slice(0, PREVIEW_LENGTH)
-    if (lastMessage.content.length > PREVIEW_LENGTH) {
-      preview += '...'
-    }
-  }
+  const preview = previewFromMessages(conversation.messages)
 
   const meta: ConversationMeta = {
     id: conversation.id,
@@ -567,6 +469,14 @@ function toMeta(conversation: Conversation): ConversationMeta {
 
   if (conversation.engineId) {
     meta.engineId = conversation.engineId
+  }
+
+  if (conversation.titleCustomized) {
+    meta.titleCustomized = true
+  }
+
+  if (conversation.ephemeral) {
+    meta.ephemeral = true
   }
 
   return meta
@@ -693,10 +603,13 @@ function getConversationsDir(spaceId: string): string {
     throw new Error(error)
   }
 
-  const convDir = space.isTemp
+  return conversationsDirOf(space)
+}
+
+function conversationsDirOf(space: { path: string; isTemp?: boolean }): string {
+  return space.isTemp
     ? join(space.path, 'conversations')
     : join(space.path, '.halo', 'conversations')
-  return convDir
 }
 
 // List all conversations for a space (returns lightweight metadata)
@@ -705,7 +618,7 @@ export function listConversations(spaceId: string): ConversationMeta[] {
 
   const index = readIndex(conversationsDir)
   if (index) {
-    return index.conversations
+    return index.conversations.filter(meta => !meta.ephemeral)
   }
 
   const metas = fullScanConversations(conversationsDir, spaceId)
@@ -714,27 +627,56 @@ export function listConversations(spaceId: string): ConversationMeta[] {
     writeIndex(conversationsDir, metas)
   }
 
-  return metas
+  return metas.filter(meta => !meta.ephemeral)
 }
 
-// Create a new conversation (always v2 format)
 /**
- * Out-of-box toolset selection for the very first conversation, before the user
- * has ever toggled a toolset (no config.lastToolsets yet). AI Browser is a core
- * capability, so it is on by default; the user can turn it off, after which
- * config.lastToolsets (possibly empty) takes over. Ids must match the registry
- * (services/agent/toolsets); unavailable ids are dropped at use time.
+ * Delete the ephemeral conversations a previous run left behind (Halo quit
+ * before the view using one let go of it). Only those created before
+ * `createdBefore` go — later ones belong to this run and may be in use. Reads
+ * each space's index only; a space without one is left for a later start.
  */
-const FIRST_RUN_DEFAULT_TOOLSETS = ['ai-browser']
+export function deleteEphemeralConversations(createdBefore: number): number {
+  let deleted = 0
+  for (const space of [getHaloSpace(), ...listSpaces()]) {
+    const index = readIndex(conversationsDirOf(space))
+    if (!index) continue
+    for (const meta of index.conversations) {
+      if (!meta.ephemeral || !(Date.parse(meta.createdAt) < createdBefore)) continue
+      try {
+        if (deleteConversation(space.id, meta.id)) deleted++
+      } catch (error) {
+        console.error(`[Conversation] Failed to delete ephemeral conversation ${meta.id}:`, error)
+      }
+    }
+  }
+  if (deleted > 0) console.log(`[Conversation] Deleted ${deleted} ephemeral conversation(s) left by an earlier run`)
+  return deleted
+}
 
-export function createConversation(spaceId: string, title?: string): Conversation {
+/**
+ * Create a new conversation (always v2 format).
+ *
+ * @param reasoningEffort Level it starts at (the composer passes its last-used
+ *        pick). Taken at creation so the warm-up that follows spawns the
+ *        session at this level; anything that is not a ladder level is dropped.
+ * @param options.keepTitle The given title stays: the first message does not
+ *        replace it.
+ * @param options.ephemeral See `ConversationMeta.ephemeral`.
+ */
+export function createConversation(
+  spaceId: string,
+  title?: string,
+  reasoningEffort?: unknown,
+  options?: { keepTitle?: boolean; ephemeral?: boolean }
+): Conversation {
   const id = uuidv4()
   const now = new Date().toISOString()
 
   // Stamp the conversation with the engine that created it. Cheap to read
   // (single config field) and avoids needing a separate IPC call from
   // the renderer when displaying the engine badge.
-  let engineId: 'anthropic' | 'halo' | 'codex' = 'anthropic'
+  let engineId: 'anthropic' | 'halo' | 'codex' | 'dsh' = 'anthropic'
   // Stamp the active global model selection so a new conversation inherits the
   // last-used source + model (Cursor-style). Left undefined when no source is
   // configured — the credential resolver falls back to the global selection.
@@ -743,10 +685,10 @@ export function createConversation(spaceId: string, title?: string): Conversatio
   // Stamp the global last-used toolset selection so a new conversation inherits
   // the previous window's enabled toolsets (mirrors the model pin above). Unknown
   // or unavailable ids are ignored at use time (toolsets/registry availability
-  // gate), so no filtering here. On first run (no persisted selection yet) the
-  // browser toolset is on out of the box; once the user toggles anything,
-  // config.lastToolsets is authoritative — including an empty set (all off).
-  let toolsets: string[] = FIRST_RUN_DEFAULT_TOOLSETS
+  // gate), so no filtering here. Until the user toggles anything the shared
+  // defaults apply; after that config.lastToolsets is authoritative — including
+  // an empty set (all off).
+  let toolsets: string[] = [...DEFAULT_TOOLSETS]
   // KB ids to preload: the space's bound KBs plus the global default, snapshotted
   // once at creation so the conversation owns its knowledge set (space rebinds
   // affect only later conversations; the user can add/remove per conversation).
@@ -754,7 +696,7 @@ export function createConversation(spaceId: string, title?: string): Conversatio
   try {
     const cfg = getConfig()
     const cfgEngine = cfg?.agent?.sdkEngine
-    if (cfgEngine === 'halo' || cfgEngine === 'codex') engineId = cfgEngine
+    if (cfgEngine === 'halo' || cfgEngine === 'codex' || cfgEngine === 'dsh') engineId = cfgEngine
 
     const aiSources = cfg?.aiSources
     if (aiSources?.version === 2 && aiSources.currentId) {
@@ -796,6 +738,9 @@ export function createConversation(spaceId: string, title?: string): Conversatio
     ...(toolsets.length > 0 ? { toolsets: [...toolsets] } : {}),
     // Only persist knowledge bases when the space/default seed is non-empty.
     ...(knowledgeBaseIds.length > 0 ? { knowledgeBaseIds: [...knowledgeBaseIds] } : {}),
+    ...(isReasoningEffortLevel(reasoningEffort) ? { reasoningEffort } : {}),
+    ...(title && options?.keepTitle ? { titleCustomized: true } : {}),
+    ...(options?.ephemeral ? { ephemeral: true } : {}),
   }
 
   const conversationsDir = getConversationsDir(spaceId)
@@ -810,7 +755,7 @@ export function createConversation(spaceId: string, title?: string): Conversatio
   updateIndexEntry(conversationsDir, spaceId, id, toMeta(conversation))
 
   // Update space activity timestamp for home page sorting
-  touchSpaceActivity(spaceId)
+  if (!conversation.ephemeral) touchSpaceActivity(spaceId)
 
   return conversation
 }
@@ -827,6 +772,98 @@ export function getConversation(spaceId: string, conversationId: string): Conver
   return result ? result.conversation : null
 }
 
+/**
+ * Whether a conversation is known to no longer exist: its space is gone, or
+ * the space's conversation folder is there without its file. A folder that
+ * cannot be seen (a space on an unmounted drive) proves nothing, so false.
+ */
+export function isConversationGone(spaceId: string, conversationId: string): boolean {
+  if (!isSpaceConversationId(conversationId)) return false
+  if (conversationId.includes('..')) return true
+  const space = getSpace(spaceId)
+  if (!space) return true
+  const conversationsDir = conversationsDirOf(space)
+  if (!existsSync(conversationsDir)) return false
+  try {
+    statSync(join(conversationsDir, `${conversationId}.json`))
+    return false
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return existsSync(conversationsDir)
+    console.warn(`[Conversation] Cannot check deletion: space=${spaceId}, conversation=${conversationId}; task state retained`, error)
+    return false
+  }
+}
+
+/**
+ * A conversation whose messages start at `fromMessageId` (inclusive), for a
+ * reader that already holds the earlier ones — a finished turn then transfers
+ * its own messages, not the whole history. `messagesFrom` marks a cut list;
+ * when the id is unknown the whole conversation is returned without it.
+ */
+export function getConversationFrom(
+  spaceId: string,
+  conversationId: string,
+  fromMessageId: string
+): (Conversation & { messagesFrom?: string }) | null {
+  const conversation = getConversation(spaceId, conversationId)
+  if (!conversation) return null
+  const index = conversation.messages.findIndex(m => m.id === fromMessageId)
+  if (index < 0) return conversation
+  return { ...conversation, messages: conversation.messages.slice(index), messagesFrom: fromMessageId }
+}
+
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+}
+
+function imageFilesDir(conversationsDir: string, conversationId: string): string {
+  return join(conversationsDir, `${conversationId}.images`)
+}
+
+/** A `halo-file://` URL for a local path (the protocol decodes it back). */
+function toHaloFileUrl(filePath: string): string {
+  return `halo-file://${filePath.replace(/%/g, '%25').replace(/#/g, '%23').replace(/\?/g, '%3F')}`
+}
+
+/**
+ * The conversation as the desktop renderer receives it: each inline base64
+ * image is written once beside the conversation (`<id>.images/`) and sent as a
+ * `halo-file://` URL with empty `data`, so the renderer holds a URL instead of
+ * megabytes of base64. The stored JSON keeps the data — remote clients (no
+ * `halo-file:`) and older builds read it. An image that cannot be written is
+ * sent inline as before.
+ */
+export function withImageFiles<T extends Conversation>(spaceId: string, conversation: T): T {
+  if (!conversation.messages.some(m => m.images?.some(image => image.data))) return conversation
+  const dir = imageFilesDir(getConversationsDir(spaceId), conversation.id)
+  let failed = false
+  const messages = conversation.messages.map((message, messageIndex) => {
+    if (!message.images?.some(image => image.data)) return message
+    const images = message.images.map((image, imageIndex) => {
+      if (!image.data || failed) return image
+      const stem = `${message.id || messageIndex}-${image.id || imageIndex}`.replace(/[^\w-]/g, '_')
+      const name = `${stem}.${IMAGE_EXTENSIONS[image.mediaType] ?? 'bin'}`
+      const filePath = join(dir, name)
+      try {
+        if (!existsSync(filePath)) {
+          mkdirSync(dir, { recursive: true })
+          writeFileSync(filePath, Buffer.from(image.data, 'base64'))
+        }
+        return { ...image, data: '', url: toHaloFileUrl(filePath) }
+      } catch (error) {
+        failed = true
+        console.error(`[Conversation] Could not write image file for ${conversation.id}; sending images inline:`, error)
+        return image
+      }
+    })
+    return { ...message, images }
+  })
+  return { ...conversation, messages }
+}
+
 // Update a conversation
 export function updateConversation(
   spaceId: string,
@@ -838,6 +875,16 @@ export function updateConversation(
 
   const { conversation, filePath, conversationsDir } = result
 
+  // A thinking level must be a ladder level; anything else is dropped here so
+  // it can never be stored.
+  if ('reasoningEffort' in updates && updates.reasoningEffort !== undefined && !isReasoningEffortLevel(updates.reasoningEffort)) {
+    const { reasoningEffort: _invalid, ...rest } = updates
+    updates = rest
+  }
+  // Adjusting how hard a conversation thinks isn't activity on it, so it
+  // doesn't move the conversation up the list.
+  const levelOnly = Object.keys(updates).length === 1 && 'reasoningEffort' in updates
+
   // A title arriving through an update is a user rename — mark it so the
   // first-message auto-title in addMessage never clobbers it afterwards.
   const titleCustomized = 'title' in updates ? true : conversation.titleCustomized
@@ -846,7 +893,7 @@ export function updateConversation(
     ...conversation,
     ...updates,
     ...(titleCustomized ? { titleCustomized } : {}),
-    updatedAt: new Date().toISOString()
+    updatedAt: levelOnly ? conversation.updatedAt : new Date().toISOString()
   }
 
   cachedWrite(conversationId, updated, filePath, conversationsDir, spaceId)
@@ -884,7 +931,7 @@ export function addMessage(spaceId: string, conversationId: string, message: Omi
     message.role === 'user' &&
     !conversation.titleCustomized
   ) {
-    conversation.title = message.content.slice(0, 50) + (message.content.length > 50 ? '...' : '')
+    conversation.title = titleFromFirstMessage(message.content, message.metadata?.references) ?? conversation.title
   }
 
   // Ensure version is set for new writes
@@ -896,7 +943,7 @@ export function addMessage(spaceId: string, conversationId: string, message: Omi
   debouncedUpdateIndexEntry(conversationsDir, spaceId, conversationId, toMeta(conversation))
 
   // Update space activity timestamp (throttled — safe to call per message)
-  touchSpaceActivity(spaceId)
+  if (!conversation.ephemeral) touchSpaceActivity(spaceId)
 
   return newMessage
 }
@@ -988,7 +1035,7 @@ export function updateLastMessage(
   // Handle thoughts separation
   if (thoughtsToStore) {
     // Compute summary for the main file
-    lastMessage.thoughtsSummary = computeThoughtsSummary(thoughtsToStore)
+    lastMessage.thoughtsSummary = summarizeThoughts(thoughtsToStore)
     lastMessage.thoughts = null  // Marker: thoughts exist but stored separately
 
     // Write thoughts file first (crash safety: if this succeeds but main fails,
@@ -1022,6 +1069,37 @@ export function updateLastMessage(
   debouncedUpdateIndexEntry(conversationsDir, spaceId, conversationId, toMeta(conversation))
 
   return lastMessage
+}
+
+/** What `removeEmptyReplyPlaceholder` did: removed the placeholder, or why it stayed. */
+export type ReplyPlaceholderOutcome =
+  | 'removed'
+  | 'conversation-gone'
+  /** Messages came after it — typically ones injected while the turn ran, which are shown on the reply before them. */
+  | 'followed-by-messages'
+  | 'not-empty'
+
+/**
+ * Remove the reply placeholder of a turn that produced nothing: the
+ * conversation's last message, only while it is still an empty assistant
+ * message.
+ */
+export function removeEmptyReplyPlaceholder(spaceId: string, conversationId: string): ReplyPlaceholderOutcome {
+  const result = cachedRead(spaceId, conversationId)
+  if (!result) return 'conversation-gone'
+
+  const { conversation, filePath, conversationsDir } = result
+  const last = conversation.messages[conversation.messages.length - 1]
+  if (!last) return 'not-empty'
+  if (last.role !== 'assistant') return 'followed-by-messages'
+  if (last.content || last.error || last.thoughtsSummary || last.thoughts?.length || last.images?.length) return 'not-empty'
+
+  conversation.messages.pop()
+  conversation.messageCount = conversation.messages.length
+
+  cachedWrite(conversationId, conversation, filePath, conversationsDir, spaceId)
+  debouncedUpdateIndexEntry(conversationsDir, spaceId, conversationId, toMeta(conversation))
+  return 'removed'
 }
 
 /**
@@ -1098,6 +1176,15 @@ export function deleteConversation(spaceId: string, conversationId: string): boo
     const tmpThoughts = thoughtsPath + '.tmp'
     if (existsSync(tmpMain)) try { rmSync(tmpMain) } catch { /* ignore */ }
     if (existsSync(tmpThoughts)) try { rmSync(tmpThoughts) } catch { /* ignore */ }
+
+    const imagesDir = imageFilesDir(conversationsDir, conversationId)
+    if (existsSync(imagesDir)) {
+      try {
+        rmSync(imagesDir, { recursive: true, force: true })
+      } catch (error) {
+        console.error(`[Conversation] Failed to delete image files for ${conversationId}:`, error)
+      }
+    }
 
     // Use immediate index update for deletes (user expects instant feedback).
     // Clear any pending debounced entry to prevent the deleted conversation

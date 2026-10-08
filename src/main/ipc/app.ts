@@ -24,10 +24,15 @@
  *   app:update-config      Update App user configuration
  *   app:update-frequency   Update subscription frequency override
  *   app:update-spec        Update App spec (JSON Merge Patch)
+ *   app:get-author-spec    Get the author's original a digital human's upgrades compare against
+ *   app:adopt-author-version  Switch fields an upgrade kept at the user's version to the author's
  *   app:chat-send          Send a chat message to an App's AI agent
  *   app:chat-stop          Stop an active app chat generation
+ *   app:chat-inject        Add a message to the turn an app chat is running
  *   app:chat-status        Get app chat status (generating + conversationId)
  *   app:chat-messages      Load persisted chat messages for an app
+ *   app:chat-transcript    Load one page of persisted chat messages (newest first, thoughts omitted)
+ *   app:chat-message-thoughts  Load the thought process of one chat message
  *   app:chat-session-state Get session state for recovery after refresh
  *   app:chat-restart       Restart an app's chat agent (reload prompt/config)
  *   app:im-chat-messages   Load persisted IM session chat messages
@@ -56,14 +61,18 @@ import {
   getStudioSummary,
   moveAppDefaultSpace,
   readAppRunMessages,
+  RunProcessClearedError,
   sendAppChatMessage,
   stopAppChat,
   stopAppChatConversation,
+  injectIntoAppChatWhenLive,
   isAppChatGenerating,
   isAppChatConversationGenerating,
   loadAppChatMessages,
   loadImChatMessages,
   loadChatMessagesForConversation,
+  loadChatTranscriptForConversation,
+  loadChatMessageThoughts,
   getAppChatSessionState,
   getAppChatConversationId,
   clearAppChat,
@@ -73,11 +82,20 @@ import {
   createNativeChatSession,
   forkNativeChatSession,
   deleteNativeChatSession,
+  getDigitalHumanMemoryStatus,
+  consolidateDigitalHumanMemoryNow,
+  listAppReminders,
+  cancelAppReminder,
+  countClearableChats,
+  clearAllChats,
 } from '../apps/runtime'
 import type { AppSpec } from '../apps/spec'
 import type { AppListFilter, UninstallOptions, UpgradeStrategy } from '../apps/manager'
 import type { ActivityQueryOptions, RunQueryOptions, EscalationResponse, AppChatRequest } from '../apps/runtime'
 import { getSpace } from '../services/space.service'
+import { resolveUserInjectTarget } from '../controllers/app-chat-target.controller'
+import { parseTurnReferences, toAppChatRequest } from '../controllers/chat-turn-input'
+import type { ContentReference } from '../../shared/types/content-reference'
 import { broadcastToAll } from '../http/websocket'
 import * as appController from '../controllers/app.controller'
 import { analytics } from '../services/analytics/analytics.service'
@@ -126,9 +144,10 @@ async function appOperation(name: string, operation: () => unknown | Promise<unk
 
 export function registerAppHandlers(): void {
   registerRawRpcHandlers(appRpc, {
+    // The desktop's Run once: the user is at the screen, so the run's pages open where they can watch them.
     appStartRun: (appId: string) => appOperation('start-run', async () => {
       const r = requireRuntime()
-      return r.success ? { success: true, data: await r.runtime.startManually(appId) } : r
+      return r.success ? { success: true, data: await r.runtime.startManually(appId, { watchable: true }) } : r
     }),
     appGetStudioSummary: (language?: string) => appOperation('studio-summary', () => ({ success: true, data: getStudioSummary(language) })),
     appListPeople: (query?: import('../../shared/apps/people-directory').PeopleDirectoryQuery) => appOperation('list-people', () => ({ success: true, data: listPeopleDirectory(query) })),
@@ -185,6 +204,14 @@ export function registerAppHandlers(): void {
       await r.runtime.stopRun(input.appId, input.runId)
       return { success: true }
     }),
+    appGetAuthorSpec: (appId: string) => appOperation('get-author-spec', () => {
+      const r = requireManager()
+      return r.success ? { success: true, data: r.manager.getAuthorSpec(appId) } : r
+    }),
+    appAdoptAuthorVersion: (input: { appId: string; entryId: string; fields: string[] }) => appOperation('adopt-author-version', () => {
+      const r = requireRuntime()
+      return r.success ? { success: true, data: r.runtime.adoptAuthorVersion(input.appId, input.entryId, input.fields) } : r
+    }),
     // ── app:install ──────────────────────────────────────────────────────────
     appInstall: async (input: { spaceId: string | null; spec: AppSpec; userConfig?: Record<string, unknown> }) => {
       // Shared install + activate orchestration lives in the controller.
@@ -212,7 +239,7 @@ export function registerAppHandlers(): void {
           })
         }
 
-        await r.manager.uninstall(input.appId, input.options)
+        await r.manager.uninstall(input.appId, { ...input.options, reason: 'user' })
         console.log(`[AppIPC] app:uninstall: appId=${input.appId}`)
         return { success: true }
       } catch (error: unknown) {
@@ -476,11 +503,13 @@ export function registerAppHandlers(): void {
     },
 
     // ── app:inject-run ───────────────────────────────────────────────────────
-    appInjectRun: async (input: { appId: string; runId: string; text: string }) => {
+    appInjectRun: async (input: { appId: string; runId: string; text: string; references?: ContentReference[] }) => {
       try {
+        const references = parseTurnReferences(input.references)
+        if (!references.ok) return { success: false, error: references.error }
         const r = requireRuntime()
         if (!r.success) return r
-        await r.runtime.injectIntoRun(input.appId, input.runId, input.text)
+        await r.runtime.injectIntoRun(input.appId, input.runId, input.text, references.references)
         console.log(`[AppIPC] app:inject-run: appId=${input.appId}, runId=${input.runId}`)
         return { success: true }
       } catch (error: unknown) {
@@ -633,6 +662,7 @@ export function registerAppHandlers(): void {
         return { success: true, data: messages }
       } catch (error: unknown) {
         const err = error as Error
+        if (error instanceof RunProcessClearedError) return { success: false, error: err.message, code: error.code }
         console.error('[AppIPC] app:get-session error:', err.message)
         return { success: false, error: err.message }
       }
@@ -641,17 +671,23 @@ export function registerAppHandlers(): void {
     // ── app:chat-send ─────────────────────────────────────────────────────
     appChatSend: async (request: AppChatRequest) => {
       try {
+        // Built field by field, exactly as the HTTP route does: identity is derived, never taken.
+        const built = toAppChatRequest(request?.appId, request)
+        if (!built.ok) {
+          console.warn(`[AppIPC] app:chat-send refused: appId=${request?.appId} ${built.error}`)
+          return { success: false, error: built.error }
+        }
         // Fire-and-forget: streaming events are pushed to renderer via agent:* channels.
         // We don't await the full completion here because the renderer listens for
         // real-time events (agent:message, agent:thought, etc.) keyed by conversationId.
-        sendAppChatMessage(request).catch((error: unknown) => {
+        sendAppChatMessage(built.request).catch((error: unknown) => {
           const err = error as Error
           console.error(`[AppIPC] app:chat-send background error:`, err.message)
         })
         // Echo back the session actually addressed: the caller's explicit
-        // conversationId (native local / IM / HTTP session) or the app's
-        // native default when none was supplied.
-        const conversationId = request.conversationId ?? getAppChatConversationId(request.appId)
+        // conversationId (native local / team session) or the app's native
+        // default when none was supplied.
+        const conversationId = built.request.conversationId ?? getAppChatConversationId(request.appId)
         console.log(`[AppIPC] app:chat-send: appId=${request.appId} conversationId=${conversationId}`)
         return {
           success: true,
@@ -680,6 +716,32 @@ export function registerAppHandlers(): void {
       } catch (error: unknown) {
         const err = error as Error
         console.error('[AppIPC] app:chat-stop error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // ── app:chat-inject ────────────────────────────────────────────────────
+    // The user adding to the turn a digital human is running — or is about to
+    // run: a turn still starting is waited for. `delivered: false` means no turn
+    // was in flight to take it (it ended in the meantime) — the caller then
+    // sends the text as a new message — unless `stopped`: the user stopped that
+    // turn, and the text goes back to them.
+    appChatInject: async (input: { appId: string; conversationId: string; message: string; references?: ContentReference[] }) => {
+      try {
+        const message = typeof input?.message === 'string' ? input.message.trim() : ''
+        const references = parseTurnReferences(input?.references)
+        if (!references.ok) return { success: false, error: references.error }
+        if ((!message && !references.references) || !input?.conversationId) {
+          return { success: false, error: 'Missing conversationId or message' }
+        }
+        const target = resolveUserInjectTarget(input.appId, input.conversationId)
+        if (!target.ok) return { success: false, error: target.error }
+        const outcome = await injectIntoAppChatWhenLive(target.conversationId, message, { source: 'injection' }, references.references)
+        console.log(`[AppIPC] app:chat-inject: appId=${input.appId} conversationId=${input.conversationId} outcome=${outcome}`)
+        return { success: true, data: { delivered: outcome === 'delivered', ...(outcome === 'stopped' ? { stopped: true } : {}) } }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:chat-inject error:', err.message)
         return { success: false, error: err.message }
       }
     },
@@ -726,6 +788,50 @@ export function registerAppHandlers(): void {
       }
     },
 
+    // ── app:chat-transcript ────────────────────────────────────────────────
+    // Paged read of the same transcript app:chat-messages returns whole: newest
+    // page first, thought processes left out (app:chat-message-thoughts).
+    appChatTranscript: async (input: { appId: string; spaceId: string; conversationId?: string; before?: string; limit?: number; through?: string }) => {
+      try {
+        const space = getSpace(input.spaceId)
+        if (!space?.path) {
+          return { success: true, data: { messages: [], hasMoreBefore: false, cursor: null, total: 0 } }
+        }
+        const data = loadChatTranscriptForConversation(
+          space.path,
+          input.appId,
+          input.conversationId ?? getAppChatConversationId(input.appId),
+          { before: input.before, limit: input.limit, through: input.through }
+        )
+        return { success: true, data }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:chat-transcript error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // ── app:chat-message-thoughts ──────────────────────────────────────────
+    appChatMessageThoughts: async (input: { appId: string; spaceId: string; conversationId?: string; messageId: string }) => {
+      try {
+        const space = getSpace(input.spaceId)
+        if (!space?.path) {
+          return { success: true, data: [] }
+        }
+        const data = loadChatMessageThoughts(
+          space.path,
+          input.appId,
+          input.conversationId ?? getAppChatConversationId(input.appId),
+          input.messageId
+        )
+        return { success: true, data }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:chat-message-thoughts error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
     // ── app:chat-session-state ─────────────────────────────────────────────
     appChatSessionState: async (appId: string, conversationId?: string) => {
       try {
@@ -767,6 +873,29 @@ export function registerAppHandlers(): void {
       } catch (error: unknown) {
         const err = error as Error
         console.error('[AppIPC] app:chat-restart error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // ── app:chats-clearable / app:chats-clear-all ─────────────────────────
+    // Every conversation of the digital human cleared as /clear clears each;
+    // the count comes first so the confirmation can say what will go.
+    appChatsClearable: async (appId: string) => {
+      try {
+        return { success: true, data: countClearableChats(appId) }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:chats-clearable error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    appChatsClearAll: async (appId: string) => {
+      try {
+        return { success: true, data: await clearAllChats(appId) }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:chats-clear-all error:', err.message)
         return { success: false, error: err.message }
       }
     },
@@ -1049,6 +1178,51 @@ export function registerAppHandlers(): void {
       } catch (error: unknown) {
         const err = error as Error
         console.error('[AppIPC] app:clear-memory error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // ── app:memory-status / app:memory-consolidate ──────────────────────────
+    appGetMemoryStatus: async (appId: string) => {
+      try {
+        const status = await getDigitalHumanMemoryStatus(appId)
+        return status ? { success: true, data: status } : { success: false, error: 'App not found' }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:memory-status error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    appConsolidateMemory: async (appId: string) => {
+      try {
+        return { success: true, data: consolidateDigitalHumanMemoryNow(appId) }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:memory-consolidate error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    // ── app:reminders-list / app:reminder-cancel ───────────────────────────
+    appListReminders: async (appId: string) => {
+      try {
+        return { success: true, data: listAppReminders(appId) }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:reminders-list error:', err.message)
+        return { success: false, error: err.message }
+      }
+    },
+
+    appCancelReminder: async (input: { appId: string; reminderId: string }) => {
+      try {
+        return cancelAppReminder(input.appId, input.reminderId)
+          ? { success: true }
+          : { success: false, error: 'Reminder not found' }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error('[AppIPC] app:reminder-cancel error:', err.message)
         return { success: false, error: err.message }
       }
     },

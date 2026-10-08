@@ -3,11 +3,11 @@
  *
  * Layout (following industry standard):
  * ┌──────────────────────────────────────────────────────┐
- * │ [Image previews]                                     │
+ * │ [Image previews] [Reference cards]                   │
  * │ ┌──────────────────────────────────────────────────┐ │
  * │ │ Textarea                                         │ │
  * │ └──────────────────────────────────────────────────┘ │
- * │ [Recipient] [+] [Tools] [Thinking] [Knowledge] ── [Send] │
+ * │ [Recipient] [+] [Thinking] [Knowledge] ──── [Send]   │
  * │      Bottom toolbar: always visible, expandable     │
  * └──────────────────────────────────────────────────────┘
  *
@@ -19,20 +19,33 @@
  * - Bottom toolbar for future extensibility
  */
 
-import { useState, useRef, useEffect, useMemo, useCallback, KeyboardEvent, ClipboardEvent, DragEvent } from 'react'
-import { Plus, ImagePlus, Loader2, AlertCircle, Atom, Lightbulb, MessageSquare, Bot } from 'lucide-react'
+import { memo, useState, useRef, useEffect, useMemo, useCallback, KeyboardEvent, ClipboardEvent, DragEvent } from 'react'
+import { Plus, Paperclip, Loader2, AlertCircle, MessagesSquare, Bot, Target } from 'lucide-react'
 import { useAppStore } from '../../stores/app.store'
 import { useChatStore } from '../../stores/chat.store'
 import { useOnboardingStore } from '../../stores/onboarding.store'
 import { getOnboardingPrompt } from '../onboarding/onboardingData'
-import { ToolsetControls } from './ToolsetControls'
 import { LiveSessionsHeader } from './LiveSessionsHeader'
-import { Popover, PopoverTrigger, PopoverContent } from '../ui/Popover'
+import { ComposerMenu, type ComposerMenuSection } from './composer-menu/ComposerMenu'
+import { useComposerToolsets } from './composer-menu/useComposerToolsets'
+import { sortToolsets, toolsetDescription, toolsetIcon, toolsetLabel } from './composer-menu/toolset-display'
+import type { ToolsetStatus } from '../../stores/toolsets.store'
+import { canAttachPath, type AttachedPath, type PickedLocalEntry } from '../../../shared/attached-paths'
+import { MAX_UPLOAD_FILE_SIZE } from '../../../shared/constants/artifact-upload'
+import type { ContentReference } from '../../../shared/types/content-reference'
+import { useComposerReferences, useComposerReferencesStore } from '../../stores/composer-references.store'
+import { useSpaceStore } from '../../stores/space.store'
+import { commitCommentEdits, ComposerReferenceChips, notifyReferenceLimit, useHasNewCommentText } from '../references'
+import { api } from '../../api'
+import { isElectron } from '../../api/transport'
 import { ImageAttachmentPreview } from './ImageAttachmentPreview'
 import { KnowledgeBaseButton } from './KnowledgeBaseButton'
 import { processImage, isValidImageType, formatFileSize } from '../../utils/imageProcessor'
 import { startDigitalHumanConversation } from '../../utils/conversation-navigation'
-import type { ImageAttachment, Artifact } from '../../types'
+import type { ImageAttachment } from '../../types'
+import type { FileQueryItem } from '../../../shared/types/artifact'
+import { normalizePathLike } from '../../../shared/file-path-match'
+import { useFileMentionQuery } from '../../hooks/useFileMentionQuery'
 import { getCurrentSource, resolveModelVision } from '../../types'
 import { useTranslation } from '../../i18n'
 import { SlashCommandMenu, filterSlashCommands } from './SlashCommandMenu'
@@ -43,6 +56,15 @@ import { decideConversationMentionCandidates } from './mentionMenuDecision'
 import { formatConversationReference } from '../../../shared/conversation-reference'
 import { DigitalHumanSelector, type DigitalHumanSelectorConfig } from './DigitalHumanSelector'
 import { AutomationAvatar } from '../apps/AutomationAvatar'
+import {
+  lenBucket,
+  takeComposerOrigin,
+  takeEntry,
+  trackHome,
+  trackHomeThrottled,
+  type ComposerOrigin,
+} from '../../services/home-telemetry'
+import type { GoalComposerConfig } from '../goal'
 
 // ── mention helpers ──
 //
@@ -65,25 +87,6 @@ function getMentionMatch(value: string, cursorPosition: number): MentionMatch | 
   return { query: match[2] || '', start: match.index + match[1].length, end: cursorPosition }
 }
 
-function normalizePathLike(value: string): string {
-  return value.replace(/\\/g, '/').trim().toLowerCase()
-}
-
-function matchesFuzzyPathPrefix(relativePath: string, query: string): boolean {
-  const normalizedPath = normalizePathLike(relativePath)
-  const normalizedQuery = normalizePathLike(query)
-  if (!normalizedQuery) return true
-  if (normalizedPath.includes(normalizedQuery)) return true
-  const pathSegments = normalizedPath.split('/').filter(Boolean)
-  const querySegments = normalizedQuery.split('/').filter(Boolean)
-  if (querySegments.length === 0) return true
-  if (querySegments.length > pathSegments.length) return false
-  for (let i = 0; i < querySegments.length; i += 1) {
-    if (!pathSegments[i]?.startsWith(querySegments[i])) return false
-  }
-  return true
-}
-
 function formatArtifactReference(relativePath: string): string {
   return `\`${relativePath}\``
 }
@@ -102,7 +105,7 @@ function formatArtifactReference(relativePath: string): string {
 type MentionCandidate =
   | { kind: 'digitalHuman'; key: string; text: null; appId: string; name: string; paused: boolean }
   | { kind: 'conversation'; key: string; text: string; conversation: ConversationMentionCandidate }
-  | { kind: 'artifact'; key: string; text: string; artifact: Artifact }
+  | { kind: 'artifact'; key: string; text: string; artifact: FileQueryItem }
 
 /**
  * Section heading shown above each kind's rows.
@@ -118,6 +121,14 @@ function mentionGroupLabel(kind: MentionCandidate['kind'], t: (key: string) => s
   }
 }
 
+type MentionTelemetryType = 'digital_human' | 'file' | 'conversation'
+
+const MENTION_TELEMETRY_TYPE: Record<MentionCandidate['kind'], MentionTelemetryType> = {
+  digitalHuman: 'digital_human',
+  artifact: 'file',
+  conversation: 'conversation',
+}
+
 /**
  * Rows per group on a bare "@", before the user types anything to narrow.
  *
@@ -128,6 +139,8 @@ function mentionGroupLabel(kind: MentionCandidate['kind'], t: (key: string) => s
  * and the cap would only hide matches, so it lifts.
  */
 const MENTION_GROUP_PREVIEW_LIMIT = 4
+/** Most file matches the @ menu asks the index for. */
+const MENTION_FILE_LIMIT = 50
 
 /** One kind's rows, plus where they start in the flat keyboard-navigation order. */
 interface MentionGroup {
@@ -142,10 +155,20 @@ interface MentionGroup {
   startIndex: number
 }
 
+/** What a send carries besides text, images and the thinking switch. */
+export interface ComposerSendOptions {
+  /** The cards in the composer, in order (their numbers). */
+  references?: ContentReference[]
+}
+
 interface InputAreaProps {
-  onSend: (content: string, images?: ImageAttachment[], thinkingEnabled?: boolean) => void | Promise<void | boolean>
-  /** Called when user submits a message while generation is in progress (mid-turn inject) */
-  onInject?: (content: string) => void
+  /** Resolving false means nothing was sent: the text, images and cards come back. */
+  onSend: (content: string, images?: ImageAttachment[], thinkingEnabled?: boolean, options?: ComposerSendOptions) => void | Promise<void | boolean>
+  /**
+   * Called when user submits a message while generation is in progress (mid-turn inject).
+   * Resolving false means nothing was added: the text and cards come back.
+   */
+  onInject?: (content: string, references?: ContentReference[]) => Promise<void | boolean>
   /** Stop the current generation. Omit for inject-only inputs that cannot stop the
    *  underlying process (e.g. the automation run-detail supplement input); the Stop
    *  button is then hidden. */
@@ -154,10 +177,12 @@ interface InputAreaProps {
   placeholder?: string
   isCompact?: boolean
   toolbarSlot?: React.ReactNode
+  /** Controls placed just left of the send button (e.g. model and quota). */
+  sendSlot?: React.ReactNode
   /** Available slash commands for the "/" quick-input autocomplete */
   slashCommands?: SlashCommandItem[]
-  /** Files available in the @ menu. */
-  mentionArtifacts?: Artifact[]
+  /** Space whose files the @ menu offers (queried on demand); omitted = no Files group. */
+  mentionSpaceId?: string
   /**
    * Conversations available in the @ menu. Omitted by surfaces that cannot
    * deliver across conversations (digital-human / team chat), which then show
@@ -165,9 +190,10 @@ interface InputAreaProps {
    */
   mentionConversations?: ConversationMentionCandidate[]
   /**
-   * Hide the on-demand toolset broker control ("Tools" button). Digital-human
-   * chat sets this: a digital human's tools are governed by its Capabilities
-   * panel, not the broker, so the control would be inert and misleading here.
+   * Hide the Capabilities group of the "+" panel (the toolset broker's
+   * switches). Digital-human chat sets this: a digital human's tools are
+   * governed by its own Capabilities panel, not the broker, so the switches
+   * would be inert and misleading here.
    */
   hideToolsetControls?: boolean
   /**
@@ -199,22 +225,40 @@ interface InputAreaProps {
    * when the key changes — drafts are read once, at mount, via lazy useState.
    */
   draftKey?: string
+  /**
+   * Conversation goal: the "+" menu row, goal mode, and the shelf above the
+   * card. Only the space conversation board sets this, and only for engines
+   * that keep goals.
+   */
+  goal?: GoalComposerConfig
 }
 
 // Draft attachments stay in memory; image data must not fill browser storage.
+// The cards live in the composer-references store under the same key.
 interface InputDraft { content: string; images: ImageAttachment[] }
 const inputDrafts = new Map<string, InputDraft>()
 // A failed send can settle after its original input has been replaced.
 const draftRecoverySubscribers = new Map<string, Set<(draft: InputDraft) => void>>()
+// Cards of a composer with no draft key live under a key of its own, gone with it.
+let composerInstanceSeq = 0
 
 // Image constraints
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024  // 20MB max per image (before compression)
 const MAX_IMAGES = 10  // Max images per message
 
-// Number of actions offered by the "+" control. With only one, the toolbar
-// shows it directly instead of hiding it behind a popover — bump this when an
-// action is added or removed.
-const ATTACH_ACTION_COUNT: number = 3
+function base64ToFile(data: string, name: string, mediaType: string): File {
+  const binary = atob(data)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return new File([bytes], name, { type: mediaType })
+}
+
+/**
+ * Every composer send thinks. How hard is the conversation's (or digital
+ * human's) own level, resolved in main; without one, the model's configured
+ * effort.
+ */
+const THINKING_ENABLED = true
 
 // Error message type
 interface ImageError {
@@ -222,7 +266,8 @@ interface ImageError {
   message: string
 }
 
-export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder, isCompact = false, toolbarSlot, draftKey, slashCommands = [], mentionArtifacts = [], mentionConversations = [], hideToolsetControls = false, hideKnowledgeControls = false, standalone = false, digitalHumanSelector }: InputAreaProps) {
+// Memoized: the composer is large and its parent re-renders on every turn-state change.
+export const InputArea = memo(function InputArea({ onSend, onInject, onStop, isGenerating, placeholder, isCompact = false, toolbarSlot, sendSlot, draftKey, slashCommands = [], mentionSpaceId, mentionConversations = [], hideToolsetControls = false, hideKnowledgeControls = false, standalone = false, digitalHumanSelector, goal }: InputAreaProps) {
   const { t } = useTranslation()
   const sendKeyMode = useAppStore(state => state.config?.chat?.sendKeyMode ?? 'enter')
 
@@ -243,6 +288,14 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
   const [content, setContent] = useState(() => draftKey ? inputDrafts.get(draftKey)?.content ?? '' : '')
   const [isFocused, setIsFocused] = useState(false)
   const [images, setImages] = useState<ImageAttachment[]>(() => draftKey ? inputDrafts.get(draftKey)?.images ?? [] : [])
+  const [instanceKey] = useState(() => `composer-${++composerInstanceSeq}`)
+  const referenceKey = draftKey ?? instanceKey
+  const references = useComposerReferences(referenceKey)
+  const writingComment = useHasNewCommentText(referenceKey)
+  useEffect(() => {
+    if (draftKey) return
+    return () => { useComposerReferencesStore.getState().take(instanceKey) }
+  }, [draftKey, instanceKey])
   useEffect(() => {
     if (!draftKey) return
     const restore = (draft: InputDraft) => {
@@ -267,8 +320,11 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
   }, [draftKey, content, images])
   const [isDragOver, setIsDragOver] = useState(false)
   const [isProcessingImages, setIsProcessingImages] = useState(false)
+  // Files a remote client is still uploading into the space (see uploadFiles).
+  // Their cards are not in the message yet, so no way of sending goes out until they land.
+  const [uploadingCount, setUploadingCount] = useState(0)
+  const uploading = uploadingCount > 0
   const [imageError, setImageError] = useState<ImageError | null>(null)
-  const [thinkingEnabled, setThinkingEnabled] = useState(true)  // Extended thinking mode
   const [showAttachMenu, setShowAttachMenu] = useState(false)  // Attachment menu visibility
   // Slash-command autocomplete
   const [slashMenuOpen, setSlashMenuOpen] = useState(false)
@@ -280,10 +336,66 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
   const [slashPreviewOverride, setSlashPreviewOverride] = useState<SlashCommandItem | null>(null)
   // @ mention autocomplete; cursorPos is tracked as state for correct useMemo deps
   const [mentionMenuOpen, setMentionMenuOpen] = useState(false)
+  // Opened by typing with only files as a possible kind: the menu stays hidden
+  // until the space turns out to have files, so "@" in an empty space is inert.
+  const [mentionFilesOnly, setMentionFilesOnly] = useState(false)
   const [mentionSelectedIndex, setMentionSelectedIndex] = useState(0)
   const [cursorPos, setCursorPos] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const cardRef = useRef<HTMLDivElement>(null)
+  const plusTriggerRef = useRef<HTMLButtonElement>(null)
+  const goalMode = !!goal?.active
+  // A remote client's files are not on the host, so only uploaded images make sense there.
+  const canAttachLocalPaths = isElectron()
+
+  // ── References (shown as chips; their counts bump as references arrive) ──
+  const spaceRoot = useSpaceStore(state => (state.currentSpace ? state.currentSpace.workingDir || state.currentSpace.path : undefined))
+  const focusText = useCallback(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    textarea.focus()
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length)
+  }, [])
+
+  // A selection elsewhere added a reference here, and may want the caret here too.
+  const signal = useComposerReferencesStore(state => (state.signal?.key === referenceKey ? state.signal : null))
+  useEffect(() => {
+    if (!signal) return
+    useComposerReferencesStore.getState().consumeSignal(signal.seq)
+    if (signal.focus === 'text') requestAnimationFrame(focusText)
+  }, [signal, focusText])
+
+  // Opened by an AI request rather than by the user: the panel then leaves the keyboard to the composer.
+  const [attachMenuByRequest, setAttachMenuByRequest] = useState(false)
+  const openAttachMenu = useCallback((byRequest = false) => {
+    setSlashMenuOpen(false)
+    setMentionMenuOpen(false)
+    setAttachMenuByRequest(byRequest)
+    setShowAttachMenu(true)
+  }, [])
+  const openAttachMenuForRequest = useCallback(() => openAttachMenu(true), [openAttachMenu])
+  const toolsets = useComposerToolsets({
+    enabled: !hideToolsetControls,
+    panelOpen: showAttachMenu,
+    onRequested: openAttachMenuForRequest,
+  })
+
+  useEffect(() => {
+    if (goalMode) textareaRef.current?.focus()
+  }, [goalMode])
+
+  // A starting turn takes the panel's Add and Context rows away: close it rather than reshape it under the pointer.
+  useEffect(() => {
+    if (isGenerating) setShowAttachMenu(false)
+  }, [isGenerating])
+
+  // Only the home composer wires the recipient selector, so it also scopes
+  // the home.composer.* events.
+  const isHomeComposer = !!digitalHumanSelector
+  // What produced the current draft, credited to its send.
+  const composerOriginRef = useRef<ComposerOrigin | null>(null)
+  const mentionInsertedRef = useRef(false)
 
   // Consume a composer prefill requested for this space (e.g. a skill's slash
   // command from the store's "Use" action, or SkillsTab's row click): fill
@@ -296,6 +408,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     const text = pendingComposerInput.text
     const slashPreview = pendingComposerInput.slashPreview
     useChatStore.setState({ pendingComposerInput: null })
+    composerOriginRef.current = takeComposerOrigin()
     setContent(text)
     // A prefilled slash command (skill "use" actions always fill one) opens
     // the same autocomplete menu the user would see typing it — it's the
@@ -409,25 +522,111 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     setImages(prev => prev.filter(img => img.id !== id))
   }
 
+  /** Refused items are reported here, before any card appears, so nothing looks attached that will not be sent. */
+  const reportUnattachable = (count: number, reason: 'no-local-path' | 'not-absolute') => {
+    if (count === 0) return
+    console.warn('[InputArea] Items not attached', { count, reason, desktop: canAttachLocalPaths })
+    showError(canAttachLocalPaths
+      ? t('{{count}} item(s) could not be attached: not a file or folder on this computer', { count })
+      : t('{{count}} folder(s) could not be attached: only files can be uploaded from this device', { count }))
+  }
+
+  /** Local files and folders become path cards, numbered with the other cards. */
+  const addPaths = (candidates: AttachedPath[]) => {
+    const accepted = candidates.filter(p => canAttachPath(p.path))
+    reportUnattachable(candidates.length - accepted.length, 'not-absolute')
+    if (accepted.length === 0) return
+    const { refused } = useComposerReferencesStore.getState().add(
+      referenceKey,
+      accepted.map(p => ({ source: { kind: 'path' as const, path: p.path, isDirectory: p.isDirectory } })),
+    )
+    if (refused === 'limit') notifyReferenceLimit()
+    requestAnimationFrame(() => textareaRef.current?.focus())
+  }
+
+  /**
+   * A remote client has no local path to hand over, so its files go into the
+   * space's working directory first and are attached by the path they get there.
+   */
+  const uploadFiles = async (files: File[]) => {
+    if (files.length === 0) return
+    const spaceId = mentionSpaceId ?? currentSpaceId
+    if (!spaceId) {
+      showError(t('Open a workspace to attach files'))
+      return
+    }
+    const tooLarge = (name: string) =>
+      t('{{name}} is larger than {{limit}} and was not uploaded', { name, limit: formatFileSize(MAX_UPLOAD_FILE_SIZE) })
+    const oversized = files.find(file => file.size > MAX_UPLOAD_FILE_SIZE)
+    if (oversized) showError(tooLarge(oversized.name))
+    const accepted = files.filter(file => file.size <= MAX_UPLOAD_FILE_SIZE)
+    if (accepted.length === 0) return
+
+    const uploaded: AttachedPath[] = []
+    setUploadingCount(count => count + accepted.length)
+    try {
+      for (const file of accepted) {
+        const result = await api.uploadArtifactFile(spaceId, file)
+        if (result.success && result.data) {
+          uploaded.push({ path: result.data.path, isDirectory: false })
+        } else {
+          console.warn('[InputArea] Upload failed', { code: result.code, error: result.error })
+          showError(result.code === 'TOO_LARGE' ? tooLarge(file.name) : t('Could not upload {{name}}', { name: file.name }))
+        }
+      }
+    } finally {
+      setUploadingCount(count => count - accepted.length)
+    }
+    addPaths(uploaded)
+  }
+
+  /**
+   * Splits dropped, pasted or picked files: images become image attachments (the
+   * model sees them), everything else is attached by path — its local path on
+   * the desktop, the path it is uploaded to elsewhere. Images beyond the
+   * per-message limit go the same way rather than vanish.
+   */
+  const attachFiles = async (entries: Array<{ file: File; isDirectory: boolean }>) => {
+    const imageFiles: File[] = []
+    const byPath: AttachedPath[] = []
+    const uploads: File[] = []
+    let withoutPath = 0
+    for (const { file, isDirectory } of entries) {
+      const path = canAttachLocalPaths ? api.getPathForFile(file) : ''
+      if (!isDirectory && isValidImageType(file) && images.length + imageFiles.length < MAX_IMAGES) {
+        imageFiles.push(file)
+      } else if (path) {
+        byPath.push({ path, isDirectory })
+      } else if (!canAttachLocalPaths && !isDirectory) {
+        uploads.push(file)
+      } else {
+        withoutPath += 1
+      }
+    }
+    reportUnattachable(withoutPath, 'no-local-path')
+    addPaths(byPath)
+    if (imageFiles.length > 0) await addImages(imageFiles)
+    await uploadFiles(uploads)
+  }
+
   // Handle paste event
   const handlePaste = async (e: ClipboardEvent) => {
     const items = e.clipboardData?.items
     if (!items) return
 
-    const imageFiles: File[] = []
-
+    const files: Array<{ file: File; isDirectory: boolean }> = []
     for (const item of Array.from(items)) {
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile()
-        if (file) {
-          imageFiles.push(file)
-        }
-      }
+      if (item.kind !== 'file') continue
+      const file = item.getAsFile()
+      // A copied file from the system file manager arrives with a path; a
+      // screenshot or copied image arrives with bytes only. attachFiles
+      // reports whatever it cannot take.
+      if (file) files.push({ file, isDirectory: false })
     }
 
-    if (imageFiles.length > 0) {
-      e.preventDefault()  // Prevent default only if we're handling images
-      await addImages(imageFiles)
+    if (files.length > 0) {
+      e.preventDefault()
+      await attachFiles(files)
     }
   }
 
@@ -443,15 +642,8 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
   }
 
   // Handle artifact drag-drop reference insertion
-  const handleDropReference = (rawPath: string): boolean => {
-    const normalizedPath = normalizePathLike(rawPath)
-    // P1 fix: use string match instead of RegExp
-    const target = mentionArtifacts.find(a => {
-      const rp = normalizePathLike(a.relativePath)
-      return rp === normalizedPath || rp.endsWith('/' + normalizedPath)
-    })
-    if (!target) return false
-
+  const insertFileReference = (relativePath: string): void => {
+    const target = { relativePath }
     const prefix = content && !content.endsWith(' ') && !content.endsWith('\n') ? ' ' : ''
     const nextContent = `${content}${prefix}${formatArtifactReference(target.relativePath)} `
     setContent(nextContent)
@@ -465,6 +657,21 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
         setCursorPos(len)
       }
     })
+  }
+
+  // Dropped plain text counts as a file reference only when it names a file
+  // of this space (the tree's own drags carry a dedicated type and skip this).
+  const insertMatchingFileReference = async (rawPath: string): Promise<boolean> => {
+    if (!mentionSpaceId) return false
+    const normalizedPath = normalizePathLike(rawPath)
+    if (!normalizedPath) return false
+    const response = await api.queryArtifactFiles(mentionSpaceId, normalizedPath, 20)
+    const target = response.data?.items.find(item => {
+      const rp = normalizePathLike(item.relativePath)
+      return rp === normalizedPath || rp.endsWith('/' + normalizedPath)
+    })
+    if (!target) return false
+    insertFileReference(target.relativePath)
     return true
   }
 
@@ -472,16 +679,30 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     e.preventDefault()
     setIsDragOver(false)
 
+    // Everything is read before the first await: drop data is gone once the event returns.
+    const treePath = e.dataTransfer.getData('text/halo-artifact-relative-path')
+    const plainText = treePath ? '' : e.dataTransfer.getData('text/plain')
+    const items = Array.from(e.dataTransfer.items ?? []).filter(item => item.kind === 'file')
+    const files = Array.from(e.dataTransfer.files).map((file, index) => ({
+      file,
+      isDirectory: items[index]?.webkitGetAsEntry?.()?.isDirectory ?? false,
+    }))
+
     // Check for artifact drag-drop first
-    const referencePath = e.dataTransfer.getData('text/halo-artifact-relative-path') || e.dataTransfer.getData('text/plain')
-    if (referencePath && handleDropReference(referencePath)) {
+    if (treePath.trim()) {
+      insertFileReference(treePath.trim())
       return
     }
-
-    const files = Array.from(e.dataTransfer.files).filter(file => isValidImageType(file))
-
-    if (files.length > 0) {
-      await addImages(files)
+    try {
+      if (plainText && files.length === 0 && await insertMatchingFileReference(plainText)) {
+        return
+      }
+      if (files.length > 0) {
+        await attachFiles(files)
+      }
+    } catch (error) {
+      console.error('[InputArea] Drop failed:', error)
+      showError(t('Could not add the dropped files'))
     }
   }
 
@@ -489,7 +710,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
   const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
     if (files.length > 0) {
-      await addImages(files)
+      await attachFiles(files.map(file => ({ file, isDirectory: false })))
     }
     // Reset input
     if (fileInputRef.current) {
@@ -497,10 +718,47 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     }
   }
 
-  // Handle image button click (from attachment menu)
-  const handleImageButtonClick = () => {
-    setShowAttachMenu(false)
-    fileInputRef.current?.click()
+  // "+" → Files and folders. The desktop opens the native picker; a remote
+  // client picks files on its own device, which are uploaded into the space.
+  const handleAttachClick = async () => {
+    if (isHomeComposer) trackHome('home.composer.attach', { action: 'files' })
+    if (!canAttachLocalPaths) {
+      fileInputRef.current?.click()
+      return
+    }
+    const res = await api.pickLocalEntries()
+    if (!res.success) {
+      console.warn('[InputArea] File picker failed', { error: res.error })
+      showError(t('Could not open the file picker'))
+      return
+    }
+    const picked: PickedLocalEntry[] = res.data ?? []
+    const imageFiles: File[] = []
+    const byPath: AttachedPath[] = []
+    for (const entry of picked) {
+      if (entry.image && images.length + imageFiles.length < MAX_IMAGES) {
+        const name = entry.path.split(/[\\/]/).pop() || 'image'
+        imageFiles.push(base64ToFile(entry.image.data, name, entry.image.mediaType))
+      } else {
+        byPath.push({ path: entry.path, isDirectory: entry.isDirectory })
+      }
+    }
+    addPaths(byPath)
+    if (imageFiles.length > 0) await addImages(imageFiles)
+    textareaRef.current?.focus()
+  }
+
+  const handleAttachMenuToggle = () => {
+    if (showAttachMenu) {
+      closeAttachMenu('outside')
+      return
+    }
+    if (isHomeComposer) trackHome('home.composer.attach', { action: 'open' })
+    openAttachMenu()
+  }
+
+  const trackMentionOpen = (type?: MentionTelemetryType) => {
+    if (isHomeComposer) trackHomeThrottled('mention-open', 1000, 'home.composer.mention', { action: 'open', type })
   }
 
   /**
@@ -510,7 +768,9 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
    * entries land in this one menu, so the kinds can never drift apart into
    * two pickers with their own filtering and keyboard behavior.
    */
-  const handleOpenMentionMenu = () => {
+  const handleOpenMentionMenu = (via: 'digital_human' | 'conversation') => {
+    if (isHomeComposer) trackHome('home.composer.attach', { action: via })
+    trackMentionOpen(via)
     setShowAttachMenu(false)
     const cursor = textareaRef.current?.selectionStart ?? content.length
     const before = content.slice(0, cursor)
@@ -521,6 +781,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
 
     setContent(nextContent)
     setMentionMenuOpen(true)
+    setMentionFilesOnly(false)
     setMentionSelectedIndex(0)
 
     requestAnimationFrame(() => {
@@ -577,33 +838,23 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     [content, cursorPos]
   )
 
-  // Filtered & scored mention artifacts — only computed when the menu is open
-  const filteredMentionArtifacts = useMemo(() => {
-    if (!mentionMenuOpen) return []
-    const query = mentionMatch?.query.trim() || ''
-    const normalizedQuery = normalizePathLike(query)
+  // Ranked file matches, queried from the space's path index while the menu is open
+  const {
+    items: filteredMentionArtifacts,
+    indexing: mentionFilesIndexing,
+    available: mentionFilesAvailable,
+  } = useFileMentionQuery(
+    mentionSpaceId,
+    mentionMatch?.query.trim() ?? '',
+    mentionMenuOpen,
+    MENTION_FILE_LIMIT
+  )
+  const mentionMenuVisible = mentionMenuOpen && (!mentionFilesOnly || mentionFilesAvailable)
 
-    const score = (artifact: Artifact) => {
-      const name = normalizePathLike(artifact.name)
-      const rp = normalizePathLike(artifact.relativePath)
-      if (!normalizedQuery) return artifact.type === 'folder' ? 0 : 1
-      if (rp === normalizedQuery || name === normalizedQuery) return 0
-      if (rp.startsWith(normalizedQuery)) return 1
-      if (name.startsWith(normalizedQuery)) return 2
-      if (rp.includes(normalizedQuery)) return 3
-      return 10
-    }
-
-    return [...mentionArtifacts]
-      .filter(a => matchesFuzzyPathPrefix(a.relativePath, query))
-      .sort((a, b) => {
-        const diff = score(a) - score(b)
-        if (diff !== 0) return diff
-        if (a.type !== b.type) return a.type === 'folder' ? -1 : 1
-        return a.relativePath.localeCompare(b.relativePath)
-      })
-      .slice(0, 50)
-  }, [mentionArtifacts, mentionMatch, mentionMenuOpen])
+  // A files-only menu counts as opened once it actually shows
+  useEffect(() => {
+    if (mentionMenuOpen && mentionFilesOnly && mentionFilesAvailable) trackMentionOpen()
+  }, [mentionFilesAvailable]) // rising edge only; the other flags are read, not watched
 
   // A bare "@" deliberately lists everything (see mentionMenuDecision.ts), a
   // typed query narrows it. Matching logic lives there, shared with the
@@ -693,6 +944,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     const nextCursor = content.slice(0, match.start).length + mentionText.length + (needsTrailingSpace ? 1 : 0)
 
     setContent(nextContent)
+    mentionInsertedRef.current = true
     handleMentionClose()
 
     requestAnimationFrame(() => {
@@ -737,11 +989,20 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
 
   /** One entry point for the menu, so every kind stays keyboard- and click-equal. */
   const selectMentionCandidate = (candidate: MentionCandidate) => {
+    // Shown so the user knows it exists, but its AI could not reach it.
+    if (candidate.kind === 'conversation' && candidate.conversation.unavailable) return
+    if (isHomeComposer) trackHome('home.composer.mention', { action: 'select', type: MENTION_TELEMETRY_TYPE[candidate.kind] })
     if (candidate.kind === 'digitalHuman') void selectDigitalHumanMention(candidate.appId)
     else insertMention(candidate.text)
   }
 
   const handleSlashSelect = (item: SlashCommandItem) => {
+    if (isHomeComposer) {
+      // Command names are never sent: non-skill commands include user-defined ones.
+      trackHome('home.composer.slash', { action: 'select', kind: item.category })
+    }
+    // A command is not a goal.
+    if (goalMode) goal?.exit()
     const newContent = item.command + ' '
     setContent(newContent)
     setSlashMenuOpen(false)
@@ -759,14 +1020,63 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     })
   }
 
+  const trackSend = (text: string, sentImages: ImageAttachment[], isInject: boolean) => {
+    const origin = composerOriginRef.current
+    const mentioned = mentionInsertedRef.current
+    composerOriginRef.current = null
+    mentionInsertedRef.current = false
+    // The onboarding send is a scripted demo, not a real turn.
+    if (!digitalHumanSelector || isOnboardingSendStep) return
+    const appId = digitalHumanSelector.current ?? undefined
+    trackHome('home.composer.send', {
+      source: origin?.source ?? (text.startsWith('/') ? 'slash' : mentioned ? 'mention' : 'manual'),
+      chip: origin?.source === 'chip' ? origin.chip : undefined,
+      recipient: appId ? 'digital_human' : 'halo',
+      appId,
+      hasImages: sentImages.length > 0,
+      imageCount: sentImages.length,
+      isInject,
+      lenBucket: lenBucket(text.length),
+      entry: takeEntry(),
+    })
+  }
+
   // Handle send — routes to inject path when generation is in progress
   const handleSend = () => {
+    if (uploading) return
     const textToSend = isOnboardingSendStep ? onboardingPrompt : content.trim()
+    // Sending means the writing is done: comments still open in the content go in as written.
+    commitCommentEdits(referenceKey)
+    const referenceCount = useComposerReferencesStore.getState().drafts.get(referenceKey)?.length ?? 0
+    // Resolving false (or failing) means nothing went out: what was taken comes back, in order.
+    const handBackIfRefused = (result: unknown, sentImages: ImageAttachment[], sentReferences: ContentReference[], inject: boolean) => {
+      if (!draftKey || !(result instanceof Promise)) return
+      const key = draftKey
+      const restoreDraft = () => {
+        const recoveryKey = currentDraftKey.current ?? key
+        const saved = inputDrafts.get(recoveryKey)
+        const restored = {
+          content: saved?.content || textToSend,
+          images: saved?.images.length ? saved.images : sentImages,
+        }
+        inputDrafts.set(recoveryKey, restored)
+        useComposerReferencesStore.getState().restore(recoveryKey, sentReferences)
+        draftRecoverySubscribers.get(recoveryKey)?.forEach(listener => listener(restored))
+      }
+      void result.then(accepted => {
+        if (accepted === false) restoreDraft()
+      }).catch(error => {
+        console.warn('[InputArea] Send failed', { draftKey: key, inject, error })
+        restoreDraft()
+      })
+    }
 
-    if (isGenerating) {
-      // Mid-turn inject: text only (no images, no thinking toggle)
-      if (textToSend && onInject) {
-        onInject(textToSend)
+    if (isGenerating && !goalMode) {
+      // Mid-turn inject: text and cards (no images, no thinking toggle)
+      if ((textToSend || referenceCount > 0) && onInject) {
+        trackSend(textToSend, [], true)
+        const injected = useComposerReferencesStore.getState().take(referenceKey)
+        handBackIfRefused(onInject(textToSend, injected.length > 0 ? injected : undefined), [], injected, true)
         setContent('')
         if (draftKey) useChatStore.getState().clearComposerDraft(draftKey)
         handleMentionClose()
@@ -776,37 +1086,31 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
       return
     }
 
-    const hasContent = textToSend || images.length > 0
+    const hasContent = goalMode ? goal!.canSubmit(textToSend) : (textToSend || images.length > 0 || referenceCount > 0)
     if (hasContent) {
-      const sentImages = images
-      const result = onSend(textToSend, sentImages.length > 0 ? sentImages : undefined, thinkingEnabled)
+      // A goal set mid-turn goes to the running turn, not a new message, so attachments wait for the next one.
+      const keepImages = goalMode && isGenerating
+      const sentImages = keepImages ? [] : images
+      // The onboarding send is a scripted demo: the cards stay for a real message.
+      const sentReferences = keepImages || isOnboardingSendStep ? [] : useComposerReferencesStore.getState().take(referenceKey)
+      trackSend(textToSend, sentImages, false)
+      const result = goalMode
+        ? goal!.submit(textToSend, sentImages.length > 0 ? sentImages : undefined, THINKING_ENABLED, sentReferences)
+        : onSend(
+          textToSend,
+          sentImages.length > 0 ? sentImages : undefined,
+          THINKING_ENABLED,
+          sentReferences.length > 0 ? { references: sentReferences } : undefined,
+        )
       if (draftKey) inputDrafts.delete(draftKey)
-      if (draftKey && result instanceof Promise) {
-        const restoreDraft = () => {
-          const recoveryKey = currentDraftKey.current ?? draftKey
-          const saved = inputDrafts.get(recoveryKey)
-          const restored = {
-            content: saved?.content || textToSend,
-            images: saved?.images.length ? saved.images : sentImages,
-          }
-          inputDrafts.set(recoveryKey, restored)
-          draftRecoverySubscribers.get(recoveryKey)?.forEach(listener => listener(restored))
-        }
-        void result.then(accepted => {
-          if (accepted === false) restoreDraft()
-        }).catch(error => {
-          console.warn('[InputArea] Send failed', { draftKey, error })
-          restoreDraft()
-        })
-      }
+      handBackIfRefused(result, sentImages, sentReferences, false)
 
       if (!isOnboardingSendStep) {
         setContent('')
         if (draftKey) useChatStore.getState().clearComposerDraft(draftKey)
-        setImages([])  // Clear images after send
+        if (!keepImages) setImages([])
         handleMentionClose()
         handleSlashClose()
-        // Don't reset thinkingEnabled - user might want to keep it on
         // Reset height
         if (textareaRef.current) {
           textareaRef.current.style.height = 'auto'
@@ -827,7 +1131,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     if (e.nativeEvent.isComposing) return
 
     // ── @ mention menu navigation ───────────────────────────────────────────────
-    if (mentionMenuOpen && mentionCandidates.length > 0) {
+    if (mentionMenuVisible && mentionCandidates.length > 0) {
       const mLen = mentionCandidates.length
       if (e.key === 'ArrowDown') {
         e.preventDefault()
@@ -889,6 +1193,22 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // A panel the AI opened leaves the keyboard here: Esc closes it rather than stopping the turn.
+    if (showAttachMenu && e.key === 'Escape') {
+      e.preventDefault()
+      setShowAttachMenu(false)
+      return
+    }
+
+    // Leaving goal mode keeps the text as an ordinary draft. Esc here never
+    // stops a running turn; a second Esc, outside goal mode, does.
+    if (goalMode && (e.key === 'Escape' || (e.key === 'Backspace' && content === ''))) {
+      e.preventDefault()
+      e.stopPropagation()
+      goal?.exit()
+      return
+    }
+
     // Mobile: send via button only
     // PC: respect sendKeyMode setting
     if (!isMobile()) {
@@ -914,15 +1234,94 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
   }
 
   // In onboarding mode, can always send (prefilled content)
-  // Can send if has text OR has images (and not processing/generating)
-  // During generation (inject mode): only plain text is allowed, no images
-  // Normal mode: text or images, not currently processing
+  // Can send if has text, images or references — a comment still being written counts (and not processing images)
+  // During generation (inject mode): text and references, no images
+  const hasReferences = references.length > 0 || writingComment
   const canSend = isOnboardingSendStep ||
-    (isGenerating
-      ? (content.trim().length > 0 && !!onInject)
-      : ((content.trim().length > 0 || images.length > 0) && !isProcessingImages)
+    (goalMode
+      ? (goal!.canSubmit(content) && !isProcessingImages && !uploading)
+      : isGenerating
+        ? ((content.trim().length > 0 || hasReferences) && !!onInject && !uploading)
+        : ((content.trim().length > 0 || images.length > 0 || hasReferences) && !isProcessingImages && !uploading)
     )
   const hasImages = images.length > 0
+  const cardRadius = standalone ? 'rounded-[22px]' : 'rounded-[18px]'
+
+  const closeAttachMenu = useCallback((reason: 'select' | 'escape' | 'outside') => {
+    setShowAttachMenu(false)
+    if (reason === 'escape') textareaRef.current?.focus()
+  }, [])
+
+  const digitalHumanBlockedReason = !digitalHumanSelector || digitalHumanSelector.options.length === 0
+    ? t('No digital humans in this space yet')
+    : digitalHumanSelector.locked
+      ? t('Switch recipient after the current reply finishes')
+      : null
+  const conversationBlockedReason = mentionConversations.length === 0 ? t('No other conversations in this space yet') : null
+  const attachedCount = images.length + references.filter(ref => ref.source.kind === 'path').length
+
+  // Add → things this message carries; Context → where the work points;
+  // Capabilities → what the AI may use. Unavailable rows stay visible and say why.
+  const menuSections: ComposerMenuSection[] = [
+    {
+      id: 'add',
+      title: t('Add'),
+      items: [{
+        id: 'files',
+        icon: <Paperclip size={16} />,
+        label: canAttachLocalPaths ? t('Files and folders') : t('Files'),
+        description: canAttachLocalPaths
+          ? t('Attach from this computer; AI reads them where they are')
+          : t('Upload from this device into the workspace; images go to the AI directly'),
+        meta: attachedCount > 0 ? String(attachedCount) : undefined,
+        disabledReason: isProcessingImages ? t('Processing image...') : null,
+        onSelect: () => void handleAttachClick(),
+      }],
+    },
+    {
+      id: 'context',
+      title: t('Context'),
+      items: [
+        ...(goal ? [{
+          id: 'goal',
+          icon: <Target size={16} />,
+          label: goal.menuItem.label,
+          description: goal.menuItem.description,
+          onSelect: goal.menuItem.onSelect,
+        }] : []),
+        {
+          id: 'conversation',
+          icon: <MessagesSquare size={16} />,
+          label: t('Reference a conversation'),
+          description: t('Let AI read another conversation, or message it directly'),
+          disabledReason: conversationBlockedReason,
+          onSelect: () => handleOpenMentionMenu('conversation'),
+        },
+        {
+          id: 'digital-human',
+          icon: <Bot size={16} />,
+          label: t('Chat with a digital human'),
+          description: t('Hand this message to one of your digital humans'),
+          disabledReason: digitalHumanBlockedReason,
+          onSelect: () => handleOpenMentionMenu('digital_human'),
+        },
+      ],
+    },
+    ...(toolsets.list.length > 0 ? [{
+      id: 'capabilities',
+      title: t('Capabilities'),
+      items: sortToolsets(toolsets.list).map(ts => ({
+        id: `toolset:${ts.id}`,
+        icon: toolsetIcon(ts.id),
+        label: toolsetLabel(t, ts),
+        description: toolsetDescription(t, ts),
+        toggle: { checked: ts.open, onChange: () => toolsets.toggle(ts) },
+        attention: toolsets.requested.has(ts.id) && !ts.open,
+      })),
+    }] : []),
+  ]
+  // While a turn runs nothing can be attached; capabilities can change, from the next message on.
+  const panelSections = isGenerating ? menuSections.filter(section => section.id === 'capabilities') : menuSections
 
   return (
     <div className={`
@@ -930,7 +1329,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
       transition-[padding] duration-300 ease-out
       ${standalone ? '' : isCompact ? 'px-3 py-2' : 'pt-3 px-6 pb-[18px]'}
     `}>
-      <div className={standalone ? '' : isCompact ? '' : 'max-w-[720px] mx-auto'}>
+      <div className={standalone ? '' : isCompact ? '' : 'max-w-chat mx-auto'}>
         {/* Error toast notification */}
         {imageError && (
           <div className="mb-2 p-3 rounded-xl bg-destructive/10 border border-destructive/20
@@ -944,7 +1343,6 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/jpeg,image/png,image/gif,image/webp"
           multiple
           className="hidden"
           onChange={handleFileInputChange}
@@ -954,15 +1352,19 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
             Sibling above the input card; the input box itself is untouched. */}
         <LiveSessionsHeader />
 
+        {/* Inset past the card's corner radius so the shelf sits on its straight top edge. */}
+        {goal && <div className={standalone ? 'mx-6' : 'mx-5'}>{goal.shelf}</div>}
+
         {/* Input container — radius kept at the prototype's literal values
             (its own core visual feature, not on the 8/10/12/16 scale):
             22px centered/standalone, 18px once docked at the bottom. */}
         <div
+          ref={cardRef}
           className={`
             relative flex flex-col border bg-card shadow-soft
             transition-colors ease-halo
-            ${standalone ? 'rounded-[22px]' : 'rounded-[18px]'}
-            ${isFocused ? 'border-primary ring-[3px] ring-primary/[0.12]' : 'border-border'}
+            ${cardRadius}
+            border-border ${isFocused ? 'ring-[3px] ring-primary/[0.12]' : ''}
             ${isDragOver ? 'ring-2 ring-primary/50 bg-primary/5' : ''}
           `}
           onDragOver={handleDragOver}
@@ -971,8 +1373,21 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
         >
           {/* Slash-command autocomplete menu — floats above the input box.
               Only rendered when there are actual matches; no empty-state UI. */}
+          {showAttachMenu && !isOnboardingSendStep && panelSections.length > 0 && (
+            <ComposerMenu
+              // Rows come and go when a turn ends; a fresh panel keeps the keyboard highlight on the right row.
+              key={isGenerating ? 'turn-running' : 'idle'}
+              sections={panelSections}
+              takeFocus={!attachMenuByRequest}
+              anchorRef={cardRef}
+              triggerRef={plusTriggerRef}
+              onClose={closeAttachMenu}
+              radiusClassName={cardRadius}
+            />
+          )}
           {slashMenuOpen && filteredSlashCommands.length > 0 && (
             <SlashCommandMenu
+              radiusClassName={cardRadius}
               items={filteredSlashCommands}
               selectedIndex={slashSelectedIndex}
               onSelect={handleSlashSelect}
@@ -981,9 +1396,9 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
           )}
           {/* @ mention autocomplete menu — one menu, one keyboard model, one
               row shell; only the row content differs per candidate kind. */}
-          {mentionMenuOpen && mentionCandidates.length > 0 && (
-            <div className="absolute bottom-full left-0 mb-2 w-full max-w-md bg-popover border border-border rounded-xl shadow-lg z-30 overflow-hidden">
-              <div className="max-h-[336px] overflow-y-auto py-1">
+          {mentionMenuVisible && mentionCandidates.length > 0 && (
+            <div className={`absolute bottom-full -inset-x-px mb-2 bg-popover border border-border/70 ${cardRadius} shadow-soft z-30 overflow-hidden animate-composer-rise`}>
+              <div className="max-h-[336px] overflow-y-auto py-1 scrollbar-thin">
                 {mentionGroups.map(group => (
                   <div key={group.kind}>
                     {/* "More exists" rides on the heading rather than a line
@@ -1006,6 +1421,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
                             e.preventDefault()
                             selectMentionCandidate(candidate)
                           }}
+                          aria-disabled={candidate.kind === 'conversation' && candidate.conversation.unavailable ? true : undefined}
                           className={`w-full flex items-center gap-2 text-left min-h-[38px] py-1 border-l-2 ${isSelected ? 'bg-primary/10 border-primary pl-2.5 pr-3' : 'border-transparent pl-2.5 pr-3 hover:bg-muted/50'}`}
                         >
                           {candidate.kind === 'digitalHuman' ? (
@@ -1041,15 +1457,16 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
                 <span>↑↓ {t('navigate')}</span>
                 <span>↵ {t('select')}</span>
                 <span>Esc {t('close')}</span>
+                {mentionFilesIndexing && <span className="ml-auto">{t('Indexing files…')}</span>}
               </div>
             </div>
           )}
           {/* Stays open with zero matches: a silently empty "@" is
               indistinguishable from the keystroke not registering. */}
-          {mentionMenuOpen && mentionCandidates.length === 0 && (
-            <div className="absolute bottom-full left-0 mb-2 w-56 bg-popover border border-border rounded-xl shadow-lg z-30 overflow-hidden">
+          {mentionMenuVisible && mentionCandidates.length === 0 && (
+            <div className={`absolute bottom-full -inset-x-px mb-2 bg-popover border border-border/70 ${cardRadius} shadow-soft z-30 overflow-hidden animate-composer-rise`}>
               <div className="px-3 py-4 text-xs text-muted-foreground text-center">
-                {t('No matching results found')}
+                {mentionFilesIndexing ? t('Indexing files…') : t('No matching results found')}
               </div>
             </div>
           )}
@@ -1075,6 +1492,12 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
               <span>{t('Processing image...')}</span>
             </div>
           )}
+          {uploading && (
+            <div className="px-4 py-2 flex items-center gap-2 text-xs text-muted-foreground border-b border-border/30">
+              <Loader2 size={14} className="animate-spin" />
+              <span>{t('Uploading {{count}} file(s)…', { count: uploadingCount })}</span>
+            </div>
+          )}
 
           {/* Drag overlay */}
           {isDragOver && (
@@ -1082,11 +1505,17 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
               bg-primary/5 rounded-2xl border-2 border-dashed border-primary/30
               pointer-events-none z-10">
               <div className="flex flex-col items-center gap-2 text-primary/70">
-                <ImagePlus size={24} />
-                <span className="text-sm font-medium">{t('Drop to add images')}</span>
+                <Paperclip size={22} />
+                <span className="text-sm font-medium">
+                  {canAttachLocalPaths ? t('Drop files or folders to attach') : t('Drop files to attach')}
+                </span>
               </div>
             </div>
           )}
+
+          {/* References and attached files, on the same layer as the goal chip. */}
+          <ComposerReferenceChips composerKey={referenceKey} references={references} baseDir={spaceRoot} className="px-3.5 pt-2.5" />
+          {goalMode && goal.chip}
 
           {/* Textarea area */}
           <div className="px-4 pt-3.5">
@@ -1097,6 +1526,10 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
                 if (isOnboardingSendStep) return
                 const val = e.target.value
                 setContent(val)
+                if (!val) {
+                  composerOriginRef.current = null
+                  mentionInsertedRef.current = false
+                }
                 // Real typing always falls back to the session's live command
                 // list — a stale prefill preview shouldn't keep overriding it.
                 setSlashPreviewOverride(null)
@@ -1113,6 +1546,9 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
                   !afterSlash.includes('\n') &&
                   afterSlash.length <= maxCommandLen
                 if (looksLikeCommand) {
+                  if (!slashMenuOpen && isHomeComposer) {
+                    trackHomeThrottled('slash-open', 1000, 'home.composer.slash', { action: 'open' })
+                  }
                   setSlashMenuOpen(true)
                   setSlashSelectedIndex(0)
                   setMentionMenuOpen(false)
@@ -1129,7 +1565,10 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
                 const hasPeople = !!digitalHumanSelector && !digitalHumanSelector.locked
                   && digitalHumanSelector.options.some(o => !query || o.name.toLowerCase().includes(query.trim().toLowerCase()))
                 const hasConversations = decideConversationMentionCandidates({ query, conversations: mentionConversations }).shouldOpenMenu
-                if (nextMentionMatch && (hasPeople || hasConversations || mentionArtifacts.length > 0)) {
+                if (nextMentionMatch && (hasPeople || hasConversations || !!mentionSpaceId)) {
+                  const filesOnly = !hasPeople && !hasConversations
+                  if (!mentionMenuOpen && !filesOnly) trackMentionOpen()
+                  setMentionFilesOnly(filesOnly)
                   setMentionMenuOpen(true)
                   setMentionSelectedIndex(0)
                 } else {
@@ -1147,7 +1586,7 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
               // redundancy the docked (post-first-message) state inherits
               // the same placeholder for, since it's the same InputArea
               // instance either way.
-              placeholder={placeholder || t('@ for digital humans, files and conversations, / for skills and commands')}
+              placeholder={goalMode ? goal.placeholder : placeholder || t('@ for digital humans, files and conversations, / for skills and commands')}
               readOnly={isOnboardingSendStep}
               rows={1}
               className={`w-full bg-transparent resize-none text-[15px] leading-[1.5]
@@ -1162,96 +1601,71 @@ export function InputArea({ onSend, onInject, onStop, isGenerating, placeholder,
           <InputToolbar
             isGenerating={isGenerating}
             isOnboarding={isOnboardingSendStep}
-            isProcessingImages={isProcessingImages}
-            thinkingEnabled={thinkingEnabled}
-            onThinkingToggle={() => setThinkingEnabled(!thinkingEnabled)}
+            canOpenMenu={panelSections.length > 0}
             showAttachMenu={showAttachMenu}
-            onAttachMenuChange={setShowAttachMenu}
-            onImageClick={handleImageButtonClick}
-            imageCount={images.length}
-            maxImages={MAX_IMAGES}
-            onOpenMentionMenu={handleOpenMentionMenu}
-            digitalHumanBlockedReason={
-              !digitalHumanSelector || digitalHumanSelector.options.length === 0
-                ? t('No digital humans in this space yet')
-                : digitalHumanSelector.locked
-                  ? t('Switch recipient after the current reply finishes')
-                  : null
-            }
-            conversationBlockedReason={mentionConversations.length === 0 ? t('No other conversations in this space yet') : null}
+            onAttachMenuToggle={handleAttachMenuToggle}
+            plusTriggerRef={plusTriggerRef}
+            extraToolsets={toolsets.extraEnabled}
             canSend={canSend}
             onSend={handleSend}
             onStop={onStop}
             sendKeyMode={sendKeyMode}
-            visionEnabled={visionEnabled}
             toolbarSlot={toolbarSlot}
-            hideToolsetControls={hideToolsetControls}
+            sendSlot={sendSlot}
             hideKnowledgeControls={hideKnowledgeControls}
             digitalHumanSelector={digitalHumanSelector}
+            sendTitle={goalMode ? goal.sendTitle : undefined}
           />
         </div>
       </div>
     </div>
   )
-}
+})
 
 /**
  * Input Toolbar - Bottom action bar
- * Extracted as a separate component for maintainability and future extensibility
  *
- * Layout: [+attachment] [knowledge] [tools] [thinking] ──── [send]
+ * Layout: [recipient] [+] [extra capabilities] [thinking] [knowledge] ──── [send]
  */
 interface InputToolbarProps {
   toolbarSlot?: React.ReactNode
+  sendSlot?: React.ReactNode
   isGenerating: boolean
   isOnboarding: boolean
-  isProcessingImages: boolean
-  thinkingEnabled: boolean
-  onThinkingToggle: () => void
+  /** Whether the "+" panel has rows now: while a turn runs, only capability switches. */
+  canOpenMenu: boolean
   showAttachMenu: boolean
-  onAttachMenuChange: (open: boolean) => void
-  onImageClick: () => void
-  imageCount: number
-  maxImages: number
-  /** Inserts "@" and opens the mention menu — same code path as typing "@" by hand. Backs both menu entries that lead there. */
-  onOpenMentionMenu: () => void
-  /** Why "Chat with a digital human" cannot be used now, or null. Disables — never hides — the entry, so it stays discoverable. */
-  digitalHumanBlockedReason: string | null
-  /** Why "Reference a conversation" cannot be used now, or null. Same disable-never-hide rule. */
-  conversationBlockedReason: string | null
+  onAttachMenuToggle: () => void
+  plusTriggerRef: React.RefObject<HTMLButtonElement>
+  /** Capabilities on beyond the defaults — the only toolset state shown at rest. */
+  extraToolsets: ToolsetStatus[]
   canSend: boolean
   onSend: () => void
   onStop?: () => void
   sendKeyMode: 'enter' | 'ctrl-enter'
-  visionEnabled: boolean
-  hideToolsetControls: boolean
   hideKnowledgeControls: boolean
   digitalHumanSelector?: DigitalHumanSelectorConfig
+  /** Overrides the Send tooltip, e.g. while Send sets a goal. */
+  sendTitle?: string
 }
 
 function InputToolbar({
   toolbarSlot,
+  sendSlot,
   isGenerating,
   isOnboarding,
-  isProcessingImages,
-  thinkingEnabled,
-  onThinkingToggle,
+  canOpenMenu,
   showAttachMenu,
-  onAttachMenuChange,
-  onImageClick,
-  imageCount,
-  maxImages,
-  onOpenMentionMenu,
-  digitalHumanBlockedReason,
-  conversationBlockedReason,
+  onAttachMenuToggle,
+  plusTriggerRef,
+  extraToolsets,
   canSend,
   onSend,
   onStop,
   sendKeyMode,
-  visionEnabled,
-  hideToolsetControls,
   hideKnowledgeControls,
-  digitalHumanSelector
+  digitalHumanSelector,
+  sendTitle
 }: InputToolbarProps) {
   const { t } = useTranslation()
   return (
@@ -1267,132 +1681,38 @@ function InputToolbar({
           <DigitalHumanSelector {...digitalHumanSelector} />
         )}
 
-        {/* A single available action shows directly as its own icon button
-            instead of hiding behind a "+" popover; the popover form only
-            earns its keep once a second action exists. */}
-        {!isGenerating && !isOnboarding && (
-          ATTACH_ACTION_COUNT === 1 ? (
-            <button
-              type="button"
-              onClick={onImageClick}
-              disabled={isProcessingImages || imageCount >= maxImages}
-              title={!visionEnabled ? t('Current model has no vision — images will be read via local OCR (text only)') : t('Add image')}
-              className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-sm cursor-pointer
-                transition-colors ease-halo
-                ${imageCount > 0
-                  ? 'bg-primary/[0.12] text-accent-on-dark'
-                  : 'text-muted-foreground hover:text-foreground hover:bg-secondary'
-                }
-                ${(isProcessingImages || imageCount >= maxImages) ? 'opacity-50 cursor-not-allowed' : ''}
-              `}
-            >
-              <ImagePlus size={17} />
-            </button>
-          ) : (
-            <Popover
-              open={showAttachMenu}
-              onOpenChange={(open) => {
-                if (open && isProcessingImages) return
-                onAttachMenuChange(open)
-              }}
-            >
-              <PopoverTrigger
-                title={t('More actions')}
-                className={`w-8 h-8 shrink-0 items-center justify-center rounded-sm cursor-pointer
-                  transition-all duration-150
-                  ${showAttachMenu
-                    ? 'bg-primary/[0.12] text-accent-on-dark'
-                    : 'text-muted-foreground/60 hover:text-muted-foreground hover:bg-secondary'
-                  }
-                  ${isProcessingImages ? 'opacity-50 cursor-not-allowed' : ''}
-                `}
-              >
-                <Plus size={17} className={`transition-transform duration-200 ${showAttachMenu ? 'rotate-45' : ''}`} />
-              </PopoverTrigger>
-
-              <PopoverContent side="top" align="start" sideOffset={8} className="py-1.5 rounded-xl min-w-[160px]">
-                <button
-                  onClick={onImageClick}
-                  disabled={imageCount >= maxImages}
-                  className={`w-full px-3 py-2 flex items-center gap-3 text-sm
-                    transition-colors duration-150
-                    ${imageCount >= maxImages
-                      ? 'text-muted-foreground/40 cursor-not-allowed'
-                      : 'text-foreground hover:bg-muted/50'
-                    }
-                  `}
-                  title={!visionEnabled ? t('Current model has no vision — images will be read via local OCR (text only)') : undefined}
-                >
-                  <ImagePlus size={16} className="text-muted-foreground" />
-                  <span>{t('Add image')}</span>
-                  {!visionEnabled && imageCount === 0 && (
-                    <span className="ml-auto text-xs text-muted-foreground/60">
-                      {t('via OCR')}
-                    </span>
-                  )}
-                  {imageCount > 0 && (
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      {imageCount}/{maxImages}
-                    </span>
-                  )}
-                </button>
-                {/* Both entries below open the same "@" menu; only the label
-                    and the availability check differ, so a user who thinks in
-                    "talk to someone" and one who thinks in "point at a past
-                    conversation" each find their own way in. */}
-                <button
-                  onClick={onOpenMentionMenu}
-                  disabled={!!digitalHumanBlockedReason}
-                  className={`w-full px-3 py-2 flex items-center gap-3 text-sm
-                    transition-colors duration-150
-                    ${digitalHumanBlockedReason
-                      ? 'text-muted-foreground/40 cursor-not-allowed'
-                      : 'text-foreground hover:bg-muted/50'
-                    }
-                  `}
-                  title={digitalHumanBlockedReason ?? undefined}
-                >
-                  <Bot size={16} className="text-muted-foreground" />
-                  <span>{t('Chat with a digital human')}</span>
-                </button>
-                <button
-                  onClick={onOpenMentionMenu}
-                  disabled={!!conversationBlockedReason}
-                  className={`w-full px-3 py-2 flex items-center gap-3 text-sm
-                    transition-colors duration-150
-                    ${conversationBlockedReason
-                      ? 'text-muted-foreground/40 cursor-not-allowed'
-                      : 'text-foreground hover:bg-muted/50'
-                    }
-                  `}
-                  title={conversationBlockedReason ?? undefined}
-                >
-                  <MessageSquare size={16} className="text-muted-foreground" />
-                  <span>{t('Reference a conversation')}</span>
-                </button>
-              </PopoverContent>
-            </Popover>
-          )
+        {canOpenMenu && !isOnboarding && (
+          <button
+            ref={plusTriggerRef}
+            type="button"
+            onClick={onAttachMenuToggle}
+            aria-label={isGenerating ? t('Capabilities') : t('Add files, context and capabilities')}
+            aria-haspopup="menu"
+            aria-expanded={showAttachMenu}
+            title={isGenerating ? t('Capabilities') : t('Add files, context and capabilities')}
+            className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-full transition-colors duration-150
+              ${showAttachMenu
+                ? 'bg-secondary text-foreground'
+                : 'text-muted-foreground hover:text-foreground hover:bg-secondary'
+              }`}
+          >
+            <Plus size={18} className={`transition-transform duration-200 ease-halo ${showAttachMenu ? 'rotate-45' : ''}`} />
+          </button>
         )}
 
-        {/* On-demand toolsets (catalog menu + activation pills) */}
-        {!isGenerating && !isOnboarding && !hideToolsetControls && <ToolsetControls />}
-
-        {/* Thinking mode toggle - always show full label, no expansion */}
-        {!isGenerating && !isOnboarding && (
+        {/* Quiet reminder of capabilities turned on beyond the defaults; opens the panel. */}
+        {!isGenerating && !isOnboarding && extraToolsets.length > 0 && (
           <button
-            onClick={onThinkingToggle}
-            className={`h-8 shrink-0 flex items-center gap-[5px] px-[9px] rounded-sm
-              transition-colors ease-halo
-              ${thinkingEnabled
-                ? 'bg-primary/[0.12] text-accent-on-dark'
-                : 'text-muted-foreground hover:text-foreground hover:bg-secondary'
-              }
-            `}
-            title={thinkingEnabled ? t('Disable Deep Thinking') : t('Enable Deep Thinking')}
+            type="button"
+            onClick={onAttachMenuToggle}
+            title={extraToolsets.map(ts => toolsetLabel(t, ts)).join(', ')}
+            aria-label={t('Capabilities on: {{names}}', { names: extraToolsets.map(ts => toolsetLabel(t, ts)).join(', ') })}
+            className="h-8 shrink-0 flex items-center gap-1.5 px-2 rounded-full text-muted-foreground
+              hover:text-foreground hover:bg-secondary transition-colors duration-150"
           >
-            <Lightbulb size={17} />
-            <span className="hidden sm:inline text-xs whitespace-nowrap">{t('Deep Thinking')}</span>
+            {extraToolsets.map(ts => (
+              <span key={ts.id} className="inline-flex">{toolsetIcon(ts.id, 15)}</span>
+            ))}
           </button>
         )}
 
@@ -1404,6 +1724,7 @@ function InputToolbar({
 
       {/* Right section: Stop (when generating) + Send — fixed, never scrolls */}
       <div className="flex flex-nowrap items-center gap-1 shrink-0">
+        {sendSlot && !isOnboarding && <div className="flex items-center">{sendSlot}</div>}
         {isGenerating && onStop && (
           <button
             onClick={onStop}
@@ -1429,11 +1750,12 @@ function InputToolbar({
               }
             `}
             title={
-              isGenerating
+              sendTitle ? sendTitle
+              : isGenerating
                 ? t('Add to queue')
                 : sendKeyMode === 'ctrl-enter'
-                  ? (thinkingEnabled ? t('Send (Deep Thinking) — Ctrl+Enter') : t('Send — Ctrl+Enter'))
-                  : (thinkingEnabled ? t('Send (Deep Thinking) — Enter') : t('Send — Enter'))
+                  ? t('Send — Ctrl+Enter')
+                  : t('Send — Enter')
             }
           >
             <svg className="w-[17px] h-[17px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>

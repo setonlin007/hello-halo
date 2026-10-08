@@ -75,6 +75,12 @@ export type MemorySchema = Record<string, MemoryField>
 export interface ScheduleSourceConfig {
   every?: string
   cron?: string
+  /**
+   * Run only on mainland China working days, holidays and make-up workdays
+   * included. The schedule decides the times; the calendar decides which days
+   * count, so it should fire every day (not Monday to Friday).
+   */
+  workday_calendar?: boolean
 }
 
 export interface FileSourceConfig {
@@ -137,6 +143,11 @@ export interface SubscriptionDef {
   source: SubscriptionSource
   frequency?: FrequencyDef
   config_key?: string
+}
+
+/** Whether a subscription is a schedule limited to mainland China working days. */
+export function usesWorkdayCalendar(sub: SubscriptionDef): boolean {
+  return sub.source.type === 'schedule' && sub.source.config.workday_calendar === true
 }
 
 // ============================================

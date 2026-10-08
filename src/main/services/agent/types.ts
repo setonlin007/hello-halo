@@ -5,7 +5,12 @@
  * This file has no dependencies and is imported by all other agent modules.
  */
 
-import type { ReasoningEffortSetting } from '../../../shared/constants/reasoning-effort'
+import type { ReasoningEffortLevel, ReasoningEffortSetting } from '../../../shared/constants/reasoning-effort'
+import type { Goal, GoalInput } from '../../../shared/types/goal'
+import type { ApiRetryState } from '../../../shared/types/api-retry'
+import type { ContentReference } from '../../../shared/types/content-reference'
+import type { MessageTask } from '../../../shared/types/message-task'
+import type { BackendRequestConfig } from '../../../shared/types/ai-sources'
 
 // ============================================
 // API Credentials
@@ -25,8 +30,6 @@ export interface ResolvedModelCapabilities {
   maxOutputTokens: number
   contextWindow: number
   reasoningEffort?: ReasoningEffortSetting
-  /** User opted this model into a window above CC's 200K intrinsic. */
-  extendedContext?: boolean
   /**
    * False when `maxOutputTokens` is only Halo's blanket fallback — no preset,
    * no catalog entry, no user value. Required rather than optional so every
@@ -34,6 +37,8 @@ export interface ResolvedModelCapabilities {
    * guess on the wire for exactly the models Halo knows nothing about.
    */
   maxOutputTokensConfigured: boolean
+  /** The model thinks adaptively instead of against a token budget. */
+  adaptiveThinking?: boolean
 }
 
 /**
@@ -41,6 +46,11 @@ export interface ResolvedModelCapabilities {
  * Unified structure for custom API and OAuth sources
  */
 export interface ApiCredentials {
+  sourceId?: BackendRequestConfig['sourceId']
+  /** Captured with this credential snapshot, before asynchronous SDK preparation. */
+  credentialsGeneration?: number | string
+  codexModelCapabilities?: BackendRequestConfig['codexModelCapabilities']
+  profileArn?: BackendRequestConfig['profileArn']
   baseUrl: string
   apiKey: string
   model: string
@@ -110,29 +120,8 @@ export type { ImageAttachment, ImageMediaType }
 // Canvas Context
 // ============================================
 
-/**
- * Canvas Context - Injected into messages to provide AI awareness of user's open tabs
- * This allows AI to naturally understand what the user is currently viewing
- */
-export interface CanvasContext {
-  isOpen: boolean
-  tabCount: number
-  activeTab: {
-    type: string  // 'browser' | 'code' | 'markdown' | 'image' | 'pdf' | 'text' | 'json' | 'csv' | 'terminal'
-    title: string
-    url?: string   // For browser/pdf tabs
-    path?: string  // For file tabs
-    terminalSessionId?: string  // For terminal tabs - the pty session id the AI drives via terminal_* tools
-  } | null
-  tabs: Array<{
-    type: string
-    title: string
-    url?: string
-    path?: string
-    terminalSessionId?: string  // For terminal tabs - the pty session id the AI drives via terminal_* tools
-    isActive: boolean
-  }>
-}
+export type { CanvasContext } from '../../../shared/types/canvas-context'
+import type { CanvasContext } from '../../../shared/types/canvas-context'
 
 // ============================================
 // Agent Request
@@ -145,10 +134,18 @@ export interface AgentRequest {
   resumeSessionId?: string
   images?: ImageAttachment[]  // Optional images for multi-modal messages
   thinkingEnabled?: boolean   // Enable extended thinking; depth comes from the model's reasoning effort
+  reasoningEffort?: ReasoningEffortLevel  // Depth picked for this send; overrides the toggle and the model config
   model?: string              // Model to use (for future model switching)
   canvasContext?: CanvasContext  // Current canvas state for AI awareness
   knowledgeBaseId?: string         // When set, run as a "chat with this knowledge base" turn:
                               // working dir = the KB's wiki dir, that KB injected into the prompt
+  goal?: GoalInput            // Set as the conversation goal before this message runs (engines with features.goal)
+  /** Places the user pointed at, in the order they added them; already checked (shared/content-reference parseReferences). */
+  references?: ContentReference[]
+  /** Built-in task this message starts. Set in-process only (services/code-review); no transport carries it. */
+  task?: MessageTask
+  /** What `task` asks the model, written by the task's owner; in-process only, never persisted. */
+  taskInstructions?: string
 }
 
 // ============================================
@@ -229,6 +226,14 @@ export interface SessionState {
   spaceId: string
   conversationId: string
   thoughts: Thought[]  // Backend accumulates thoughts (Single Source of Truth)
+  /** The model request the engine is waiting to resend, if any (see api-retry.ts). */
+  apiRetry?: PendingApiRetry | null
+}
+
+/** A retry the engine announced; `retryAt` is on this process's clock. */
+export interface PendingApiRetry {
+  state: ApiRetryState
+  retryAt: number
 }
 
 // ============================================
@@ -242,7 +247,7 @@ export interface SessionState {
  * using minimal interface for type safety and maintainability, avoiding inference to never.
  */
 export type V2SDKSession = {
-  send: (message: any) => void
+  send: (message: any) => void | Promise<void>
   stream: () => AsyncIterable<any>
   close: () => void
   interrupt?: () => Promise<void> | void
@@ -251,14 +256,18 @@ export type V2SDKSession = {
   // Optional because alternate engines may not expose them — callers must guard.
   setMaxThinkingTokens?: (maxThinkingTokens: number | null) => Promise<void>
   setPermissionMode?: (mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan') => Promise<void>
+  // Session goal — present on engines advertising `features.goal`.
+  getGoal?: () => Goal | null
+  /** Throws TypeError on a blank objective. */
+  setGoal?: (goal: GoalInput | null) => Goal | null
 }
 
 /**
  * V2 Session info stored in the sessions map
  *
- * Note: session rebuilds are driven by credentialsGeneration (global model /
- * API-config changes), a per-conversation credentialsFingerprint (this
- * conversation's own model/source pin — see session-manager
+ * Note: session rebuilds are driven by credentialsGeneration (global legacy
+ * epoch plus this source's epoch), a per-conversation credentialsFingerprint
+ * (this conversation's own model/source pin — see session-manager
  * computeCredentialsFingerprint), and a knowledgeFingerprint (the conversation's
  * knowledge-base set, baked into the system prompt at creation). Toolset changes
  * are seeded at creation and take effect via an explicit rebuild (toolset broker),
@@ -270,9 +279,9 @@ export interface V2SessionInfo {
   conversationId: string
   createdAt: number
   lastUsedAt: number
-  // Credentials generation at session creation time
-  // Used to detect stale credentials (session created before global config change)
-  credentialsGeneration: number
+  sourceId?: string
+  // Captured before asynchronous creation, so a racing config change stays stale.
+  credentialsGeneration: number | string
   // Per-conversation credential/model fingerprint at session creation time.
   // Detects a change to THIS conversation's model pin (which the global
   // credentialsGeneration does not track), triggering a targeted rebuild.
@@ -290,6 +299,9 @@ export interface V2SessionInfo {
   // undefined for main chat, which builds MCP servers lazily and handles toolset
   // changes via requestSessionRebuild.
   inputsFingerprint?: string
+  // MCP servers the engine reported as failed at this session's latest turn.
+  // The engine does not retry them within the session (see noteSessionMcpStatus).
+  failedMcpServers?: string[]
   // Detaches this session's process-exit listener. Must be called on cleanup:
   // session.close() never calls transport.close(), so the listener would
   // otherwise outlive the session and fire against a successor registered

@@ -13,9 +13,17 @@ import type {
   ApiResponse,
 } from './_shared'
 import type { ActivityEntry, AutomationAppState, AvailableSkill, EscalationAnswerPayload, InstalledApp, PendingDecisionQuery } from '../../shared/apps/app-types'
+import type { AppSpec } from '../../shared/apps/spec-types'
 import type { CapabilityInventory } from '../../shared/apps/capability-inventory'
 import type { AppSpaceChangePreview } from '../../shared/apps/app-environment'
 import type { ImageAttachment } from '../../shared/types/image-attachment'
+import type { CanvasContext } from '../../shared/types/canvas-context'
+import type { ContentReference } from '../../shared/types/content-reference'
+import type { ReasoningEffortLevel } from '../../shared/constants/reasoning-effort'
+import type { MemoryStatus } from '../../shared/types/memory'
+import type { ConversationReminderView } from '../../shared/apps/conversation-reminders'
+import type { Thought, TranscriptPage } from '../../shared/types/transcript'
+import { ensureExtendedServicesReady } from './bootstrap-ready'
 
 export const appsApi = {
   appStartRun: async (appId: string): Promise<ApiResponse<import('../../shared/apps/app-types').AppRunStartInfo>> => {
@@ -23,7 +31,10 @@ export const appsApi = {
     return httpRequest('POST', `/api/apps/${encodeURIComponent(appId)}/runs/start`)
   },
   appGetAllStates: async (): Promise<ApiResponse<Record<string, AutomationAppState>>> => {
-    if (isElectron()) return window.halo.appGetAllStates()
+    if (isElectron()) {
+      await ensureExtendedServicesReady()
+      return window.halo.appGetAllStates()
+    }
     return httpRequest('GET', '/api/apps/states')
   },
   appGetPendingInbox: async (options?: PendingDecisionQuery): Promise<ApiResponse<import('../../shared/apps/app-types').PendingDecisionInbox>> => {
@@ -229,11 +240,11 @@ export const appsApi = {
     return httpRequest('POST', `/api/apps/${appId}/runs/${runId}/continue`)
   },
 
-  appInjectRun: async (appId: string, runId: string, text: string): Promise<ApiResponse> => {
+  appInjectRun: async (appId: string, runId: string, text: string, references?: ContentReference[]): Promise<ApiResponse> => {
     if (isElectron()) {
-      return window.halo.appInjectRun({ appId, runId, text })
+      return window.halo.appInjectRun({ appId, runId, text, ...(references ? { references } : {}) })
     }
-    return httpRequest('POST', `/api/apps/${appId}/runs/${runId}/inject`, { text })
+    return httpRequest('POST', `/api/apps/${appId}/runs/${runId}/inject`, { text, ...(references ? { references } : {}) })
   },
 
   appUpdateConfig: async (appId: string, config: Record<string, unknown>): Promise<ApiResponse> => {
@@ -268,6 +279,17 @@ export const appsApi = {
       return window.halo.appUpdateSpec({ appId, specPatch })
     }
     return httpRequest('PATCH', `/api/apps/${appId}/spec`, specPatch)
+  },
+
+  /** The author's version a digital human's upgrades compare against; null when none is recorded. */
+  appGetAuthorSpec: async (appId: string): Promise<ApiResponse<AppSpec | null>> => {
+    if (isElectron()) return window.halo.appGetAuthorSpec(appId)
+    return httpRequest('GET', `/api/apps/${encodeURIComponent(appId)}/author-spec`)
+  },
+
+  appAdoptAuthorVersion: async (appId: string, entryId: string, fields: string[]): Promise<ApiResponse<ActivityEntry>> => {
+    if (isElectron()) return window.halo.appAdoptAuthorVersion({ appId, entryId, fields })
+    return httpRequest('POST', `/api/apps/${encodeURIComponent(appId)}/activity/${encodeURIComponent(entryId)}/adopt-author-version`, { fields })
   },
 
   appGrantPermission: async (appId: string, permission: string): Promise<ApiResponse> => {
@@ -368,6 +390,34 @@ export const appsApi = {
     return httpRequest('POST', `/api/apps/${appId}/clear-memory`)
   },
 
+  appGetMemoryStatus: async (appId: string): Promise<ApiResponse<MemoryStatus>> => {
+    if (isElectron()) {
+      return window.halo.appGetMemoryStatus(appId)
+    }
+    return httpRequest('GET', `/api/apps/${appId}/memory`)
+  },
+
+  appConsolidateMemory: async (appId: string): Promise<ApiResponse<{ started: boolean; reason?: string }>> => {
+    if (isElectron()) {
+      return window.halo.appConsolidateMemory(appId)
+    }
+    return httpRequest('POST', `/api/apps/${appId}/memory/consolidate`)
+  },
+
+  appListReminders: async (appId: string): Promise<ApiResponse<ConversationReminderView[]>> => {
+    if (isElectron()) {
+      return window.halo.appListReminders(appId)
+    }
+    return httpRequest('GET', `/api/apps/${appId}/reminders`)
+  },
+
+  appCancelReminder: async (appId: string, reminderId: string): Promise<ApiResponse> => {
+    if (isElectron()) {
+      return window.halo.appCancelReminder({ appId, reminderId })
+    }
+    return httpRequest('DELETE', `/api/apps/${appId}/reminders/${encodeURIComponent(reminderId)}`)
+  },
+
   appMoveSpace: async (appId: string, newSpaceId: string | null): Promise<ApiResponse> => {
     if (isElectron()) {
       return window.halo.appMoveSpace({ appId, newSpaceId })
@@ -378,9 +428,9 @@ export const appsApi = {
   // App Chat
   // conversationId addresses a specific native/local session; omit for the app's
   // native default session.
-  appChatSend: async (request: { appId: string; spaceId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean; conversationId?: string; teamContext?: unknown }): Promise<ApiResponse<{ conversationId: string }>> => {
+  appChatSend: async (request: { appId: string; spaceId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean; reasoningEffort?: ReasoningEffortLevel; canvasContext?: CanvasContext; references?: ContentReference[]; conversationId?: string; teamContext?: unknown }): Promise<ApiResponse<{ conversationId: string }>> => {
     // Subscribe to agent events so remote/Capacitor clients receive streaming updates.
-    // The view also subscribes on mount (via useRemoteSubscription), but the API-level
+    // The view also subscribes on mount (via useConversationDetail), but the API-level
     // subscription mirrors sendMessage's pattern and ensures coverage if the API is
     // called before the view mounts (e.g. programmatic triggers).
     if (!isElectron()) {
@@ -400,6 +450,20 @@ export const appsApi = {
     return httpRequest('POST', `/api/apps/${appId}/chat/stop`, { conversationId })
   },
 
+  // Add a message to the turn a digital human is running. delivered is false when
+  // no turn was in flight to take it — the caller sends it as a new message —
+  // and stopped says the user stopped that turn, so the text goes back to them.
+  appChatInject: async (input: { appId: string; conversationId: string; message: string; references?: ContentReference[] }): Promise<ApiResponse<{ delivered: boolean; stopped?: boolean }>> => {
+    if (isElectron()) {
+      return window.halo.appChatInject(input)
+    }
+    return httpRequest('POST', `/api/apps/${input.appId}/chat/inject`, {
+      conversationId: input.conversationId,
+      message: input.message,
+      ...(input.references ? { references: input.references } : {}),
+    })
+  },
+
   appChatStatus: async (appId: string, conversationId?: string): Promise<ApiResponse<{ isGenerating: boolean; conversationId: string }>> => {
     if (isElectron()) {
       return window.halo.appChatStatus(appId, conversationId)
@@ -414,6 +478,29 @@ export const appsApi = {
     }
     const convQs = conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ''
     return httpRequest('GET', `/api/apps/${appId}/chat/messages?spaceId=${spaceId}${convQs}`)
+  },
+
+  /** One page of the transcript, newest first; messages carry `thoughts: null` (see appChatMessageThoughts). */
+  appChatTranscript: async (input: { appId: string; spaceId: string; conversationId?: string; before?: string; limit?: number; through?: string }): Promise<ApiResponse<TranscriptPage>> => {
+    if (isElectron()) {
+      return window.halo.appChatTranscript(input)
+    }
+    const params = new URLSearchParams({ spaceId: input.spaceId })
+    if (input.conversationId) params.set('conversationId', input.conversationId)
+    if (input.before) params.set('before', input.before)
+    if (input.limit) params.set('limit', String(input.limit))
+    if (input.through) params.set('through', input.through)
+    return httpRequest('GET', `/api/apps/${input.appId}/chat/transcript?${params}`)
+  },
+
+  /** The thought process of one message, loaded on demand. */
+  appChatMessageThoughts: async (input: { appId: string; spaceId: string; conversationId?: string; messageId: string }): Promise<ApiResponse<Thought[]>> => {
+    if (isElectron()) {
+      return window.halo.appChatMessageThoughts(input)
+    }
+    const params = new URLSearchParams({ spaceId: input.spaceId })
+    if (input.conversationId) params.set('conversationId', input.conversationId)
+    return httpRequest('GET', `/api/apps/${input.appId}/chat/messages/${encodeURIComponent(input.messageId)}/thoughts?${params}`)
   },
 
   appChatSessionState: async (appId: string, conversationId?: string): Promise<ApiResponse> => {
@@ -436,6 +523,20 @@ export const appsApi = {
       return window.halo.appChatRestart(appId)
     }
     return httpRequest('POST', `/api/apps/${appId}/chat/restart`)
+  },
+
+  appChatsClearable: async (appId: string): Promise<ApiResponse<{ total: number; im: number; teamIm: number }>> => {
+    if (isElectron()) {
+      return window.halo.appChatsClearable(appId)
+    }
+    return httpRequest('GET', `/api/apps/${appId}/chats/clearable`)
+  },
+
+  appChatsClearAll: async (appId: string): Promise<ApiResponse<{ cleared: number; failed: number }>> => {
+    if (isElectron()) {
+      return window.halo.appChatsClearAll(appId)
+    }
+    return httpRequest('POST', `/api/apps/${appId}/chats/clear-all`)
   },
 
   appImChatMessages: async (appId: string, spaceId: string, channel: string, chatType: 'direct' | 'group', chatId: string): Promise<ApiResponse> => {

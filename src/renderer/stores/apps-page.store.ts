@@ -154,6 +154,10 @@ interface AppsPageState {
   currentTab: AppsPageTab
   /** Remembers which automation detail tab the user last selected (persisted) */
   lastAutomationTab: AutomationDetailTab
+  /** The sibling list beside a detail page is folded to icons (persisted) */
+  switcherCollapsed: boolean
+  /** Width of that list when unfolded, in px (persisted) */
+  switcherWidth: number
 
   // ── Store Tab State ────────────────────────
   storeApps: RegistryEntry[]
@@ -207,6 +211,8 @@ interface AppsPageState {
   loadStoreApps: (query?: StoreQuery) => Promise<void>
   seedStoreApps: (items: RegistryEntry[], hasMore: boolean) => void
   revalidateStore: () => Promise<void>
+  /** The enabled store sources changed: drop what was read from the old set and read the catalog again. */
+  reloadStoreCatalog: () => Promise<void>
   loadMoreStoreApps: () => Promise<void>
   setStoreSearch: (query: string) => void
   setStoreCategory: (category: string | null) => void
@@ -252,6 +258,8 @@ export const useAppsPageStore = create<AppsPageState>()(
   // ── Tab State ──────────────────────────────
   currentTab: 'my-digital-humans',
   lastAutomationTab: 'activity',
+  switcherCollapsed: false,
+  switcherWidth: 220,
 
   // ── Store Tab State ────────────────────────
   storeApps: [],
@@ -398,6 +406,13 @@ export const useAppsPageStore = create<AppsPageState>()(
     } finally {
       revalidateInFlight = false
     }
+  },
+
+  reloadStoreCatalog: async () => {
+    storeListCache.clear()
+    discoverPageResource.invalidate()
+    // A store not visited yet loads on its first visit.
+    if (get().storeApps.length > 0) await get().loadStoreApps()
   },
 
   /**
@@ -682,9 +697,11 @@ export const useAppsPageStore = create<AppsPageState>()(
 }),
     {
       name: 'halo-apps-page',
-      // Only persist the user's last automation tab preference
+      // Only persist layout preferences
       partialize: (state) => ({
         lastAutomationTab: state.lastAutomationTab,
+        switcherCollapsed: state.switcherCollapsed,
+        switcherWidth: state.switcherWidth,
       }),
     }
   )

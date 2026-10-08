@@ -11,7 +11,7 @@
  *     transport/connection.ts with `resolveBundledCodexBinary`)
  *
  * What we DO produce:
- *   - process env: CODEX_HOME isolation, ANTHROPIC_* stripped, NO_PROXY
+ *   - process env: CODEX_HOME isolation, ANTHROPIC_* stripped, proxy policy
  *   - thread/start params: model, cwd, sandbox, approvalPolicy, config{...}
  *   - per-turn parameters (model override; we don't override anything else)
  *   - OpenAI-compat router config (when the user has selected a non-Anthropic
@@ -21,14 +21,16 @@
 
 import path from 'path'
 import { mkdirSync } from 'fs'
-import { getApiCredentials, credentialsToBackendConfig } from '../helpers'
-import { resolveCodexReasoningEffort } from '../reasoning-effort'
+import { credentialsToBackendConfig } from '../helpers'
+import { pickReasoningEffort, resolveCodexReasoningEffort } from '../reasoning-effort'
 import { getConfig, getHaloDir } from '../../../foundation/config.service'
-import { getCleanUserEnv } from '../sdk-config'
+import { getCleanUserEnv, getSdkApiCredentials } from '../sdk-config'
 import { ensureOpenAICompatRouter, encodeBackendConfig } from '../../../openai-compat-router'
 import type { ApiCredentials } from '../types'
 import type { AskForApproval, SandboxMode, ThreadStartParams } from './types/codex-protocol'
-import { prepareCodexMcpServers, type CodexSdkMcpBridge } from './mcp-bridge'
+import { prepareCodexMcpServers } from './mcp-config'
+import { applyProxyEnv } from '../../proxy-policy'
+import type { SdkMcpBridge } from '../mcp/sdk-bridge'
 
 export interface CodexResolvedOptions {
   /** Process env passed to the app-server child. */
@@ -50,7 +52,7 @@ export interface CodexResolvedOptions {
   /** MCP servers (used by the event normalizer to populate system.init.tools). */
   mcpServers: Record<string, any>
   /** Local bridge for SDK-backed MCP servers. Owned by CodexAppServerSession. */
-  mcpBridge?: CodexSdkMcpBridge
+  mcpBridge?: SdkMcpBridge
   /**
    * Mirrors Claude Code SDK's `includePartialMessages`:
    *   - true  → consumer wants stream_event (token-level deltas) for live UI.
@@ -72,8 +74,7 @@ export interface CodexResolvedOptions {
 }
 
 export async function resolveCodexOptions(sdkOptions: Record<string, any>): Promise<CodexResolvedOptions> {
-  const appConfig = getConfig()
-  const credentials = await getApiCredentials(appConfig)
+  const credentials = getSdkApiCredentials(sdkOptions)
   const model = resolveCodexModel(sdkOptions.model, credentials)
   const cwd = sdkOptions.cwd || process.cwd()
 
@@ -82,7 +83,7 @@ export async function resolveCodexOptions(sdkOptions: Record<string, any>): Prom
   // `model_providers.<id>.env_key` from the OS environment of the
   // app-server child — NOT from the JSON config — so the key must land
   // in `env`, not in `config.env`.
-  const preparedMcp = await prepareCodexMcpServers(sdkOptions.mcpServers)
+  const preparedMcp = await prepareCodexMcpServers(sdkOptions.mcpServers, sdkOptions.disabledMcpTools)
   try {
     // Absent for sessions that never carry a turn, such as the connectivity
     // check in api-validator.service.
@@ -144,8 +145,7 @@ async function buildCodexEnv(
 
   env.CODEX_HOME = ensureCodexHome()
   env.DISABLE_TELEMETRY = '1'
-  env.NO_PROXY = appendNoProxy(env.NO_PROXY || env.no_proxy)
-  env.no_proxy = env.NO_PROXY
+  applyProxyEnv(env, getConfig().network)
 
   // Forward our chosen API key to the app-server. For Anthropic-direct
   // routes, this is the user's key; for routed providers we set the
@@ -173,13 +173,6 @@ function ensureCodexHome(): string {
   const codexHome = path.join(getHaloDir(), 'codex')
   mkdirSync(codexHome, { recursive: true })
   return codexHome
-}
-
-function appendNoProxy(current: string | undefined): string {
-  const values = new Set((current || '').split(',').map((entry) => entry.trim()).filter(Boolean))
-  values.add('localhost')
-  values.add('127.0.0.1')
-  return Array.from(values).join(',')
 }
 
 // ============================================================================
@@ -251,7 +244,13 @@ async function buildThreadConfig(
     const upstreamApiType = credentials.apiType || inferCodexUpstreamApiType(credentials.baseUrl)
     const backendUrl = normalizeBackendEndpointUrl(credentials.baseUrl, upstreamApiType)
     const apiKey = encodeBackendConfig(
-      credentialsToBackendConfig(credentials, { url: backendUrl, apiType: upstreamApiType }),
+      credentialsToBackendConfig(credentials, {
+        url: backendUrl,
+        apiType: upstreamApiType,
+        // Codex's own effort reaches the router only as "thinking on", so the
+        // picked level rides in the key, as on the Claude path.
+        pickedReasoningEffort: pickReasoningEffort(sdkOptions.pickedReasoningEffort),
+      }),
     )
 
     // Codex removed `wire_api = "chat"` (see codex-rs/model-provider-info
@@ -281,7 +280,7 @@ function inferCodexUpstreamApiType(apiUrl: string): 'responses' | 'chat_completi
   return 'chat_completions'
 }
 
-function normalizeBackendEndpointUrl(apiUrl: string, apiType: 'responses' | 'chat_completions'): string {
+function normalizeBackendEndpointUrl(apiUrl: string, apiType: NonNullable<ApiCredentials['apiType']>): string {
   const baseUrl = normalizeCodexBaseUrl(apiUrl)
   return apiType === 'responses' ? `${baseUrl}/responses` : `${baseUrl}/chat/completions`
 }

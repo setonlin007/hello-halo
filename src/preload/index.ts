@@ -2,11 +2,24 @@
  * Preload Script - Exposes IPC to renderer
  */
 
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import { browserHostBridge } from './browser-host-bridge'
+import type { BrowserHostBridge, BrowserPageGone } from '../shared/types/browser-host'
 import type { RpcContract, RpcClient } from '../shared/rpc/define'
 import type { CatalogModelCapability, ModelCapabilityOverride } from '../shared/types/model-capabilities'
+import type { ReasoningEffortLevel } from '../shared/constants/reasoning-effort'
 import type { EscalationResponse } from '../shared/apps/app-types'
 import type { UpdaterChannel, UpdaterStatusPayload } from '../shared/types/updater'
+import type { GoalInput } from '../shared/types/goal'
+import type { CanvasContext } from '../shared/types/canvas-context'
+import type { ContentReference } from '../shared/types/content-reference'
+import type { AgentInjectRequest, AgentSendRequest } from '../shared/types/agent-send'
+import type { Thought, TranscriptPage } from '../shared/types/transcript'
+import type { ArtifactChangeBatchEvent, FileQueryResult, ResolvedArtifactPath } from '../shared/types/artifact'
+import type { MemoryPressureEvent } from '../shared/types/memory-pressure'
+import type { AIBrowserActiveView, AIBrowserConversationReleased, AIBrowserLivePage, AIBrowserStopResult, AIBrowserViewGone } from '../shared/types/ai-browser'
+import type { MemorySettings, MemoryStatus } from '../shared/types/memory'
+import type { PickedLocalEntry } from '../shared/attached-paths'
 import { modelCapabilitiesRpc } from '../shared/rpc/contracts/model-capabilities.contract'
 import { onboardingRpc } from '../shared/rpc/contracts/onboarding.contract'
 import { securityRpc } from '../shared/rpc/contracts/security.contract'
@@ -24,6 +37,9 @@ import { remoteRpc } from '../shared/rpc/contracts/remote.contract'
 import { authRpc } from '../shared/rpc/contracts/auth.contract'
 import { systemRpc } from '../shared/rpc/contracts/system.contract'
 import { healthRpc } from '../shared/rpc/contracts/health.contract'
+import { canvasPreviewRpc } from '../shared/rpc/contracts/canvas-preview.contract'
+import { gitRpc } from '../shared/rpc/contracts/git.contract'
+import { codeReviewRpc } from '../shared/rpc/contracts/code-review.contract'
 import { configRpc } from '../shared/rpc/contracts/config.contract'
 import { agentRpc } from '../shared/rpc/contracts/agent.contract'
 import { terminalRpc } from '../shared/rpc/contracts/terminal.contract'
@@ -32,7 +48,6 @@ import { searchRpc } from '../shared/rpc/contracts/search.contract'
 import { wecomBotRpc } from '../shared/rpc/contracts/wecom-bot.contract'
 import { feishuBotRpc } from '../shared/rpc/contracts/feishu-bot.contract'
 import { gitBashRpc } from '../shared/rpc/contracts/git-bash.contract'
-import { overlayRpc } from '../shared/rpc/contracts/overlay.contract'
 import { appRpc } from '../shared/rpc/contracts/app.contract'
 import { TEAM_IPC, TEAM_EVENTS } from '../shared/apps/team-types'
 import type {
@@ -59,6 +74,10 @@ import type { NotifyChannelsProductConfig } from '../shared/types/notification-c
 import type { StoreInstallProgress, StoreCapabilities, CategoryTaxonomy, DiscoverLayout, ResolvedDiscover, MyPublication, StoreCollection, StoreSignInStatus } from '../shared/store/store-types'
 import type { AppType, AppSpec } from '../shared/apps/spec-types'
 
+type GitRpcClient = RpcClient<typeof gitRpc>
+type CodeReviewRpcClient = RpcClient<typeof codeReviewRpc>
+type AuthRpcClient = RpcClient<typeof authRpc>
+
 // Seed --display-scale before the renderer's first paint. The main process
 // passes the persisted scale via additionalArguments at window creation;
 // waiting for the async display:get-scale IPC instead would leave the native
@@ -77,25 +96,26 @@ import type { AppType, AppSpec } from '../shared/apps/spec-types'
 }
 
 // Type definitions for exposed API
-export interface HaloAPI {
+export interface HaloAPI extends BrowserHostBridge {
   // Generic Auth (provider-agnostic)
   authGetProviders: () => Promise<IpcResponse>
   authGetBuiltinProviders: () => Promise<IpcResponse>
-  authStartLogin: (providerType: string) => Promise<IpcResponse>
-  authOpenLoginWindow: (providerType: string, loginUrl: string, redirectUri: string) => Promise<IpcResponse>
-  authCompleteLogin: (providerType: string, state: string) => Promise<IpcResponse>
-  authRefreshToken: (sourceId: string) => Promise<IpcResponse>
-  authCheckToken: (sourceId: string) => Promise<IpcResponse>
-  authLogout: (sourceId: string) => Promise<IpcResponse>
+  authStartLogin: AuthRpcClient['authStartLogin']
+  authOpenLoginWindow: AuthRpcClient['authOpenLoginWindow']
+  authCompleteLogin: AuthRpcClient['authCompleteLogin']
+  authCancelLogin: AuthRpcClient['authCancelLogin']
+  authRefreshToken: AuthRpcClient['authRefreshToken']
+  authCheckToken: AuthRpcClient['authCheckToken']
+  authLogout: AuthRpcClient['authLogout']
   authGetQuota: (sourceId: string) => Promise<IpcResponse>
   authDelegatedStatus: () => Promise<IpcResponse>
   authDelegatedActivate: () => Promise<IpcResponse>
-  onAuthLoginProgress: (callback: (data: { provider: string; status: string }) => void) => () => void
 
   // Config
-  getConfig: () => Promise<IpcResponse>
-  setConfig: (updates: Record<string, unknown>) => Promise<IpcResponse>
+  getConfig: () => Promise<IpcResponse & { configEpoch?: number }>
+  setConfig: (updates: Record<string, unknown>, snapshotEpoch?: number) => Promise<IpcResponse>
   getCredentialFailures: () => Promise<IpcResponse>
+  getConfigReadFailure: () => Promise<IpcResponse>
   onCredentialDecryptFailed: (callback: (data: { failures: Array<{ path: string; label: string }> }) => void) => () => void
   validateApi: (apiKey: string, apiUrl: string, provider: string, model?: string) => Promise<IpcResponse>
   fetchModels: (apiKey: string, apiUrl: string) => Promise<IpcResponse>
@@ -124,6 +144,7 @@ export interface HaloAPI {
   getSpace: (spaceId: string) => Promise<IpcResponse>
   openSpaceFolder: (spaceId: string) => Promise<IpcResponse>
   updateSpace: (spaceId: string, updates: { name?: string; icon?: string; color?: string }) => Promise<IpcResponse>
+  setSpaceWorkingDir: (spaceId: string, workingDir: string) => Promise<IpcResponse>
   getDefaultSpacePath: () => Promise<IpcResponse>
   selectFolder: () => Promise<IpcResponse>
   updateSpacePreferences: (spaceId: string, preferences: {
@@ -131,16 +152,18 @@ export interface HaloAPI {
       artifactRailExpanded?: boolean
       chatWidth?: number
     }
+    memory?: MemorySettings
   }) => Promise<IpcResponse>
   getSpacePreferences: (spaceId: string) => Promise<IpcResponse>
+  getSpaceMemoryStatus: (spaceId: string) => Promise<IpcResponse<MemoryStatus>>
+  consolidateSpaceMemory: (spaceId: string) => Promise<IpcResponse<{ started: boolean; reason?: string }>>
   reorderSpaces: (spaceIds: string[]) => Promise<IpcResponse>
-  listSpaceSummaries: () => Promise<IpcResponse>
   forgetSpace: (spaceId: string) => Promise<IpcResponse>
 
   // Conversation
   listConversations: (spaceId: string) => Promise<IpcResponse>
-  createConversation: (spaceId: string, title?: string) => Promise<IpcResponse>
-  getConversation: (spaceId: string, conversationId: string) => Promise<IpcResponse>
+  createConversation: (spaceId: string, title?: string, reasoningEffort?: ReasoningEffortLevel, options?: { ephemeral?: boolean }) => Promise<IpcResponse>
+  getConversation: (spaceId: string, conversationId: string, options?: { fromMessageId?: string }) => Promise<IpcResponse>
   updateConversation: (
     spaceId: string,
     conversationId: string,
@@ -169,41 +192,7 @@ export interface HaloAPI {
   ) => Promise<IpcResponse>
 
   // Agent
-  sendMessage: (request: {
-    spaceId: string
-    conversationId: string
-    message: string
-    resumeSessionId?: string
-    images?: Array<{
-      id: string
-      type: 'image'
-      mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
-      data: string
-      name?: string
-      size?: number
-    }>
-    thinkingEnabled?: boolean  // Enable extended thinking mode
-    knowledgeBaseId?: string  // Chat-with-knowledge-base turn
-    canvasContext?: {  // Canvas context for AI awareness
-      isOpen: boolean
-      tabCount: number
-      activeTab: {
-        type: string
-        title: string
-        url?: string
-        path?: string
-        terminalSessionId?: string
-      } | null
-      tabs: Array<{
-        type: string
-        title: string
-        url?: string
-        path?: string
-        terminalSessionId?: string
-        isActive: boolean
-      }>
-    }
-  }) => Promise<IpcResponse>
+  sendMessage: (request: AgentSendRequest) => Promise<IpcResponse>
   stopGeneration: (conversationId?: string) => Promise<IpcResponse>
   approveTool: (conversationId: string) => Promise<IpcResponse>
   rejectTool: (conversationId: string) => Promise<IpcResponse>
@@ -212,12 +201,14 @@ export interface HaloAPI {
   testMcpConnections: () => Promise<{ success: boolean; servers: unknown[]; error?: string }>
   probeMcpApp: (appId: string) => Promise<{ success: boolean; result?: unknown; error?: string }>
   answerQuestion: (data: { conversationId: string; id: string; answers: Record<string, string> }) => Promise<IpcResponse>
-  injectMessage: (data: { conversationId: string; message: string }) => Promise<IpcResponse>
+  injectMessage: (data: AgentInjectRequest) => Promise<IpcResponse>
   getEngineCapabilities: () => Promise<IpcResponse>
   getEngineAvailability: () => Promise<IpcResponse>
   listToolsets: (data: { spaceId: string; conversationId: string }) => Promise<IpcResponse>
   openToolset: (data: { spaceId: string; conversationId: string; toolsetId: string }) => Promise<IpcResponse>
   closeToolset: (data: { spaceId: string; conversationId: string; toolsetId: string }) => Promise<IpcResponse>
+  getGoal: (data: { spaceId: string; conversationId: string }) => Promise<IpcResponse>
+  setGoal: (data: { spaceId: string; conversationId: string; goal: GoalInput | null }) => Promise<IpcResponse>
 
   // Terminal (derived from terminalRpc contract)
   listTerminals: () => Promise<IpcResponse>
@@ -246,6 +237,8 @@ export interface HaloAPI {
   onAgentAskQuestion: (callback: (data: unknown) => void) => () => void
   onAgentSessionInfo: (callback: (data: unknown) => void) => () => void
   onAgentTurnStart: (callback: (data: unknown) => void) => () => void
+  onAgentGoalUpdated: (callback: (data: unknown) => void) => () => void
+  onAgentApiRetry: (callback: (data: unknown) => void) => () => void
   onToolsetsChanged: (callback: (data: unknown) => void) => () => void
   onToolsetsRequested: (callback: (data: unknown) => void) => () => void
 
@@ -263,6 +256,7 @@ export interface HaloAPI {
   tlonUnbindApp: (kbId: string, appId: string) => Promise<IpcResponse>
   tlonAddLinkedDir: (kbId: string, dir: { path: string; label: string }) => Promise<IpcResponse>
   tlonRemoveLinkedDir: (kbId: string, linkId: string) => Promise<IpcResponse>
+  tlonRetryLinkedDir: (kbId: string, linkId: string) => Promise<IpcResponse>
   tlonAddFiles: (kbId: string, filePaths: string[]) => Promise<IpcResponse>
   tlonListRaw: (kbId: string) => Promise<IpcResponse>
   tlonRemoveRaw: (kbId: string, relativePath: string) => Promise<IpcResponse>
@@ -278,26 +272,17 @@ export interface HaloAPI {
 
   // Artifact
   listArtifacts: (spaceId: string, maxDepth?: number) => Promise<IpcResponse>
+  queryArtifactFiles: (spaceId: string, query: string, limit: number) => Promise<IpcResponse<FileQueryResult>>
+  /** Which mentioned paths are existing files or folders of the space; relative ones resolve against `baseDir`. */
+  resolveArtifactPaths: (spaceId: string, paths: string[], baseDir?: string) => Promise<IpcResponse<ResolvedArtifactPath[]>>
   listArtifactsTree: (spaceId: string) => Promise<IpcResponse>
   loadArtifactChildren: (spaceId: string, dirPath: string) => Promise<IpcResponse>
-  initArtifactWatcher: (spaceId: string) => Promise<IpcResponse>
-  onArtifactChanged: (callback: (data: {
-    type: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir'
-    path: string
-    relativePath: string
-    spaceId: string
-    item?: unknown
-  }) => void) => () => void
+  retainArtifactSpace: (spaceId: string, clientId: string) => Promise<IpcResponse>
+  releaseArtifactSpace: (spaceId: string, clientId: string) => Promise<IpcResponse>
+  onArtifactChangedBatch: (callback: (data: ArtifactChangeBatchEvent) => void) => () => void
   onArtifactTreeUpdate: (callback: (data: {
     spaceId: string
     updatedDirs: Array<{ dirPath: string; children: unknown[] }>
-    changes: Array<{
-      type: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir'
-      path: string
-      relativePath: string
-      spaceId: string
-      item?: unknown
-    }>
   }) => void) => () => void
   reconcileArtifacts: (spaceId: string) => Promise<IpcResponse>
   openArtifact: (filePath: string) => Promise<IpcResponse>
@@ -349,7 +334,12 @@ export interface HaloAPI {
   getAutoLaunch: () => Promise<IpcResponse>
   setAutoLaunch: (enabled: boolean) => Promise<IpcResponse>
   openLogFolder: () => Promise<IpcResponse>
+  openCrashReportsFolder: () => Promise<IpcResponse<{ path: string; pending: number }>>
   relaunch: () => Promise<IpcResponse>
+  /** Native picker for files/folders to attach to a chat message. */
+  pickLocalEntries: () => Promise<IpcResponse<PickedLocalEntry[]>>
+  /** Absolute path of a dropped or pasted File; empty when it has none. */
+  getPathForFile: (file: File) => string
 
   // Window
   setTitleBarOverlay: (options: { color: string; symbolColor: string }) => Promise<IpcResponse>
@@ -387,6 +377,7 @@ export interface HaloAPI {
   // Browser (embedded browser for Content Canvas)
   getBrowserHomepage: () => Promise<IpcResponse>
   createBrowserView: (viewId: string, url?: string) => Promise<IpcResponse>
+  onBrowserPageGone: (callback: (data: BrowserPageGone) => void) => () => void
   destroyBrowserView: (viewId: string) => Promise<IpcResponse>
   showBrowserView: (viewId: string, bounds: { x: number; y: number; width: number; height: number }) => Promise<IpcResponse>
   hideBrowserView: (viewId: string) => Promise<IpcResponse>
@@ -423,13 +414,11 @@ export interface HaloAPI {
   }) => void) => () => void
 
   // AI Browser
-  onAIBrowserActiveViewChanged: (callback: (data: { viewId: string; url: string | null; title: string | null }) => void) => () => void
-  onAIBrowserViewGone: (callback: (data: { viewId: string }) => void) => () => void
-
-  // Overlay (for floating UI above BrowserView)
-  showChatCapsuleOverlay: () => Promise<IpcResponse>
-  hideChatCapsuleOverlay: () => Promise<IpcResponse>
-  onCanvasExitMaximized: (callback: () => void) => () => void
+  onAIBrowserActiveViewChanged: (callback: (data: AIBrowserActiveView) => void) => () => void
+  onAIBrowserViewGone: (callback: (data: AIBrowserViewGone) => void) => () => void
+  listAIBrowserLivePages: () => Promise<IpcResponse<AIBrowserLivePage[]>>
+  onAIBrowserConversationReleased: (callback: (data: AIBrowserConversationReleased) => void) => () => void
+  stopAIBrowserPage: (viewId: string, conversationId: string) => Promise<IpcResponse<AIBrowserStopResult>>
 
   // Performance Monitoring (Developer Tools)
   perfStart: (config?: { sampleInterval?: number; maxSamples?: number }) => Promise<IpcResponse>
@@ -483,6 +472,9 @@ export interface HaloAPI {
   generateHealthReportText: () => Promise<IpcResponse<string>>
   exportHealthReport: (filePath?: string) => Promise<IpcResponse<HealthExportResponse>>
   runHealthCheck: () => Promise<IpcResponse<HealthCheckResponse>>
+  getMemoryPressure: () => Promise<IpcResponse<MemoryPressureEvent>>
+  onMemoryPressure: (callback: (data: MemoryPressureEvent) => void) => () => void
+  setVisibleConversations: (conversationIds: string[]) => void
 
   // Notification Channels
   testNotificationChannel: (channelType: string) => Promise<IpcResponse>
@@ -522,6 +514,8 @@ export interface HaloAPI {
   imSessionsSetProactive: (input: { appId: string; channel: string; chatId: string; proactive: boolean }) => Promise<IpcResponse>
   imSessionsRemove: (input: { appId: string; channel: string; chatId: string }) => Promise<IpcResponse>
   imSessionsSetCustomName: (input: { appId: string; channel: string; chatId: string; name: string }) => Promise<IpcResponse>
+  imSessionsListLinked: (appId: string) => Promise<IpcResponse>
+  imSessionsSetPushLink: (input: { appId: string; session: { appId: string; channel: string; chatId: string }; link: { autoSync: boolean } | null }) => Promise<IpcResponse>
 
   // WeChat Personal Bot via iLink API
   weixinIlinkRequestQrcode: () => Promise<IpcResponse<{ qrcode: string; qrcodeImgContent: string; baseUrl: string }>>
@@ -561,11 +555,13 @@ export interface HaloAPI {
   appGetRunStats: (input: { appId: string; window?: number }) => Promise<IpcResponse<import('../shared/apps/app-types').RunStats>>
   appGetOverview: (input?: { spaceId?: string }) => Promise<IpcResponse<import('../shared/apps/app-types').AppOverviewEntry[]>>
   appContinueRun: (input: { appId: string; runId: string }) => Promise<IpcResponse>
-  appInjectRun: (input: { appId: string; runId: string; text: string }) => Promise<IpcResponse>
+  appInjectRun: (input: { appId: string; runId: string; text: string; references?: ContentReference[] }) => Promise<IpcResponse>
   appUpdateConfig: (input: { appId: string; config: Record<string, unknown> }) => Promise<IpcResponse>
   appUpdateFrequency: (input: { appId: string; subscriptionId: string; frequency: string }) => Promise<IpcResponse>
   appUpdateOverrides: (input: { appId: string; overrides: Record<string, unknown> }) => Promise<IpcResponse>
   appUpdateSpec: (input: { appId: string; specPatch: Record<string, unknown> }) => Promise<IpcResponse>
+  appGetAuthorSpec: (appId: string) => Promise<IpcResponse<AppSpec | null>>
+  appAdoptAuthorVersion: (input: { appId: string; entryId: string; fields: string[] }) => Promise<IpcResponse<import('../shared/apps/app-types').ActivityEntry>>
   appGrantPermission: (input: { appId: string; permission: string }) => Promise<IpcResponse>
   appRevokePermission: (input: { appId: string; permission: string }) => Promise<IpcResponse>
   appSetUpgradeStrategy: (input: { appId: string; strategy: 'auto' | 'notify' | 'manual' }) => Promise<IpcResponse>
@@ -581,18 +577,29 @@ export interface HaloAPI {
   appGetDataPath: (appId: string) => Promise<IpcResponse<{ path: string }>>
   appOpenDataFolder: (appId: string) => Promise<IpcResponse>
   appClearMemory: (appId: string) => Promise<IpcResponse<{ filesRemoved: number }>>
+  appGetMemoryStatus: (appId: string) => Promise<IpcResponse<MemoryStatus>>
+  appConsolidateMemory: (appId: string) => Promise<IpcResponse<{ started: boolean; reason?: string }>>
+  appListReminders: (appId: string) => Promise<IpcResponse<import('../shared/apps/conversation-reminders').ConversationReminderView[]>>
+  appCancelReminder: (input: { appId: string; reminderId: string }) => Promise<IpcResponse>
   appMoveSpace: (input: { appId: string; newSpaceId: string | null }) => Promise<IpcResponse>
 
   // App Chat
   // conversationId addresses a specific native/local session; omit for the app's
   // native default session.
-  appChatSend: (request: { appId: string; spaceId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean; conversationId?: string; teamContext?: unknown }) => Promise<IpcResponse<{ conversationId: string }>>
+  appChatSend: (request: { appId: string; spaceId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean; reasoningEffort?: ReasoningEffortLevel; canvasContext?: CanvasContext; references?: ContentReference[]; conversationId?: string; teamContext?: unknown }) => Promise<IpcResponse<{ conversationId: string }>>
   appChatStop: (appId: string, conversationId?: string) => Promise<IpcResponse>
+  // Add a message to the running turn; delivered:false when no turn was in flight
+  appChatInject: (input: { appId: string; conversationId: string; message: string; references?: ContentReference[] }) => Promise<IpcResponse<{ delivered: boolean; stopped?: boolean }>>
   appChatStatus: (appId: string, conversationId?: string) => Promise<IpcResponse<{ isGenerating: boolean; conversationId: string }>>
   appChatMessages: (input: { appId: string; spaceId: string; conversationId?: string }) => Promise<IpcResponse>
+  // Paged read, newest page first; messages carry thoughts:null (see appChatMessageThoughts)
+  appChatTranscript: (input: { appId: string; spaceId: string; conversationId?: string; before?: string; limit?: number; through?: string }) => Promise<IpcResponse<TranscriptPage>>
+  appChatMessageThoughts: (input: { appId: string; spaceId: string; conversationId?: string; messageId: string }) => Promise<IpcResponse<Thought[]>>
   appChatSessionState: (appId: string, conversationId?: string) => Promise<IpcResponse>
   appChatClear: (input: { appId: string; spaceId: string; conversationId?: string }) => Promise<IpcResponse>
   appChatRestart: (appId: string) => Promise<IpcResponse<{ sessionsClosed: number }>>
+  appChatsClearable: (appId: string) => Promise<IpcResponse<{ total: number; im: number; teamIm: number }>>
+  appChatsClearAll: (appId: string) => Promise<IpcResponse<{ cleared: number; failed: number }>>
   appImChatMessages: (input: { appId: string; spaceId: string; channel: string; chatType: 'direct' | 'group'; chatId: string }) => Promise<IpcResponse>
   appImChatClear: (input: { appId: string; spaceId: string; channel: string; chatType: 'direct' | 'group'; chatId: string }) => Promise<IpcResponse>
   appImChatStop: (input: { appId: string; channel: string; chatType: 'direct' | 'group'; chatId: string }) => Promise<IpcResponse<{ stopped: boolean }>>
@@ -672,7 +679,7 @@ export interface HaloAPI {
   /** Remote office: leave a joined office, removing the local shadow (joiner). */
   teamLeaveOffice: (input: { officeId: string }) => Promise<IpcResponse>
   /** Send a message to a remote member via the office owner (team wake). */
-  teamSendToMember: (input: { teamId: string; appId: string; epochId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean }) => Promise<IpcResponse>
+  teamSendToMember: (input: { teamId: string; appId: string; epochId: string; message: string; images?: ImageAttachment[]; thinkingEnabled?: boolean; spaceId?: string; references?: ContentReference[] }) => Promise<IpcResponse>
   /** Stop a member's running turn, wherever that member runs. */
   teamStopMember: (input: { teamId: string; appId: string; epochId?: string }) => Promise<IpcResponse>
   /** Conversations (office-shared session objects). */
@@ -706,7 +713,7 @@ export interface HaloAPI {
   storeQuery: (params: { search?: string; type?: string; category?: string; page?: number; pageSize?: number; locale?: string }) => Promise<IpcResponse>
   storeListApps: (query: { search?: string; locale?: string; category?: string; type?: string; tags?: string[] }) => Promise<IpcResponse>
   storeGetAppDetail: (slug: string) => Promise<IpcResponse>
-  storeGetAppDocument: (slug: string) => Promise<IpcResponse>
+  storeGetAppDocument: (slug: string) => Promise<IpcResponse<{ content: string | null }>>
   storeInstall: (
     input: { slug: string; spaceId: string | null; userConfig?: Record<string, unknown> },
     onProgress?: (progress: StoreInstallProgress) => void,
@@ -720,6 +727,7 @@ export interface HaloAPI {
   storeUpdateRegistryAdapterConfig: (input: { registryId: string; adapterConfig: Record<string, unknown> }) => Promise<IpcResponse>
   storeCheckUpdatesNow: () => Promise<IpcResponse>
   storeApplyUpgrade: (input: { appId: string; mode?: 'patch_minor' | 'major' | 'force' }) => Promise<IpcResponse>
+  storePreviewUpgrade: (input: { appId: string }) => Promise<IpcResponse<import('../shared/apps/app-types').SpecUpgradeOutcome>>
   storePublish: (input: { appId: string; author?: string; version?: string; changelog?: string; category?: string; name?: string; description?: string; tags?: string[] }) => Promise<IpcResponse>
   storePublishPreview: (input: { appId: string; author?: string; name?: string }) => Promise<IpcResponse<{ slug: string; localVersion: string; storeVersion: string | null }>>
   storeInspectSkillDeps: (input: { appId: string }) => Promise<IpcResponse<Array<{ id: string; declaredBundled: boolean; resolvable: boolean; installed: boolean; appId: string | null; storeName: string | null }>>>
@@ -749,6 +757,29 @@ export interface HaloAPI {
   /** Get all preset model capabilities as a flat map */
   modelCapabilitiesAll: () => Promise<IpcResponse>
 
+  // Canvas HTML preview origin
+  openHtmlPreview: (filePath: string) => Promise<IpcResponse<{ url: string; host: string }>>
+  closeHtmlPreview: (host: string) => Promise<IpcResponse<void>>
+
+  // Git (changes view): repositories of a space, status, change lists, writes
+  gitListRepositories: GitRpcClient['gitListRepositories']
+  gitGetStatus: GitRpcClient['gitGetStatus']
+  gitGetChanges: GitRpcClient['gitGetChanges']
+  gitGetFileContents: GitRpcClient['gitGetFileContents']
+  gitListRevisionOptions: GitRpcClient['gitListRevisionOptions']
+  gitStage: GitRpcClient['gitStage']
+  gitUnstage: GitRpcClient['gitUnstage']
+  gitDiscard: GitRpcClient['gitDiscard']
+  gitCommit: GitRpcClient['gitCommit']
+  gitSync: GitRpcClient['gitSync']
+  gitCreateSnapshot: GitRpcClient['gitCreateSnapshot']
+  gitCountChangedSince: GitRpcClient['gitCountChangedSince']
+
+  // Code review (changes view): start a review, the latest review of a repository
+  codeReviewStart: CodeReviewRpcClient['codeReviewStart']
+  codeReviewGetLatest: CodeReviewRpcClient['codeReviewGetLatest']
+  codeReviewAvailability: CodeReviewRpcClient['codeReviewAvailability']
+
   // Telemetry (fire-and-forget — no response)
   trackEvent: (event: string, properties?: Record<string, unknown>) => void
 }
@@ -777,7 +808,6 @@ function createEventListener<T = unknown>(
   console.log(`[Preload] Creating event listener for channel: ${channel}`)
 
   const handler = (_event: Electron.IpcRendererEvent, data: unknown): void => {
-    console.log(`[Preload] Received event on channel: ${channel}`, data)
     callback(data as T)
   }
 
@@ -823,13 +853,13 @@ function bindRpc<C extends RpcContract>(contract: C): { [K in keyof C & keyof Ha
 
 // Expose API to renderer
 const api: HaloAPI = {
+  ...browserHostBridge,
   // Typed-RPC-derived bindings (see shared/rpc/contracts). Channel names and
   // argument shapes come from the contract — no manual sync needed.
   ...bindRpc(modelCapabilitiesRpc),
 
   // Generic Auth (provider-agnostic)
   ...bindRpc(authRpc),
-  onAuthLoginProgress: (callback) => createEventListener('auth:login-progress', callback),
 
   // Config + AI Sources CRUD (derived from configRpc contract)
   ...bindRpc(configRpc),
@@ -866,6 +896,8 @@ const api: HaloAPI = {
   onAgentAskQuestion: (callback) => createEventListener('agent:ask-question', callback),
   onAgentSessionInfo: (callback) => createEventListener('agent:session-info', callback),
   onAgentTurnStart: (callback) => createEventListener('agent:turn-start', callback),
+  onAgentGoalUpdated: (callback) => createEventListener('agent:goal-updated', callback),
+  onAgentApiRetry: (callback) => createEventListener('agent:api-retry', callback),
   onToolsetsChanged: (callback) => createEventListener('toolsets:changed', callback),
   onToolsetsRequested: (callback) => createEventListener('toolsets:requested', callback),
 
@@ -876,7 +908,7 @@ const api: HaloAPI = {
 
   // Artifact (methods derived from artifactRpc contract; event listeners kept)
   ...bindRpc(artifactRpc),
-  onArtifactChanged: (callback) => createEventListener('artifact:changed', callback),
+  onArtifactChangedBatch: (callback) => createEventListener('artifact:changed-batch', callback),
   onArtifactTreeUpdate: (callback) => createEventListener('artifact:tree-update', callback),
 
   // Onboarding (derived from onboardingRpc contract)
@@ -897,6 +929,13 @@ const api: HaloAPI = {
   // System Settings + Window controls (derived from systemRpc contract)
   ...bindRpc(systemRpc),
   onWindowMaximizeChange: (callback) => createEventListener('window:maximize-change', callback),
+  getPathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file)
+    } catch {
+      return ''
+    }
+  },
 
   // Search (methods derived from searchRpc contract; event listeners kept)
   ...bindRpc(searchRpc),
@@ -919,6 +958,7 @@ const api: HaloAPI = {
   onDisplayScale: (callback) => createEventListener('display:scale-changed', callback),
   getBrowserHomepage: () => ipcRenderer.invoke('browser:get-homepage'),
   createBrowserView: (viewId, url) => ipcRenderer.invoke('browser:create', { viewId, url }),
+  onBrowserPageGone: (callback) => createEventListener('browser:page-gone', callback),
   destroyBrowserView: (viewId) => ipcRenderer.invoke('browser:destroy', { viewId }),
   showBrowserView: (viewId, bounds) => ipcRenderer.invoke('browser:show', { viewId, bounds }),
   hideBrowserView: (viewId) => ipcRenderer.invoke('browser:hide', { viewId }),
@@ -946,10 +986,9 @@ const api: HaloAPI = {
   // AI Browser - active view change / view gone notifications from main process
   onAIBrowserActiveViewChanged: (callback) => createEventListener('ai-browser:active-view-changed', callback),
   onAIBrowserViewGone: (callback) => createEventListener('ai-browser:view-gone', callback),
-
-  // Overlay (for floating UI above BrowserView)
-  ...bindRpc(overlayRpc),
-  onCanvasExitMaximized: (callback) => createEventListener('canvas:exit-maximized', callback),
+  listAIBrowserLivePages: () => ipcRenderer.invoke('ai-browser:list-live-pages'),
+  onAIBrowserConversationReleased: (callback) => createEventListener('ai-browser:conversation-released', callback),
+  stopAIBrowserPage: (viewId, conversationId) => ipcRenderer.invoke('ai-browser:stop-page', { viewId, conversationId }),
 
   // Performance Monitoring (Developer Tools)
   ...bindRpc(perfRpc),
@@ -982,8 +1021,19 @@ const api: HaloAPI = {
   getBootstrapStatus: () => ipcRenderer.invoke('bootstrap:get-status'),
   onBootstrapExtendedReady: (callback) => createEventListener('bootstrap:extended-ready', callback),
 
+  // Canvas HTML preview origin
+  ...bindRpc(canvasPreviewRpc),
+
+  // Git (changes view)
+  ...bindRpc(gitRpc),
+
+  // Code review (changes view)
+  ...bindRpc(codeReviewRpc),
+
   // Health System
   ...bindRpc(healthRpc),
+  onMemoryPressure: (callback) => createEventListener('app:memory-pressure', callback),
+  setVisibleConversations: (conversationIds) => ipcRenderer.send('agent:set-visible-conversations', conversationIds),
 
   // Notification Channels
   ...bindRpc(notificationChannelsRpc),
@@ -1146,24 +1196,6 @@ const platformInfo = {
 
 contextBridge.exposeInMainWorld('platform', platformInfo)
 
-// Expose basic electron IPC for overlay SPA
-// This is used by the overlay window which doesn't need the full halo API
-const electronAPI = {
-  ipcRenderer: {
-    on: (channel: string, callback: (...args: unknown[]) => void) => {
-      ipcRenderer.on(channel, (_event, ...args) => callback(...args))
-    },
-    removeListener: (channel: string, callback: (...args: unknown[]) => void) => {
-      ipcRenderer.removeListener(channel, callback as (...args: unknown[]) => void)
-    },
-    send: (channel: string, ...args: unknown[]) => {
-      ipcRenderer.send(channel, ...args)
-    }
-  }
-}
-
-contextBridge.exposeInMainWorld('electron', electronAPI)
-
 // TypeScript declaration for window.halo and window.platform
 declare global {
   interface Window {
@@ -1173,14 +1205,6 @@ declare global {
       isMac: boolean
       isWindows: boolean
       isLinux: boolean
-    }
-    // For overlay SPA - access via contextBridge
-    electron?: {
-      ipcRenderer: {
-        on: (channel: string, callback: (...args: unknown[]) => void) => void
-        removeListener: (channel: string, callback: (...args: unknown[]) => void) => void
-        send: (channel: string, ...args: unknown[]) => void
-      }
     }
   }
 }

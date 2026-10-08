@@ -26,6 +26,17 @@ export interface CapabilityPolicy {
   allowedTools?: string[]
 
   /**
+   * Skills this caller may load, by the folder name the engine registers each
+   * under. Read like the other lists: undefined grants every skill in
+   * 'permissive' mode and none in 'strict'.
+   *
+   * A skill grants nothing beyond itself. Each tool call it makes is judged by
+   * the rest of this policy, and a skill whose own pre-approvals reach past
+   * what this policy allows does not load at all.
+   */
+  allowedSkills?: string[]
+
+  /**
    * How far the command tool reaches once it is granted at all.
    *
    *   'full'   — any command. Unstated reads as this, so a policy written
@@ -117,6 +128,25 @@ export const ALL_BUILTIN_TOOLS: readonly string[] = [
   'Write',
 ]
 
+/**
+ * Older names the engine still answers to. A rule naming one acts on the tool
+ * it names now (the sub-agent tool was "Task"), so an alias answers to its
+ * tool's switch — left to itself, it stayed withheld and took the tool it names
+ * away with it, whatever the switch said.
+ */
+const BUILTIN_TOOL_ALIASES: ReadonlyMap<string, string> = new Map([['Task', 'Agent']])
+
+/** A built-in tool's name as the switches know it. */
+export function canonicalBuiltinTool(name: string): string {
+  return BUILTIN_TOOL_ALIASES.get(name) ?? name
+}
+
+/**
+ * The built-in tool that loads skills. It has no switch of its own: it exists
+ * for a caller exactly when some skill does (see {@link CapabilityPolicy.allowedSkills}).
+ */
+export const SKILL_TOOL = 'Skill'
+
 /** Grouping of the built-in tools a policy screen lets a user switch. */
 export type CapabilityToolGroup = 'file' | 'network' | 'other' | 'advanced'
 
@@ -128,12 +158,48 @@ export const DELEGABLE_BUILTIN_TOOLS: readonly { name: string; group: Capability
   { name: 'WebFetch', group: 'network' },
   { name: 'WebSearch', group: 'network' },
   { name: 'Agent', group: 'other' },
-  { name: 'TodoWrite', group: 'other' },
   { name: 'Bash', group: 'advanced' },
   { name: 'Write', group: 'advanced' },
   { name: 'Edit', group: 'advanced' },
   { name: 'NotebookEdit', group: 'advanced' },
 ]
+
+/**
+ * Built-in tools every caller has, never offered as a switch: they act on the
+ * turn's own bookkeeping and reach nothing outside it. Withholding the task
+ * list only made multi-step work worse.
+ */
+export const ALWAYS_AVAILABLE_BUILTIN_TOOLS: readonly string[] = ['TodoWrite']
+
+/**
+ * What a guest may use when their access is turned on and the build names no
+ * default of its own: looking at files in the workspace. Paths are held to the
+ * workspace at run time, whatever is granted here.
+ */
+export const DEFAULT_GUEST_ALLOWED_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep']
+
+/**
+ * The guest policy a first turn-on of guest access starts from: the build's
+ * own default when it names one — an empty list included — else
+ * {@link DEFAULT_GUEST_ALLOWED_TOOLS}.
+ */
+export function defaultGuestPolicy(buildDefault?: { allowedTools?: string[] } | null): { allowedTools: string[] } {
+  return { allowedTools: [...(buildDefault?.allowedTools ?? DEFAULT_GUEST_ALLOWED_TOOLS)] }
+}
+
+/**
+ * Guest access turned on or off. Off keeps the choices made, so turning it
+ * back on restores them; a first turn-on starts from {@link defaultGuestPolicy}.
+ */
+export function withGuestAccess<T extends { guestPolicy?: CapabilityPolicy; savedGuestPolicy?: CapabilityPolicy }>(
+  holder: T,
+  on: boolean,
+  buildDefault?: { allowedTools?: string[] } | null
+): T {
+  if (!on) return { ...holder, guestPolicy: undefined, savedGuestPolicy: holder.guestPolicy ?? holder.savedGuestPolicy }
+  const { savedGuestPolicy, ...rest } = holder
+  return { ...rest, guestPolicy: holder.guestPolicy ?? savedGuestPolicy ?? defaultGuestPolicy(buildDefault) } as T
+}
 
 /** Group order for rendering. Labels are supplied by the screen (they differ per scenario). */
 export const CAPABILITY_TOOL_GROUPS: readonly CapabilityToolGroup[] = ['file', 'network', 'other', 'advanced']
@@ -141,7 +207,7 @@ export const CAPABILITY_TOOL_GROUPS: readonly CapabilityToolGroup[] = ['file', '
 // ── MCP server universe ──
 
 /** Halo MCP servers always available: read-only, no side effects, no local reach. */
-export const CAPABILITY_SAFE_MCP: readonly string[] = ['web-search', 'halo-memory']
+export const CAPABILITY_SAFE_MCP: readonly string[] = ['web-search']
 
 /**
  * Halo MCP servers gated by a policy toggle, in display order.
@@ -191,14 +257,14 @@ export type CapabilityMode = 'strict' | 'permissive'
  * Built-in tool names to remove from the model's pool for this turn.
  *
  * In 'permissive' mode only the tools a policy screen actually exposes
- * ({@link DELEGABLE_BUILTIN_TOOLS}) can be withheld, so an all-on policy is
- * byte-identical to having no policy at all.
+ * ({@link DELEGABLE_BUILTIN_TOOLS}, and the skill tool through the skills) can
+ * be withheld, so an all-on policy is byte-identical to having no policy at all.
  */
 export function computeDisallowedBuiltins(
   policy: CapabilityPolicy | undefined,
   mode: CapabilityMode
 ): string[] {
-  const universe = mode === 'strict' ? ALL_BUILTIN_TOOLS : DELEGABLE_BUILTIN_TOOLS.map((t) => t.name)
+  const universe = mode === 'strict' ? ALL_BUILTIN_TOOLS : [...DELEGABLE_BUILTIN_TOOLS.map((t) => t.name), SKILL_TOOL]
   return universe.filter((name) => !allowsBuiltin(policy, name, mode))
 }
 
@@ -208,9 +274,30 @@ export function allowsBuiltin(
   name: string,
   mode: CapabilityMode
 ): boolean {
+  const tool = canonicalBuiltinTool(name)
+  if (ALWAYS_AVAILABLE_BUILTIN_TOOLS.includes(tool)) return true
+  if (tool === SKILL_TOOL) return grantsAnySkill(policy, mode)
   const listed = policy?.allowedTools
   if (listed === undefined) return mode === 'permissive'
-  return listed.includes(name)
+  return listed.includes(tool)
+}
+
+/** Whether a skill may be loaded under this policy, by the folder name the engine registers it under. */
+export function allowsSkill(
+  policy: CapabilityPolicy | undefined,
+  skill: string,
+  mode: CapabilityMode
+): boolean {
+  const listed = policy?.allowedSkills
+  if (listed === undefined) return mode === 'permissive'
+  return listed.includes(skill)
+}
+
+/** Whether this policy lets the caller load any skill at all. */
+export function grantsAnySkill(policy: CapabilityPolicy | undefined, mode: CapabilityMode): boolean {
+  const listed = policy?.allowedSkills
+  if (listed === undefined) return mode === 'permissive'
+  return listed.length > 0
 }
 
 /** Whether a gated Halo capability is granted under this policy. */
@@ -316,7 +403,7 @@ export function buildAllowedToolRules(
   policy: CapabilityPolicy | undefined,
   mode: CapabilityMode
 ): string[] {
-  const rules: string[] = []
+  const rules: string[] = [...ALWAYS_AVAILABLE_BUILTIN_TOOLS]
   for (const { name } of DELEGABLE_BUILTIN_TOOLS) {
     if (name === 'Bash') continue
     if (allowsBuiltin(policy, name, mode)) rules.push(name)
@@ -344,8 +431,9 @@ export function isRestrictivePolicy(
   if (computeDisallowedBuiltins(policy, mode).length > 0) return true
   if (resolveBashAccess(policy, mode).scope !== 'full') return true
   if (CAPABILITY_MCP_TOGGLES.some((toggle) => !allowsCapability(policy, toggle.key, mode))) return true
-  // An explicit user-MCP list can only ever be narrower than "all of them".
-  return policy.allowedUserMcp !== undefined
+  // An explicit list of user MCP servers or skills can only ever be narrower
+  // than "all of them".
+  return policy.allowedUserMcp !== undefined || policy.allowedSkills !== undefined
 }
 
 /**
@@ -354,15 +442,17 @@ export function isRestrictivePolicy(
  * The per-call gate needs this to fail closed on a tool that is not in
  * {@link DELEGABLE_BUILTIN_TOOLS} — a tool the owner was never shown a switch
  * for is one they never granted, and a new SDK tool must not arrive already
- * permitted.
+ * permitted. The skill tool is answered per skill, by the gate, not here.
  */
 export function allowsBuiltinAtCallTime(
   policy: CapabilityPolicy | undefined,
   name: string,
   mode: CapabilityMode
 ): boolean {
-  if (!DELEGABLE_BUILTIN_TOOLS.some((tool) => tool.name === name)) return false
-  return allowsBuiltin(policy, name, mode)
+  const tool = canonicalBuiltinTool(name)
+  if (ALWAYS_AVAILABLE_BUILTIN_TOOLS.includes(tool)) return true
+  if (!DELEGABLE_BUILTIN_TOOLS.some((delegable) => delegable.name === tool)) return false
+  return allowsBuiltin(policy, tool, mode)
 }
 
 // ── Presets ──
@@ -392,7 +482,7 @@ export function capabilityPolicyFromPreset(preset: CapabilityPresetId): Capabili
     allowedTools: DELEGABLE_BUILTIN_TOOLS.filter((tool) =>
       preset === 'workspace'
         ? tool.group !== 'advanced' || tool.name !== 'Bash'
-        : tool.group === 'file' || tool.group === 'network' || tool.name === 'TodoWrite'
+        : tool.group === 'file' || tool.group === 'network'
     ).map((tool) => tool.name),
     bashScope: 'full',
     allowAiBrowser: false,
