@@ -38,6 +38,13 @@ import { registerBrowserHostHandlers } from '../ipc/browser-host'
  * getSwitchValue() reports, not what is loaded. It used to say 'headless' and
  * survived purely on that accident. Not worth keeping a line that reads as an
  * intent the process cannot satisfy.
+ *
+ * The same caveat applies to no-sandbox below, and it is not academic: the
+ * container runs as root, and Electron's root check also reads the real command
+ * line before this file is loaded, aborting with a FATAL at
+ * electron_main_delegate.cc (exit 133). So --no-sandbox has to be on argv too —
+ * the switch here only reaches process launches that happen later. Both flags
+ * are the entrypoint's responsibility; see deploy/server/docker-entrypoint.sh.
  */
 export function applyServerModeSwitches(app: App): void {
   app.commandLine.appendSwitch('no-sandbox')
