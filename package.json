@@ -259,6 +259,10 @@
       {
         "from": "resources/office-runtime",
         "to": "office-runtime"
+      },
+      {
+        "from": "resources/office-runtime/node_modules",
+        "to": "office-runtime/node_modules"
       }
     ],
     "asarUnpack": [

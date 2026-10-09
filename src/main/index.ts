@@ -275,9 +275,10 @@ import { recordProcessGone, recordRendererHang, startPerfTelemetry, writePreCras
 import { initInstanceId, shutdownHealthSystem, onRendererCrash, onRendererUnresponsive, sampleResourcesNow } from './services/health'
 import { initSdk } from './services/agent/resolved-sdk'
 
-// Headless server mode: apply no-display / no-sandbox switches before the app
-// becomes ready (required for Electron to start without a display in a container),
-// and route container stop signals (SIGTERM/SIGINT) into a graceful quit.
+// Headless server mode: apply the container switches (no-sandbox, no GPU) before
+// the app becomes ready, and route container stop signals (SIGTERM/SIGINT) into a
+// graceful quit. The Ozone platform is NOT set here — it must come from the real
+// command line, and it must not be 'headless'; see applyServerModeSwitches.
 if (isServerMode()) {
   applyServerModeSwitches(app)
   installServerSignalHandlers(app)

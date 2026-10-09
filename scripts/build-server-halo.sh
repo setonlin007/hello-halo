@@ -80,7 +80,10 @@ node_modules/.bin/electron-builder --linux dir --x64
 # 4) Compress + split into the repo's bundle/.
 log "compressing + splitting bundle into $OUT_REPO/bundle/ ..."
 TMP_TGZ="$(mktemp -t halo-bundle.XXXXXX).tgz"
-tar czf "$TMP_TGZ" -C dist linux-unpacked
+# COPYFILE_DISABLE: on macOS, bsdtar writes an AppleDouble "._name" sidecar for
+# every file carrying extended attributes, which lands thousands of junk files in
+# the Linux image. No-op on Linux.
+COPYFILE_DISABLE=1 tar czf "$TMP_TGZ" -C dist linux-unpacked
 
 rm -f "$OUT_REPO"/bundle/halo-bundle.tgz.part-*
 mkdir -p "$OUT_REPO/bundle"
