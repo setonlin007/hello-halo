@@ -51,6 +51,7 @@ import {
   extractScheduleValue,
   applyScheduleValue,
   applyWorkdayCalendar,
+  offersWorkdayCalendar,
   type ScheduleValue,
 } from './schedule-utils'
 
@@ -358,10 +359,10 @@ function SettingsGroup({ id, title, description, summary, dirty, children }: {
     <div
       id={id}
       className={`scroll-mt-4 bg-card border rounded-xl px-4 py-4 sm:px-5 transition-colors ${
-        dirty ? 'border-halo-warning/50' : 'border-border'
+        dirty ? 'border-halo-warning/50' : 'border-border-soft'
       }`}
     >
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 pb-3 border-b border-border/70">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 pb-3 border-b border-border-faint">
         <h2 className="text-sm font-semibold text-foreground flex-shrink-0">{title}</h2>
         {summary && (
           <span className="ml-auto text-[11px] text-muted-foreground text-right">{summary}</span>
@@ -385,6 +386,7 @@ const ADVANCED_EXPANDED_KEY = 'halo-app-settings-advanced-expanded'
 interface SettingsTabProps {
   app: InstalledApp
   appId: string
+  showWorkdayCalendar: boolean
   spaceName?: string
   t: (s: string, opts?: Record<string, unknown>) => string
   /**
@@ -398,7 +400,7 @@ interface SettingsTabProps {
   restartedAt: number | null
 }
 
-function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgent, restarting, restartedAt }: SettingsTabProps) {
+function SettingsTab({ app, appId, showWorkdayCalendar, spaceName, t, onRequireRestart, onRestartAgent, restarting, restartedAt }: SettingsTabProps) {
   const { updateAppConfig, updateAppSpec, updateAppOverrides, uninstallApp } = useAppsStore()
   const [showUninstallConfirm, setShowUninstallConfirm] = useState(false)
   const [showClearMemoryConfirm, setShowClearMemoryConfirm] = useState(false)
@@ -806,19 +808,21 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
                 value={currentScheduleValue}
                 onChange={handleScheduleValueChange}
               />
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-sm text-foreground">{t('Only on mainland China working days')}</div>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    {t('Skips public holidays and runs on make-up working days. Set the schedule to run every day; the holiday calendar decides which days count.')}
-                  </p>
+              {showWorkdayCalendar && (
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm text-foreground">{t('Only on mainland China working days')}</div>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {t('Skips public holidays and runs on make-up working days. Set the schedule to run every day; the holiday calendar decides which days count.')}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={usesWorkdayCalendar(scheduleSubscription)}
+                    onCheckedChange={handleWorkdayCalendarToggle}
+                    size="sm"
+                  />
                 </div>
-                <Switch
-                  checked={usesWorkdayCalendar(scheduleSubscription)}
-                  onCheckedChange={handleWorkdayCalendarToggle}
-                  size="sm"
-                />
-              </div>
+              )}
             </>
           ) : !hasSchedule && (
             <p className="text-xs text-muted-foreground">
@@ -1036,7 +1040,7 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
       </SettingsGroup>
 
       {/* ── Group 7: Advanced (collapsed by default) ── */}
-      <div id="settings-group-advanced" className="scroll-mt-4 bg-card border border-border rounded-xl px-4 py-4 sm:px-5">
+      <div id="settings-group-advanced" className="scroll-mt-4 bg-card border border-border-soft rounded-xl px-4 py-4 sm:px-5">
         <Disclosure title={t('Advanced')} persistKey={ADVANCED_EXPANDED_KEY}>
           <UpgradeSection app={app} appId={appId} t={t} />
 
@@ -1181,8 +1185,8 @@ function SettingsTab({ app, appId, spaceName, t, onRequireRestart, onRestartAgen
           </div>
 
           {/* ── Danger Zone ── */}
-          <div className="space-y-2">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <div className="space-y-2 rounded-lg bg-destructive/[0.02] p-3">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-destructive">
               {t('Danger zone')}
             </h3>
             {showClearMemoryConfirm ? (
@@ -1459,6 +1463,20 @@ export function AppConfigPanel({ appId, spaceName }: AppConfigPanelProps) {
   const app = apps.find(a => a.id === appId)
 
   const [activeTab, setActiveTab] = useState<ConfigTab>('settings')
+  const scheduleSubscription = app?.spec.type === 'automation'
+    ? app.spec.subscriptions?.find(s => s.source.type === 'schedule')
+    : undefined
+  const workdayCalendarOffered = activeTab === 'settings' && !!scheduleSubscription
+    && !!extractScheduleValue(scheduleSubscription)
+    && offersWorkdayCalendar(scheduleSubscription, getCurrentLanguage())
+  const [workdayCalendarVisibility, setWorkdayCalendarVisibility] = useState({ appId, visible: workdayCalendarOffered })
+  const showWorkdayCalendar = workdayCalendarOffered
+    || (workdayCalendarVisibility.appId === appId && workdayCalendarVisibility.visible)
+
+  // Keep a shown control reversible for this panel visit, never for another app.
+  if (workdayCalendarVisibility.appId !== appId || workdayCalendarVisibility.visible !== showWorkdayCalendar) {
+    setWorkdayCalendarVisibility({ appId, visible: showWorkdayCalendar })
+  }
 
   // Config changes auto-apply (the backend rebuilds the chat session on
   // permission/spec/config change). This hint stays as a visible, safe manual
@@ -1580,6 +1598,7 @@ export function AppConfigPanel({ appId, spaceName }: AppConfigPanelProps) {
         <SettingsTab
           app={app}
           appId={appId}
+          showWorkdayCalendar={showWorkdayCalendar}
           spaceName={spaceName}
           t={t}
           onRequireRestart={() => setRestartHinted(true)}

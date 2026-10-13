@@ -626,7 +626,17 @@ CSS variable-based theming. **Do not use hardcoded colors.**
 - Follows shadcn/ui design pattern
 - Uses CSS variables (`--background`, `--foreground`, `--primary`, etc.)
 - Components reference colors via `hsl(var(--xxx))`
-- Default system theme (respects OS preference), `.light` / `.dark` class overrides
+- Dark is the `:root` default; `<html class="light">` is set from the theme
+  setting (`system`, the default, follows the OS). Tailwind's `dark:` tracks
+  only the OS, so it is wrong whenever the user picks a theme explicitly.
+- Soft dividers: `border-border-soft` / `border-border-faint` (also `divide-`).
+  Light resolves them to `--border` at 0.6 / 0.5; dark uses solid colors,
+  because an alpha border vanishes on a near-black canvas. Put no `/NN` on
+  `border-border` or on these two (older `/20`–`/70` uses still fade in dark).
+- Dark-only tweaks: the `dark-ui:` variant (`:root:not(.light) &`). Its
+  selector outranks every plain state variant (`hover:`, `group-hover:`,
+  `data-[…]:`), so restate each state it overrides under `dark-ui:` too.
+  Changing one theme must leave the other identical.
 
 ```css
 /* Correct */
@@ -867,6 +877,21 @@ listener (`src/main/http/self-api/`) reached with curl.
   given and its manual entry has to say so. The injection silently narrowed
   list responses, leaving the agent to under-report against the window the
   user was looking at.
+- **An invited action is not a standing capability.** An owner's IM relay note
+  may carry a temporary HTTP grant even with `halo-api-ref` off. `http/self-api`
+  issues and validates it: one exact method and path, a memory-only grant registry,
+  reusable for 24 hours at most, always intersected with `scope.json`. Runtime owns
+  the action and its current validity (owner and private-recipient eligibility,
+  live session, bot/app/team binding, open question). Opaque in-memory revisions owned
+  by the session registry and channel manager prevent revoked grants from reviving
+  when a chat or old settings are restored. Bootstrap injects the issuer through
+  `InitAppRuntimeDeps.relayActionAccess`. Infrastructure failures leave an
+  instruction to answer in Halo without dropping other relay context; revoked
+  authorization aborts preparation. The human-readable IM record excludes appended
+  relay instructions through `AppChatRequest.recorded`, though engine history may
+  retain them. Ordinary turns receive neither a grant nor an action guide, and
+  guests never receive either. No engine or MCP surface is added. See apps/runtime
+  DESIGN §2.3 and §2.14.
 - **Adding a route** means adding its meta entry too — `npm run test:api-ref`
   fails the build when the generated tree and the routes have drifted.
 - **A capability group is described in one file and furnished in another.**
