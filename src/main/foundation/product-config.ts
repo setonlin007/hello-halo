@@ -75,7 +75,7 @@ export interface UpdateConfig {
 export interface BrowserPolicy {
   /** Policy mode */
   mode: 'allowlist' | 'blocklist' | 'unrestricted'
-  /** Domain patterns for allowlist mode (e.g. "*.weoa.com", "example.com") */
+  /** Domain patterns for allowlist mode (e.g. "*.corp.example.com", "example.com") */
   allowlist?: string[]
   /** Domain patterns for blocklist mode */
   blocklist?: string[]

@@ -61,7 +61,7 @@ product config invalidates the cache on the next `track()`.
 `userId` has two different sources. On the desktop it is the persisted UUID
 in `config.analytics.userId`. In server mode `loadOrCreateConfig()` replaces
 it with `foundation/runtime-mode.ts#getInstanceId()` — the container
-hostname, which on WFaaS is the function id visible in the access URL.
+hostname, which on a function platform is typically the function id visible in the access URL.
 
 Deriving it from the platform rather than from disk is deliberate. A
 container filesystem is not a dependable anchor: when it resets, the

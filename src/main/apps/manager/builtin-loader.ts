@@ -266,7 +266,7 @@ function stampBuiltin<T extends AppSpec>(spec: T): T {
 /**
  * Install every dependency in `spec.requires.skills` — both the ones bundled
  * under `<appDir>/skills/` (passed in `bundledSkills`, matched by `dep.id`)
- * and any plain store-slug reference (e.g. `halo-team/weoa-todo-list`), which
+ * and any plain store-slug reference (e.g. `halo-team/example-todo-list`), which
  * this delegates to `installFromStore()` the same way a store-installed app's
  * dependencies are resolved. Without this, a builtin whose spec declares a
  * non-bundled skill dependency would install with that dependency silently
@@ -594,7 +594,7 @@ async function processEntry(
   // AppAlreadyInstalledError, which would otherwise undo the `continue` above.
   //
   // Matched by spec.store.slug rather than specId: a non-bundled dep's `id`
-  // (e.g. "halo-team/weoa-todo-list") is the registry slug it was installed
+  // (e.g. "halo-team/example-todo-list") is the registry slug it was installed
   // under, which withInstallStoreMetadata() persists as spec.store.slug —
   // specId instead holds the fetched spec's own `name` field, which is not
   // guaranteed to equal the slug's second segment.

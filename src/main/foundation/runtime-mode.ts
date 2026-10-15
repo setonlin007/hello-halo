@@ -20,7 +20,7 @@ export function isServerMode(): boolean {
 
 /**
  * Port the headless HTTP server should bind. Honors the platform-provided PORT
- * (Knative/WFaaS inject it) first, then HALO_SERVER_PORT, falling back to 8080.
+ * (Knative and other serverless platforms inject it) first, then HALO_SERVER_PORT, falling back to 8080.
  */
 export function getServerPort(): number {
   const raw = process.env.PORT || process.env.HALO_SERVER_PORT
@@ -32,7 +32,7 @@ export function getServerPort(): number {
  * Which deployment this process belongs to — the identity telemetry is
  * attributed to in server mode.
  *
- * On WFaaS the container hostname is the function id (`sb-137f1ca9-65f`), the
+ * On a function platform the container hostname is typically the function id, the
  * same string that appears in the access URL and the operator console, and it
  * survives cold starts. Measured there as identical across `gethostname(2)`,
  * `/proc/sys/kernel/hostname` and `$HOSTNAME`; `K_SERVICE` is not injected, so

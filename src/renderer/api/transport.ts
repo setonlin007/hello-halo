@@ -119,7 +119,7 @@ export function getRemoteServerUrl(): string {
     return url
   }
   // Remote: derive the base from the directory the app is served from, so a
-  // reverse-proxy path prefix (e.g. WFaaS serves the app under /fc-xxx/) is
+  // reverse-proxy path prefix (e.g. a function platform serving the app under /fc-xxx/) is
   // preserved on API and WebSocket requests — origin alone would drop it.
   // SPA assets are already relative to this base; new URL('.', …) yields the
   // mount directory, and we strip the trailing slash so `${base}${path}`
