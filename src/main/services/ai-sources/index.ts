@@ -9,6 +9,7 @@ export { SubagentModelError, getSubagentModelConfigurationSnapshot, type Subagen
 
 // Manager
 export { getAISourceManager, AISourceManager } from './manager'
+export { followOrganizationSignIn } from './organization-accounts'
 export { watchCatalogSignals, type CatalogSignal } from './catalog-signals'
 export { watchListedSources } from './listed-sources'
 

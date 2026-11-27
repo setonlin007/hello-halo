@@ -4,6 +4,7 @@ import {
   type EnterpriseIdentityProvider,
   type OrgProviderSnapshot,
   type OrgSignInAlternative,
+  type OrgToolCredential,
 } from '../../../shared/interfaces/enterprise-identity-provider'
 import type { OrgCapabilityView, OrgSignInResult, OrgSignInState } from '../../../shared/types/enterprise-identity'
 import { Emitter, type IDisposable } from '../../platform/event'
@@ -47,6 +48,7 @@ const AUDIENCE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const MAX_TIMER_MS = 2 ** 31 - 1
 const SIGN_IN_TIMEOUT_MS = 10 * 60_000
 const ISSUE_RETRY_MS = [30_000, 120_000, 300_000]
+const RESTORE_WAIT_MS = 10_000
 
 type SignOutScope = Parameters<EnterpriseIdentityProvider['signOut']>[0]
 
@@ -184,6 +186,55 @@ export class EnterpriseIdentityService {
       return {}
     }
     return sanitizeSessionEnvironment(raw)
+  }
+
+  /**
+   * A credential for a model account's audience, issued on request and never
+   * written to disk. Undefined unless the sign-in is active with the
+   * capability ready; a restore in progress is waited for briefly.
+   */
+  async issueAccountCredential(audience: string, capability: string): Promise<OrgToolCredential | undefined> {
+    if (!AUDIENCE.test(audience) || this.disposed) return undefined
+    await this.activate()
+    if (this.state.status === 'restoring') await this.leaveRestoring(RESTORE_WAIT_MS)
+    const provider = this.provider
+    const limit = () => {
+      if (this.disposed || this.signedOutLocally || this.issuanceBlocked || this.signOutTask || this.state.status !== 'active') return undefined
+      const ready = this.state.capabilities.find(item => item.id === capability && item.status === 'ready')
+      return ready ? ready.expiresAt ?? Infinity : undefined
+    }
+    const before = limit()
+    if (!provider || before === undefined) return undefined
+    const subject = this.subject
+    let credential: OrgToolCredential
+    try {
+      credential = await provider.issueCredential(audience)
+    } catch {
+      this.log.warn('[EnterpriseIdentity] Could not obtain account credential', { audience })
+      return undefined
+    }
+    const after = limit()
+    if (after === undefined || this.subject !== subject) return undefined
+    const expiresAt = Math.min(after, credential?.expiresAt)
+    if (typeof credential?.token !== 'string' || !credential.token || !Number.isFinite(expiresAt) || expiresAt <= this.now()) {
+      this.log.warn('[EnterpriseIdentity] Provider returned an invalid account credential', { audience })
+      return undefined
+    }
+    return { token: credential.token, expiresAt }
+  }
+
+  private leaveRestoring(timeoutMs: number): Promise<void> {
+    return new Promise(resolve => {
+      let listener: IDisposable | undefined
+      const done = () => {
+        clearTimeout(timer)
+        listener?.dispose()
+        resolve()
+      }
+      const timer = setTimeout(done, timeoutMs)
+      timer.unref?.()
+      listener = this.onDidChange(state => { if (state.status !== 'restoring') done() })
+    })
   }
 
   retry(): Promise<OrgSignInState> {

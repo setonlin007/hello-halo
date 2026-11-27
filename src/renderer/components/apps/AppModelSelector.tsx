@@ -14,6 +14,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { ChevronDown, Brain, Check, X } from 'lucide-react'
 import { useAppStore } from '../../stores/app.store'
+import { useSourceDisplayName } from '../../hooks/useSourceDisplayName'
 import {
   resolveModelSelection,
   getCurrentModelName,
@@ -71,8 +72,9 @@ function getModelsForSource(source: AISource): ModelOption[] {
 }
 
 /** Get display name for a source */
-function getSourceDisplayName(source: AISource, t: (s: string) => string): string {
-  if (source.name) return source.name
+function getSourceDisplayName(source: AISource, t: (s: string) => string, accountName: (source: AISource) => string): string {
+  const name = accountName(source)
+  if (name) return name
   if (source.authType === 'oauth') return 'OAuth Provider'
   if (isAnthropicProvider(source.provider)) return 'Claude API'
   return t('Custom API')
@@ -82,14 +84,15 @@ function getSourceDisplayName(source: AISource, t: (s: string) => string): strin
 function resolveSelectionLabel(
   aiSources: AISourcesConfig,
   selected: ResolvedModelSelection,
-  t: (s: string) => string
+  t: (s: string) => string,
+  accountName: (source: AISource) => string
 ): string {
   if (!selected.own) return `${t('Follow global')} (${getCurrentModelName(aiSources)})`
   if (selected.group) return groupTitle(selected.group.name, t)
 
   const model = getModelsForSource(selected.source).find(m => m.id === selected.modelId)
     ?? findWithdrawnModel(selected.source, selected.modelId)
-  return `${getSourceDisplayName(selected.source, t)} / ${model?.name || selected.modelId}`
+  return `${getSourceDisplayName(selected.source, t, accountName)} / ${model?.name || selected.modelId}`
 }
 
 // ============================================
@@ -105,6 +108,7 @@ export function AppModelSelector({
   onChange,
 }: AppModelSelectorProps) {
   const { t } = useTranslation()
+  const accountName = useSourceDisplayName()
   const { config } = useAppStore()
   const [isOpen, setIsOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
@@ -158,7 +162,7 @@ export function AppModelSelector({
     }
   }, [isOpen])
 
-  const selectionLabel = resolveSelectionLabel(aiSources, selected, t)
+  const selectionLabel = resolveSelectionLabel(aiSources, selected, t, accountName)
 
   const handleSelectGlobal = () => {
     if (disabled) return
@@ -252,7 +256,7 @@ export function AppModelSelector({
               const isExpanded = expandedSection === source.id
               const isSelectedSource = hasOverride && selected.source?.id === source.id
               const models = getModelsForSource(source)
-              const displayName = getSourceDisplayName(source, t)
+              const displayName = getSourceDisplayName(source, t, accountName)
 
               return (
                 <div key={source.id}>

@@ -55,6 +55,14 @@ describe('watchListedSources', () => {
     expect(onChange).not.toHaveBeenCalled()
   })
 
+  it('announces an account signing in or out', () => {
+    const onChange = vi.fn()
+    watchListedSources(onChange)
+    save(sources([account('fly', { accessToken: '', tokenExpires: undefined })]))
+    save(sources([account('fly', { accessToken: 'again' })]))
+    expect(onChange.mock.calls.map(call => call[0].sourceIds)).toEqual([['fly'], ['fly']])
+  })
+
   it('announces removals, renames, model lists and groups', () => {
     const onChange = vi.fn()
     config.saved = sources([account('fly'), account('bell')], 'fly')

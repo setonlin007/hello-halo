@@ -2,6 +2,7 @@ import { useId, useState, type ReactNode } from 'react'
 import { ChevronRight, Search } from 'lucide-react'
 import { getSourceAccountName, type AISource, type ModelOption } from '../../../shared/types/ai-sources'
 import { useTranslation } from '../../i18n'
+import { useSourceDisplayName } from '../../hooks/useSourceDisplayName'
 
 const MAX_ROWS_PER_ACCOUNT = 100
 
@@ -46,8 +47,9 @@ export function AccountModelSection({ source, models, initiallyExpanded, searchi
   const [open, setOpen] = useState(initiallyExpanded)
   const [collapsedInSearch, setCollapsedInSearch] = useState(false)
   const id = useId()
+  const accountName = useSourceDisplayName()
   const person = getSourceAccountName(source)
-  const name = source.name || source.provider
+  const name = accountName(source) || source.provider
 
   if (unavailable) return (
     <div className="px-3 py-2 opacity-70">

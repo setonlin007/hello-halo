@@ -4,6 +4,7 @@ const env = vi.hoisted(() => ({ runner: null as any, update: vi.fn(), create: vi
 vi.mock('react', async original => ({ ...await original<typeof import('react')>(), useState: (initial: any) => env.runner.state(initial), useRef: (initial: any) => env.runner.ref(initial), useId: () => 'editor', useEffect: () => {} }))
 vi.mock('../../../src/renderer/i18n', () => ({ useTranslation: () => ({ t: (value: string) => value }) }))
 vi.mock('../../../src/renderer/api', () => ({ api: { updateSubagentModel: env.update, createSubagentModel: env.create } }))
+vi.mock('../../../src/renderer/hooks/useSourceDisplayName', () => ({ useSourceDisplayName: () => (source: { name: string }) => source.name }))
 import { ProfileEditor } from '../../../src/renderer/components/subagent-models/ProfileEditor'
 import { TargetPicker } from '../../../src/renderer/components/subagent-models/TargetPicker'
 import { SUBAGENT_MODEL_DEFAULT_PURPOSES } from '../../../src/shared/subagent-models'

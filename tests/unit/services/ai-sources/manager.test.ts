@@ -49,8 +49,10 @@ vi.mock('../../../../src/main/services/ai-sources/auth-loader', () => ({
   loadAuthProvidersAsync: vi.fn(async () => [])
 }))
 
+const organizationTypes = vi.hoisted(() => ({ value: [] as string[] }))
 vi.mock('../../../../src/main/foundation/product-config', () => ({
-  loadProductConfig: vi.fn(() => ({ name: 'test', version: '0.0.0', authProviders: [] }))
+  loadProductConfig: vi.fn(() => ({ name: 'test', version: '0.0.0', authProviders: [] })),
+  getOrganizationModelProviderTypes: vi.fn(() => organizationTypes.value)
 }))
 
 vi.mock('uuid', () => ({ v4: () => `uuid-${++uuidCounter.n}` }))
@@ -2028,5 +2030,224 @@ describe('load-balancing groups', () => {
         await expect(mgr.resolveMemberBackend('s1', 'm1')).resolves.toMatchObject({ key: 'sk-fixed' })
       })
     })
+  })
+})
+
+describe('an account that comes with the organization sign-in', () => {
+  const proof = { token: 'proof', expiresAt: 5_000 }
+  function provider(mgr: AISourceManager, uid: string) {
+    const stub = {
+      type: 'test-oauth', displayName: 'Test OAuth',
+      startLogin: vi.fn(async () => ({ success: true, data: { state: 'state' } })),
+      completeLogin: vi.fn(async () => ({ success: true, data: {
+        success: true, user: { name: uid, uid },
+        _tokenData: { accessToken: `personal-${uid}`, refreshToken: 'browser-refresh', expiresAt: 100, uid },
+        _availableModels: ['m1'], _defaultModel: 'm1'
+      } })),
+      signInWithOrganization: vi.fn(async (_proof: unknown, _previous?: string) => ({ success: true, data: {
+        success: true, user: { name: uid, uid },
+        _tokenData: { accessToken: `token-${uid}`, refreshToken: '', expiresAt: 9_000, uid },
+        _availableModels: ['m1'], _defaultModel: 'm1'
+      } })),
+      cancelLogin: vi.fn(async () => ({ success: true })),
+      logout: vi.fn(async (_config?: unknown) => ({ success: true })),
+      getBackendConfig: vi.fn()
+    }
+    mgr.registerProvider(stub as never)
+    return stub
+  }
+  function manager(issue: () => Promise<typeof proof | undefined> = async () => proof) {
+    const mgr = new AISourceManager()
+    mgr.setOrganizationSignIn(vi.fn(issue))
+    return mgr
+  }
+  function stored(): AISource[] {
+    return (store.value.aiSources as AISourcesConfig).sources
+  }
+  function current(): string | null {
+    return (store.value.aiSources as AISourcesConfig).currentId
+  }
+  function revokedTokens(stub: ReturnType<typeof provider>): unknown[] {
+    return stub.logout.mock.calls.map(([config]) => (config as any)['test-oauth'].accessToken)
+  }
+
+  beforeEach(() => { organizationTypes.value = ['test-oauth'] })
+
+  it('signs in as its own account, capped at the sign-in, and is current when nothing else is', async () => {
+    seed({ sources: [] })
+    const mgr = manager()
+    const stub = provider(mgr, 'alice')
+    await mgr.signInOrganizationAccounts()
+    expect(stub.signInWithOrganization).toHaveBeenCalledWith(proof, undefined)
+    expect(stored()).toHaveLength(1)
+    expect(stored()[0]).toMatchObject({
+      managedBy: 'organization', accessToken: 'token-alice', refreshToken: '', tokenExpires: 5_000, user: { uid: 'alice' }
+    })
+    expect(current()).toBe(stored()[0].id)
+  })
+
+  it('keeps the account the person already selected', async () => {
+    seed({ currentId: 'other', sources: [apiKeySource({ id: 'other' })] })
+    const mgr = manager()
+    provider(mgr, 'alice')
+    await mgr.signInOrganizationAccounts()
+    expect(stored()).toHaveLength(2)
+    expect(current()).toBe('other')
+  })
+
+  it('never takes over the person\'s own account of the same type', async () => {
+    seed({ currentId: 'mine', sources: [
+      oauthSource({ id: 'mine', provider: 'test-oauth', user: { uid: 'alice', name: 'alice' }, refreshToken: 'browser-refresh' })
+    ] })
+    const mgr = manager()
+    provider(mgr, 'alice')
+    await mgr.signInOrganizationAccounts()
+    expect(stored()).toHaveLength(2)
+    expect(stored()[0]).toMatchObject({ id: 'mine', accessToken: 'tok', refreshToken: 'browser-refresh' })
+    expect(stored()[0].managedBy).toBeUndefined()
+    expect(stored()[1]).toMatchObject({ managedBy: 'organization', accessToken: 'token-alice' })
+  })
+
+  it('leaves a signed-in account alone unless asked to renew, and renews with its token', async () => {
+    seed({ sources: [oauthSource({
+      id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: 'token-old', refreshToken: '', user: { uid: 'alice', name: 'alice' }
+    })] })
+    const mgr = manager()
+    const stub = provider(mgr, 'alice')
+    await mgr.signInOrganizationAccounts()
+    expect(stub.signInWithOrganization).not.toHaveBeenCalled()
+    await mgr.signInOrganizationAccounts(true)
+    expect(stub.signInWithOrganization).toHaveBeenCalledWith(proof, 'token-old')
+    expect(stored()).toHaveLength(1)
+    expect(stored()[0]).toMatchObject({ id: 'org', accessToken: 'token-alice' })
+    expect(stub.logout).not.toHaveBeenCalled()
+  })
+
+  it('follows a different person and revokes the previous person\'s token', async () => {
+    seed({ sources: [
+      oauthSource({ id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: 'token-alice', user: { uid: 'alice', name: 'alice' } }),
+      oauthSource({ id: 'mine', provider: 'test-oauth', user: { uid: 'bob', name: 'bob' } })
+    ] })
+    const mgr = manager()
+    const stub = provider(mgr, 'bob')
+    await mgr.signInOrganizationAccounts(true)
+    expect(stored().map(source => source.id)).toEqual(['org', 'mine'])
+    expect(stored()[0]).toMatchObject({ managedBy: 'organization', accessToken: 'token-bob', user: { uid: 'bob' } })
+    expect(stored()[1]).toMatchObject({ accessToken: 'tok', refreshToken: 'ref' })
+    expect(revokedTokens(stub)).toEqual(['token-alice'])
+  })
+
+  it('clears and revokes the token at sign-out and keeps the account listed', async () => {
+    seed({ currentId: 'org', sources: [oauthSource({
+      id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: 'token-alice', refreshToken: '', tokenExpires: 5_000
+    })] })
+    const mgr = manager()
+    const stub = provider(mgr, 'alice')
+    await mgr.signOutOrganizationAccounts()
+    expect(stored()).toHaveLength(1)
+    expect(stored()[0]).toMatchObject({ id: 'org', accessToken: '', managedBy: 'organization' })
+    expect(stored()[0].tokenExpires).toBeUndefined()
+    expect(current()).toBe('org')
+    expect(revokedTokens(stub)).toEqual(['token-alice'])
+  })
+
+  it('drops an exchange that a sign-out overtook', async () => {
+    seed({ sources: [] })
+    let release!: () => void
+    const mgr = manager(() => new Promise(resolve => { release = () => resolve(proof) }))
+    const stub = provider(mgr, 'alice')
+    const signingIn = mgr.signInOrganizationAccounts()
+    await vi.waitFor(() => expect(release).toBeDefined())
+    await mgr.signOutOrganizationAccounts()
+    release()
+    await signingIn
+    expect(stored()).toHaveLength(0)
+    expect(revokedTokens(stub)).toEqual(['token-alice'])
+  })
+
+  it('starts afresh when signed in again while an overtaken exchange is still running', async () => {
+    seed({ sources: [] })
+    let release!: () => void
+    const issue = vi.fn()
+      .mockImplementationOnce(() => new Promise(resolve => { release = () => resolve(proof) }))
+      .mockImplementation(async () => proof)
+    const mgr = manager(issue)
+    const stub = provider(mgr, 'alice')
+    const overtaken = mgr.signInOrganizationAccounts()
+    await vi.waitFor(() => expect(release).toBeDefined())
+    await mgr.signOutOrganizationAccounts()
+    await mgr.signInOrganizationAccounts(true)
+    release()
+    await overtaken
+    expect(stub.signInWithOrganization).toHaveBeenCalledTimes(2)
+    expect(stored()).toHaveLength(1)
+    expect(stored()[0]).toMatchObject({ managedBy: 'organization', accessToken: 'token-alice' })
+  })
+
+  it('uses a token until shortly before it expires, then exchanges again', async () => {
+    seed({ sources: [oauthSource({
+      id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: 'token-old', refreshToken: '', tokenExpires: Date.now() + 3_600_000
+    })] })
+    const mgr = manager()
+    const stub = provider(mgr, 'alice')
+    expect((await mgr.ensureValidToken('org')).success).toBe(true)
+    expect(stub.signInWithOrganization).not.toHaveBeenCalled()
+    seed({ sources: [oauthSource({
+      id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: 'token-old', refreshToken: '', tokenExpires: Date.now() + 60_000
+    })] })
+    expect((await mgr.ensureValidToken('org')).success).toBe(true)
+    expect(stub.signInWithOrganization).toHaveBeenCalledWith(proof, 'token-old')
+  })
+
+  it('is never the store identity', async () => {
+    seed({ currentId: 'org', sources: [oauthSource({
+      id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: 'token-alice', user: { uid: 'alice', name: 'alice' }
+    })] })
+    const mgr = manager()
+    provider(mgr, 'alice')
+    expect(mgr.getOAuthSource('test-oauth')).toBeNull()
+    expect(await mgr.getOAuthAccessToken('test-oauth')).toBeNull()
+    seed({ currentId: 'org', sources: [
+      oauthSource({ id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: 'token-alice' }),
+      oauthSource({ id: 'mine', provider: 'test-oauth', user: { uid: 'alice', name: 'alice' } })
+    ] })
+    expect(mgr.getOAuthSource('test-oauth')?.id).toBe('mine')
+  })
+
+  it('signs a signed-out account in again when it is used, and refuses without the organization', async () => {
+    seed({ sources: [oauthSource({ id: 'org', provider: 'test-oauth', managedBy: 'organization', accessToken: '', refreshToken: '' })] })
+    let signedIn = false
+    const mgr = manager(async () => signedIn ? proof : undefined)
+    provider(mgr, 'alice')
+    const refused = await mgr.ensureValidToken('org')
+    expect(refused).toMatchObject({ success: false, error: 'Sign in with your organization to use this account.' })
+    signedIn = true
+    expect((await mgr.ensureValidToken('org')).success).toBe(true)
+    expect(stored()[0]).toMatchObject({ id: 'org', accessToken: 'token-alice' })
+  })
+
+  it('a browser login adds a personal account and cannot target the organization\'s', async () => {
+    seed({ sources: [oauthSource({ id: 'org', provider: 'test-oauth', managedBy: 'organization', user: { uid: 'alice', name: 'alice' } })] })
+    const mgr = manager()
+    const stub = provider(mgr, 'alice')
+    const refused = await mgr.startOAuthLogin('test-oauth', 'org')
+    expect(refused.success).toBe(false)
+    expect(stub.startLogin).not.toHaveBeenCalled()
+    const started = await mgr.startOAuthLogin('test-oauth')
+    expect((await mgr.completeOAuthLogin('test-oauth', 'state', started.data!.loginId)).success).toBe(true)
+    expect(stored()).toHaveLength(2)
+    expect(stored()[0]).toMatchObject({ id: 'org', accessToken: 'tok' })
+    expect(stored()[1]).toMatchObject({ accessToken: 'personal-alice', refreshToken: 'browser-refresh' })
+    expect(stored()[1].managedBy).toBeUndefined()
+  })
+
+  it('does nothing for a type the build does not declare', async () => {
+    organizationTypes.value = []
+    seed({ sources: [] })
+    const mgr = manager()
+    const stub = provider(mgr, 'alice')
+    await mgr.signInOrganizationAccounts()
+    expect(stub.signInWithOrganization).not.toHaveBeenCalled()
+    expect(stored()).toHaveLength(0)
   })
 })

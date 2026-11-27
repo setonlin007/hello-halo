@@ -47,6 +47,9 @@ interface OAuthAISourceProvider extends AISourceProvider {
 
   // Optional: metered quota (see below)
   getQuota?(config: AISourcesConfig): Promise<ProviderResult<AuthQuotaSnapshot>>
+
+  // Optional: sign in through the organization sign-in (see below)
+  signInWithOrganization?(proof: OrganizationSignInProof, previousAccessToken?: string): Promise<ProviderResult<OAuthCompleteResult>>
 }
 ```
 
@@ -81,6 +84,18 @@ The manager renews an expired OAuth token before calling `getQuota`, so the
 `config` you receive already carries a valid, decrypted access token. On failure
 return `{ success: false, error }` — the app keeps the previous value and marks
 it stale rather than surfacing an error.
+
+#### Optional: `signInWithOrganization?` (organization sign-in)
+
+A build that declares the provider's type in `enterpriseIdentity.modelAccounts`
+signs its account in without a window. The host passes a proof of the
+organization sign-in, issued for the account's `audience` and never stored;
+the provider exchanges it at its own server and returns the same result as
+`completeLogin`. The host calls it again to renew, passing the current access
+token; a renewal may leave out the model list. The account must not outlive
+`proof.expiresAt`, and `logout` receives the account's config (with
+`managedBy: 'organization'`) so its token can be revoked. `startLogin` stays
+the provider's own login and is never redirected to the organization.
 
 ## Required Types Reference
 

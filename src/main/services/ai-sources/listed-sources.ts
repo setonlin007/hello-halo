@@ -9,12 +9,12 @@ import { getConfig, onAiSourcesConfigChange } from '../../foundation/config.serv
 
 const CURRENT_KEY = '\0current'
 
-/** Credentials and timestamps change on every renewal without changing the listing. */
+/** Credentials and timestamps change on every renewal; only whether an account has one is listed. */
 function listingOf(sources: AISourcesConfig | undefined): Map<string, string> {
   const listing = new Map<string, string>()
   for (const source of sources?.sources ?? []) {
-    const { apiKey: _apiKey, accessToken: _accessToken, refreshToken: _refreshToken, tokenExpires: _tokenExpires, updatedAt: _updatedAt, ...shown } = source
-    listing.set(source.id, JSON.stringify(shown))
+    const { apiKey, accessToken, refreshToken: _refreshToken, tokenExpires: _tokenExpires, updatedAt: _updatedAt, ...shown } = source
+    listing.set(source.id, JSON.stringify({ ...shown, signedIn: !!(apiKey || accessToken) }))
   }
   for (const group of sources?.groups ?? []) listing.set(group.id, JSON.stringify(group))
   listing.set(CURRENT_KEY, sources?.currentId ?? '')

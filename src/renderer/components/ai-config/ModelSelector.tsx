@@ -11,6 +11,7 @@ import { useState, useRef, useEffect } from 'react'
 import { ChevronDown, ChevronRight, Plus, Sparkles, X, Check, RefreshCw } from 'lucide-react'
 import { useAppStore } from '../../stores/app.store'
 import { useAppsStore } from '../../stores/apps.store'
+import { useSourceDisplayName } from '../../hooks/useSourceDisplayName'
 import { useChatStore, selectActiveConversationId, useIsGenerating } from '../../stores/chat.store'
 import { useActiveModelTarget, type ActiveModelTarget } from '../../hooks/useActiveModelTarget'
 import { openPersonModelSettings } from '../../utils/people-navigation'
@@ -127,6 +128,7 @@ function GroupChoiceRow({ group, selected, conversationId, spaceId, engineOverri
  */
 function ModelList({ onDone }: { onDone: () => void }) {
   const { t } = useTranslation()
+  const accountName = useSourceDisplayName()
   const { config, setConfig, navigate } = useAppStore()
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [refreshStatus, setRefreshStatus] = useState<'success' | 'cached' | 'failed' | null>(null)
@@ -266,7 +268,8 @@ function ModelList({ onDone }: { onDone: () => void }) {
 
   // Get display name for source
   const getSourceDisplayName = (source: AISource): string => {
-    if (source.name) return source.name
+    const name = accountName(source)
+    if (name) return name
     if (source.authType === 'oauth') return 'OAuth Provider'
     if (isAnthropicProvider(source.provider)) return 'Claude API'
     return t('Custom API')
@@ -629,6 +632,7 @@ function resolveCardFacts(source: AISource | null | undefined, modelId: string |
  */
 function CurrentModelCard({ onSwitch }: { onSwitch: () => void }) {
   const { t } = useTranslation()
+  const accountName = useSourceDisplayName()
   const navigate = useAppStore(state => state.navigate)
   const conversation = useCurrentConversation()
   const spaceId = useChatStore(state => state.currentSpaceId)
@@ -676,7 +680,7 @@ function CurrentModelCard({ onSwitch }: { onSwitch: () => void }) {
             <span className="truncate text-[15px] font-semibold text-foreground">{name}</span>
             {model && <ModelBadgePill model={model} />}
           </span>
-          <span className="mt-0.5 truncate text-xs text-muted-foreground">{source.name}</span>
+          <span className="mt-0.5 truncate text-xs text-muted-foreground">{accountName(source)}</span>
         </span>
         <ChevronRight className="w-4 h-4 shrink-0 text-subtle-foreground group-hover:text-foreground transition-colors ease-halo" />
       </button>

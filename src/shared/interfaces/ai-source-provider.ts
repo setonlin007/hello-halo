@@ -197,6 +197,23 @@ export interface OAuthAISourceProvider extends AISourceProvider, OAuthProvider {
    * @param config Legacy format (see file header); accessToken is decrypted.
    */
   getQuota?(config: AISourcesConfig): Promise<ProviderResult<AuthQuotaSnapshot>>
+
+  /**
+   * Signs in without a window through the organization sign-in, for a type
+   * listed in `enterpriseIdentity.modelAccounts`. Renewing passes the
+   * account's current token; the catalog may then be left out.
+   */
+  signInWithOrganization?(
+    proof: OrganizationSignInProof,
+    previousAccessToken?: string
+  ): Promise<ProviderResult<OAuthCompleteResult>>
+}
+
+/** Issued by the host for the model account's audience; never stored. */
+export interface OrganizationSignInProof {
+  token: string
+  /** Epoch ms when the sign-in ends; the account must not outlive it. */
+  expiresAt: number
 }
 
 /**

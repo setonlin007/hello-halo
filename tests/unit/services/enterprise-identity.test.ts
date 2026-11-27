@@ -611,3 +611,45 @@ describe('organization sign-in in the built-in browser', () => {
     expect(existsSync(join(dir, 'browser-cookies.json'))).toBe(false)
   })
 })
+
+describe('organization model account credentials', () => {
+  it('issues on request for a ready capability, capped at its expiry, without writing a file', async () => {
+    const expiry = Date.now() + 5_000
+    provider.current = active('principal-a', { intranet: { status: 'ready', expiresAt: expiry }, mail: { status: 'expired' } })
+    const service = newService({ bindings: [] })
+    await expect(service.issueAccountCredential('model', 'intranet')).resolves.toEqual({ token: 'mock-model', expiresAt: expiry })
+    expect(existsSync(credentialPath('model'))).toBe(false)
+    await expect(service.issueAccountCredential('model', 'mail')).resolves.toBeUndefined()
+    await expect(service.issueAccountCredential('bad audience', 'intranet')).resolves.toBeUndefined()
+  })
+
+  it('issues nothing while signed out, and drops an issue the sign-out overtook', async () => {
+    const service = newService({ bindings: [] })
+    await expect(service.issueAccountCredential('model', 'intranet')).resolves.toBeUndefined()
+    provider.set(active())
+    const issue = deferred<OrgToolCredential>()
+    provider.issueCredential.mockImplementationOnce(() => issue.promise)
+    const pending = service.issueAccountCredential('model', 'intranet')
+    await flush()
+    provider.set({ phase: 'settled', capabilities: {} })
+    issue.resolve({ token: 'late', expiresAt: Date.now() + 30_000 })
+    await expect(pending).resolves.toBeUndefined()
+  })
+
+  it('waits for a restore to settle', async () => {
+    provider.current = { phase: 'restoring', capabilities: {} }
+    const service = newService({ bindings: [] })
+    const pending = service.issueAccountCredential('model', 'intranet')
+    await flush()
+    provider.set(active())
+    await expect(pending).resolves.toMatchObject({ token: 'mock-model' })
+  })
+
+  it('reports a failed issue without the credential', async () => {
+    provider.current = active()
+    const service = newService({ bindings: [] })
+    provider.issueCredential.mockRejectedValueOnce(new Error('offline'))
+    await expect(service.issueAccountCredential('model', 'intranet')).resolves.toBeUndefined()
+    expect(log.warn).toHaveBeenCalledWith('[EnterpriseIdentity] Could not obtain account credential', { audience: 'model' })
+  })
+})

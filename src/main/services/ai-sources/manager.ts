@@ -22,6 +22,7 @@ import { v4 as uuidv4 } from 'uuid'
 import type {
   AISourceProvider,
   OAuthAISourceProvider,
+  OrganizationSignInProof,
   ProviderResult
 } from '../../../shared/interfaces'
 import {
@@ -62,7 +63,7 @@ import { getZhipuCodingOAuthProvider } from './providers/zhipu-coding-oauth.prov
 import { getChatGPTProvider } from './providers/chatgpt.provider'
 import { getCliDelegatedProvider } from './providers/cli-delegated.provider'
 import { loadAuthProvidersAsync } from './auth-loader'
-import { loadProductConfig } from '../../foundation/product-config'
+import { loadProductConfig, getOrganizationModelProviderTypes } from '../../foundation/product-config'
 import { decryptString } from '../../foundation/secure-storage.service'
 import { MASK_SENTINEL } from '../../foundation/config-encryption'
 import { normalizeApiUrl, resetGroupSource, type RequestCredentials } from '../../openai-compat-router'
@@ -142,6 +143,8 @@ interface ManagedOAuthLogin {
 const OAUTH_LOGIN_TIMEOUT_MS = 10 * 60 * 1000
 /** Providers renew a token minutes before it expires, so a minute-old answer is still current. */
 const REQUEST_CREDENTIAL_RECHECK_MS = 60_000
+/** An organization token closer than this to expiry is exchanged again before use. */
+const ORGANIZATION_RENEW_MARGIN_MS = 5 * 60_000
 const ACCOUNT_REMOVED_ERROR = 'This account was removed. The next message runs on the current account.'
 const MEMBER_REMOVED_ERROR = 'This account was removed.'
 /** Models of groups, at most `MAX_GROUP_MEMBERS` per group; the oldest answers go first. */
@@ -172,6 +175,10 @@ function loginAccounts(data: OAuthLoginPayload): OAuthLoginAccount[] {
   }]
 }
 
+function findOrganizationSource(sources: AISource[], providerType: ProviderId): AISource | undefined {
+  return sources.find(source => source.provider === providerType && source.managedBy === 'organization')
+}
+
 /**
  * Get display name for a provider type from product.json config
  */
@@ -191,6 +198,10 @@ class AISourceManager {
   private initPromise: Promise<void> | null = null
   private logins = new Map<ProviderId, ManagedOAuthLogin>()
   private tokenRefreshes = new Map<string, { source: AISource; model: string; promise: Promise<ProviderResult<void>> }>()
+  private organizationProof?: (providerType: ProviderId) => Promise<OrganizationSignInProof | undefined>
+  private organizationSignIns = new Map<ProviderId, { task: Promise<ProviderResult<void>>; epoch: number }>()
+  /** Bumped by every organization sign-out, so an exchange it overtook is dropped. */
+  private organizationEpoch = 0
   private catalogRefreshes = new Map<string, ManagedCatalogRefresh>()
   private readonly catalogSchedule = new CatalogSchedule()
   /** Keyed by source and model; see resolveRequestCredentials. */
@@ -300,14 +311,17 @@ class AISourceManager {
     return this.getDecryptedAiSources().sources.find(source => source.id === sourceId) ?? null
   }
 
-  /** Store identity follows the selected account, otherwise the first configured one. */
+  /**
+   * Store identity follows the selected account, otherwise the first configured
+   * one; an organization account is never a person's own identity.
+   */
   getOAuthSource(providerType: ProviderId): AISource | null {
     const config = this.getDecryptedAiSources()
-    const matches = (source: AISource) => source.provider === providerType &&
-      source.authType === 'oauth' && !!source.accessToken
+    const personal = (source: AISource | null): source is AISource => !!source &&
+      source.provider === providerType && source.authType === 'oauth' && source.managedBy !== 'organization'
     const current = getCurrentSource(config)
-    if (current?.provider === providerType && current.authType === 'oauth') return current
-    return config.sources.find(matches) ?? null
+    if (personal(current)) return current
+    return config.sources.find(source => personal(source) && !!source.accessToken) ?? null
   }
 
   /**
@@ -812,6 +826,10 @@ class AISourceManager {
       console.warn(`[AISourceManager] OAuth start refused: provider=${providerType} source=${sourceId} target unavailable or mismatched`)
       return { success: false, error: 'OAuth source not found for this provider' }
     }
+    if (target?.managedBy === 'organization') {
+      console.warn(`[AISourceManager] OAuth start refused: source=${sourceId} comes with the organization sign-in`)
+      return { success: false, error: 'This account comes with the organization sign-in. Sign in with the organization instead.' }
+    }
     const previous = this.logins.get(providerType)
     const login: ManagedOAuthLogin = {
       loginId: uuidv4(), sourceId, target: target ?? undefined,
@@ -1012,7 +1030,7 @@ class AISourceManager {
     const accountIds = new Set(accounts.map(account => account.id).filter(Boolean))
     if (!provider.getAccountId || accountIds.size === 0) return matches
     const sources = this.getAiSourcesConfig().sources
-      .filter(source => source.provider === providerType && source.authType === 'oauth')
+      .filter(source => source.provider === providerType && source.authType === 'oauth' && source.managedBy !== 'organization')
     // A reauthentication only needs its target's current id; a new login only
     // considers accounts no stored source already claims.
     const claimed = new Set(sources.map(source => source.user?.uid).filter((uid): uid is string => !!uid))
@@ -1049,7 +1067,8 @@ class AISourceManager {
     providerType: ProviderId,
     data: OAuthLoginPayload,
     targetId: string | undefined,
-    storedMatches: Map<string, string>
+    storedMatches: Map<string, string>,
+    organization = false
   ): string[] {
     const tokenData = data._tokenData
     const defaultModel = data._defaultModel || ''
@@ -1064,6 +1083,9 @@ class AISourceManager {
     const aiSources = this.getAiSourcesConfig()
     const target = targetId ? aiSources.sources.find(source => source.id === targetId) : undefined
     if (targetId && !target) throw new Error('Source was removed during login')
+    if (target?.managedBy === 'organization' && !organization) {
+      throw new Error('This account comes with the organization sign-in. Sign in with the organization instead.')
+    }
     const accounts = loginAccounts(data)
     if (accounts.some(account => !account.key)) throw new Error('Login returned no access token')
     const matchesTarget = (account: OAuthLoginAccount) => !target?.user?.uid ||
@@ -1075,14 +1097,17 @@ class AISourceManager {
     const ids: string[] = []
     const addedIds: string[] = []
     const now = new Date().toISOString()
-    const sameProvider = (source: AISource) => source.provider === providerType && source.authType === 'oauth'
+    // The organization keeps its own account per type; personal accounts and it never land on each other.
+    const sameProvider = (source: AISource) => source.provider === providerType && source.authType === 'oauth' &&
+      source.managedBy !== 'organization'
+    const organizationSource = organization ? findOrganizationSource(sources, providerType) : undefined
     for (const account of selectedAccounts) {
-      let existing = target
-      if (!existing && account.id) {
+      let existing = organization ? organizationSource : target
+      if (!existing && !organization && account.id) {
         const storedId = storedMatches.get(account.id)
         existing = sources.find(source => sameProvider(source) && source.user?.uid === account.id) ??
           (storedId ? sources.find(source => source.id === storedId) : undefined)
-      } else if (!existing) {
+      } else if (!existing && !organization) {
         // Without a verified identity, multiple accounts cannot be told apart:
         // reuse the provider's only unverified source instead of adding another.
         const unverified = sources.filter(source => sameProvider(source) && !source.user?.uid)
@@ -1107,13 +1132,15 @@ class AISourceManager {
         accountId: data._accountId ?? existing?.accountId,
         profileArn: data._profileArn ?? existing?.profileArn,
         accessToken: account.key,
-        refreshToken: data._accounts?.length ? '' : tokenData?.refreshToken || existing?.refreshToken || '',
+        // An organization account renews through the sign-in only.
+        refreshToken: data._accounts?.length || organization ? '' : tokenData?.refreshToken || existing?.refreshToken || '',
         tokenExpires: tokenData?.expiresAt,
         user: { ...data.user, name: account.label, uid: account.id || existing?.user?.uid || '' },
         model: existing?.model || defaultModel,
         availableModels: loginModels,
         modelCatalogCache: data._modelCatalogCache ?? existing?.modelCatalogCache,
-        createdAt: existing?.createdAt || now, updatedAt: now
+        createdAt: existing?.createdAt || now, updatedAt: now,
+        ...(organization ? { managedBy: 'organization' as const } : {})
       }
       // Only a list the provider sent; `models` may hold just the default Halo filled in.
       const source = existing && !data._catalogDegraded && data._availableModels?.length
@@ -1129,7 +1156,9 @@ class AISourceManager {
     }
     // Adding an account means the user wants to use it now; signing in again to
     // a listed account (expired token, reauthentication) keeps their selection.
-    const currentId = addedIds[0] || aiSources.currentId || ids[0] || null
+    // The organization's account arrives unasked, so it never replaces a selection.
+    const selected = aiSources.sources.some(source => source.id === aiSources.currentId) ? aiSources.currentId : null
+    const currentId = (organization ? selected || ids[0] : addedIds[0] || aiSources.currentId || ids[0]) || null
     saveConfig({ aiSources: { ...aiSources, currentId, sources }, isFirstLaunch: false } as any)
     console.log(`[AISourceManager] OAuth account credentials saved: provider=${providerType} sources=${ids.join(',')} current=${currentId}`)
     return ids
@@ -1166,6 +1195,113 @@ class AISourceManager {
     return { success: true }
   }
 
+  // ========== Organization Accounts ==========
+
+  /** The host's proof of the organization sign-in for a model account type. */
+  setOrganizationSignIn(issue: (providerType: ProviderId) => Promise<OrganizationSignInProof | undefined>): void {
+    this.organizationProof = issue
+  }
+
+  /**
+   * Signs in each account that comes with the organization sign-in and is
+   * missing or signed out; `renew` signs in the signed-in ones again too.
+   */
+  async signInOrganizationAccounts(renew = false): Promise<void> {
+    await this.ensureInitialized()
+    for (const providerType of getOrganizationModelProviderTypes() as ProviderId[]) {
+      if (!renew && findOrganizationSource(this.getAiSourcesConfig().sources, providerType)?.accessToken) continue
+      const result = await this.signInOrganizationAccount(providerType)
+      if (!result.success) console.warn(`[AISourceManager] Organization account not signed in: provider=${providerType} ${result.error}`)
+    }
+  }
+
+  /**
+   * Ends the organization accounts' use at once when the organization sign-in
+   * ends: their tokens are cleared and revoked, the accounts stay listed.
+   */
+  async signOutOrganizationAccounts(): Promise<void> {
+    this.organizationEpoch++
+    const signedIn = this.getDecryptedAiSources().sources.filter(source => source.managedBy === 'organization' && source.accessToken)
+    for (const source of signedIn) {
+      this.tokenRefreshes.delete(source.id)
+      this.writeSource(source.id, { accessToken: '', tokenExpires: undefined })
+      console.log(`[AISourceManager] Organization account signed out: source=${source.id}`)
+    }
+    if (!signedIn.length) return
+    // Providers may still be loading at startup; the tokens are already unusable here.
+    await this.ensureInitialized()
+    await Promise.all(signedIn.map(source => this.revoke(source)))
+  }
+
+  private async ensureOrganizationToken(source: AISource): Promise<ProviderResult<void>> {
+    const provider = this.providers.get(source.provider) as OAuthProviderWithTokenManagement | undefined
+    if (source.accessToken) {
+      const status = provider?.checkTokenWithConfig
+        ? provider.checkTokenWithConfig(this.buildLegacyOAuthConfig(source))
+        : { valid: (source.tokenExpires ?? 0) > Date.now() + ORGANIZATION_RENEW_MARGIN_MS, needsRefresh: false }
+      if (status.valid && !status.needsRefresh) return { success: true }
+    }
+    const result = await this.signInOrganizationAccount(source.provider)
+    if (!result.success) console.warn(`[AISourceManager] Token preparation refused: source=${source.id} ${result.error}`)
+    return result
+  }
+
+  /** One exchange per type at a time; a first sign-in and a renewal share it. */
+  private signInOrganizationAccount(providerType: ProviderId): Promise<ProviderResult<void>> {
+    const pending = this.organizationSignIns.get(providerType)
+    // An exchange started before a sign-out is dropped when it lands, so it is not joined.
+    if (pending?.epoch === this.organizationEpoch) return pending.task
+    const task = this.exchangeOrganizationSignIn(providerType).catch((error): ProviderResult<void> => {
+      console.error(`[AISourceManager] Organization sign-in failed: provider=${providerType}`, error)
+      return { success: false, error: error instanceof Error ? error.message : 'Organization sign-in failed' }
+    }).finally(() => {
+      if (this.organizationSignIns.get(providerType)?.task === task) this.organizationSignIns.delete(providerType)
+    })
+    this.organizationSignIns.set(providerType, { task, epoch: this.organizationEpoch })
+    return task
+  }
+
+  private async exchangeOrganizationSignIn(providerType: ProviderId): Promise<ProviderResult<void>> {
+    const provider = this.providers.get(providerType)
+    if (!provider || !this.isOAuthProvider(provider) || !provider.signInWithOrganization ||
+        !getOrganizationModelProviderTypes().includes(providerType)) {
+      return { success: false, error: 'This account does not come with the organization sign-in.' }
+    }
+    const epoch = this.organizationEpoch
+    const proof = await this.organizationProof?.(providerType)
+    if (!proof) return { success: false, error: 'Sign in with your organization to use this account.' }
+    const before = findOrganizationSource(this.getDecryptedAiSources().sources, providerType)
+    const result = await provider.signInWithOrganization(proof, before?.accessToken || undefined)
+    const data = result.data as OAuthLoginPayload | undefined
+    if (!result.success || !data?._tokenData?.accessToken) {
+      return { success: false, error: result.error || 'Organization sign-in returned no access token' }
+    }
+    if (epoch !== this.organizationEpoch) {
+      void this.revoke({ ...before, provider: providerType, managedBy: 'organization', accessToken: data._tokenData.accessToken } as AISource)
+      return { success: false, error: 'The organization sign-in ended during sign-in.' }
+    }
+    // Never outlives the sign-in it came from.
+    const expiresAt = Math.min(data._tokenData.expiresAt ?? proof.expiresAt, proof.expiresAt)
+    this.handleOAuthLoginSuccess(providerType, { ...data, _tokenData: { ...data._tokenData, expiresAt } }, undefined, new Map(), true)
+    const uid = data._tokenData.uid || data.user?.uid
+    // The account follows whoever is signed in; the previous person's token goes.
+    if (before?.accessToken && before.user?.uid && uid !== before.user.uid) void this.revoke(before)
+    return { success: true }
+  }
+
+  private async revoke(source: AISource): Promise<void> {
+    const provider = this.providers.get(source.provider)
+    if (!provider || !this.isOAuthProvider(provider)) {
+      console.warn(`[AISourceManager] Token not revoked, provider unavailable: provider=${source.provider}`)
+      return
+    }
+    try {
+      await provider.logout(this.buildLegacyOAuthConfig(source))
+    } catch (error) {
+      console.warn(`[AISourceManager] Token revocation failed: provider=${source.provider}`, error)
+    }
+  }
+
   // ========== Token Management ==========
 
   /**
@@ -1178,6 +1314,7 @@ class AISourceManager {
       return { success: false, error: 'Source not found' }
     }
     if (source.authType !== 'oauth') return { success: true }
+    if (source.managedBy === 'organization') return this.ensureOrganizationToken(source)
     if (!source.accessToken) {
       console.warn(`[AISourceManager] Token preparation refused: source=${sourceId} account is not signed in`)
       return { success: false, error: 'Account is not signed in. Please sign in again.' }
@@ -1686,7 +1823,8 @@ class AISourceManager {
         modelCatalogCache: source.modelCatalogCache,
         accessToken: source.accessToken,
         refreshToken: source.refreshToken,
-        tokenExpires: source.tokenExpires
+        tokenExpires: source.tokenExpires,
+        ...(source.managedBy ? { managedBy: source.managedBy } : {})
       }
     }
   }

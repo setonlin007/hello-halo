@@ -57,7 +57,7 @@ import {
   isNativeConversationBusy,
 } from '../services/conversation-interop'
 import { setConversationInteropFactory } from '../services/agent/toolsets/broker'
-import { getAISourceManager, startGroupRouting, watchCatalogSignals, watchListedSources } from '../services/ai-sources'
+import { followOrganizationSignIn, getAISourceManager, startGroupRouting, watchCatalogSignals, watchListedSources } from '../services/ai-sources'
 import { setRequestCredentialResolver } from '../openai-compat-router'
 import { initSpaceMemoryConsolidation, disposeSpaceMemoryConsolidation } from '../services/memory-consolidation'
 import { markExtendedServicesReady } from './state'
@@ -66,7 +66,7 @@ import { initializeHealthSystem, setSessionCleanupFn } from '../services/health'
 import { closeAllV2Sessions, initializeSdkRuntime, closeSdkRuntime, requestSessionRebuild, getHeadlessElectronPath } from '../services/agent'
 import { initCliTools } from '../services/cli-tools'
 import { createCliToolSkillStartup } from './cli-tool-skills'
-import { getToolCredentialBindings, initEnterpriseIdentity, shutdownEnterpriseIdentity } from '../services/enterprise-identity'
+import { getToolCredentialBindings, initEnterpriseIdentity, issueModelAccountCredential, shutdownEnterpriseIdentity } from '../services/enterprise-identity'
 import { getBrowserSession } from '../services/browser-view.service'
 import { ENTERPRISE_IDENTITY_CHANGED_EVENT } from '../../shared/rpc/contracts/enterprise-identity.contract'
 import { registerHealthHandlers } from '../ipc/health'
@@ -1525,8 +1525,10 @@ export function initializeExtendedServices(): void {
     onDidChange: state => {
       sendToRenderer(ENTERPRISE_IDENTITY_CHANGED_EVENT, state)
       broadcastToAll(ENTERPRISE_IDENTITY_CHANGED_EVENT, { ...state })
+      followOrganizationSignIn(state)
     },
   })
+  getAISourceManager().setOrganizationSignIn(issueModelAccountCredential)
   // Paths only; the idle task prepares the store and writes launchers and skills.
   const supportFiles = loadProductConfig().cliTools?.supportFiles
   const cliRoot = join(app.getPath('userData'), 'cli')

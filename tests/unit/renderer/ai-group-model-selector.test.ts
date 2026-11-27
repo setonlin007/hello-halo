@@ -28,6 +28,7 @@ vi.mock('../../../src/renderer/i18n', () => ({
   getCurrentLanguage: () => 'en',
 }))
 vi.mock('../../../src/renderer/api', () => ({ api: env.api }))
+vi.mock('../../../src/renderer/hooks/useSourceDisplayName', () => ({ useSourceDisplayName: () => (source: { name: string }) => source.name }))
 vi.mock('../../../src/renderer/stores/app.store', () => ({
   useAppStore: Object.assign((select?: any) => select ? select(env.appState) : env.appState, { getState: () => env.appState }),
 }))

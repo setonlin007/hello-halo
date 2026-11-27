@@ -18,6 +18,7 @@ vi.mock('../../../src/renderer/i18n', () => ({
   getCurrentLanguage: () => 'en',
 }))
 vi.mock('../../../src/renderer/api', () => ({ api: {} }))
+vi.mock('../../../src/renderer/hooks/useSourceDisplayName', () => ({ useSourceDisplayName: () => (source: { name: string }) => source.name }))
 
 import { GroupCard } from '../../../src/renderer/components/ai-groups/GroupCard'
 import { GroupEditor } from '../../../src/renderer/components/ai-groups/GroupEditor'

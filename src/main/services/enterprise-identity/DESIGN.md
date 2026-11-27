@@ -79,9 +79,15 @@ subscribe to changes; remote clients reconcile once per authenticated socket.
 Login lists receive those providers marked `organizationSignIn` and offer the
 sign-in in their place. In Settings the sign-in sits among the AI model
 accounts: a login option while signed out, then one card that also presents
-the account marked `managedBy: 'organization'`. The composer shows one
-indicator for the sign-in and the selected model's quota. The host does not
-yet obtain such an account itself. An account declared with `directSignIn` is
+the account marked `managedBy: 'organization'`. Model pickers show that account
+under the sign-in's name. The composer shows one indicator for the sign-in and
+the selected model's quota. The AI sources manager signs those accounts in
+and out as the sign-in changes; for each it asks `issueModelAccountCredential`,
+which issues a credential for the account's `audience` while its `capability`
+is ready. That credential is returned to the caller only, never written to the
+credential directory, and is capped at the capability's expiry; a restore in
+progress is waited for briefly. The sign-in result never waits for these
+accounts. An account declared with `directSignIn` is
 passed to `beginSignIn` as an alternative; when the person picks it, the
 attempt ends with `{ alternative }` (only an id the host offered), which is not
 an organization sign-in. The renderer's sign-in store then runs that account's

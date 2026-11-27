@@ -17,6 +17,7 @@ vi.mock('../../../src/renderer/services/home-telemetry', () => ({ trackHome: vi.
 vi.mock('../../../src/renderer/components/ai-config/ThinkingLevelControl', () => ({ ThinkingLevelControl: () => null }))
 vi.mock('../../../src/renderer/i18n', () => ({ useTranslation: () => ({ t: (text: string) => text }) }))
 vi.mock('../../../src/renderer/api', () => ({ api: env.api }))
+vi.mock('../../../src/renderer/hooks/useSourceDisplayName', () => ({ useSourceDisplayName: () => (source: { name: string }) => source.name }))
 const fresh = vi.hoisted(() => vi.fn())
 vi.mock('../../../src/renderer/hooks/useFreshModelCatalogs', () => ({ useFreshModelCatalogs: fresh }))
 

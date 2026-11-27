@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const env = vi.hoisted(() => ({ runner: null as any, appState: {} as any }))
 
+vi.mock('../../../src/renderer/hooks/useSourceDisplayName', () => ({ useSourceDisplayName: () => (source: { name: string }) => source.name }))
 vi.mock('react', async original => ({
   ...await original<typeof import('react')>(),
   useState: (value: any) => env.runner.state(value),

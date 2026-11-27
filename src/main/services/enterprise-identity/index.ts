@@ -3,7 +3,7 @@ import { app, powerMonitor } from 'electron'
 import { promises as fsp } from 'fs'
 import { dirname, join } from 'path'
 import { pathToFileURL } from 'url'
-import type { EnterpriseIdentityProvider, OrgSignInAlternative } from '../../../shared/interfaces/enterprise-identity-provider'
+import type { EnterpriseIdentityProvider, OrgSignInAlternative, OrgToolCredential } from '../../../shared/interfaces/enterprise-identity-provider'
 import { resolveLocalizedText } from '../../../shared/types/ai-sources'
 import type { OrgSignInResult, OrgSignInState } from '../../../shared/types/enterprise-identity'
 import { getEnterpriseIdentityConfig, getProductConfigPath, type EnterpriseModelAccountConfig } from '../../foundation/product-config'
@@ -140,6 +140,17 @@ export function applyOrgSessionEnv(env: Record<string, string | undefined>): str
   const names = Object.keys(extra).sort()
   for (const name of names) env[name] = extra[name]
   return names.map(name => `${name}=${extra[name]}`).join('\n')
+}
+
+/**
+ * Proof of the current sign-in for a model account that comes with it, issued
+ * for the account's audience. Undefined without a ready sign-in.
+ */
+export async function issueModelAccountCredential(aiSourceType: string): Promise<OrgToolCredential | undefined> {
+  const accounts = getEnterpriseIdentityConfig()?.modelAccounts
+  const account = Array.isArray(accounts) ? accounts.find(item => item?.aiSourceType === aiSourceType) : undefined
+  if (typeof account?.audience !== 'string' || typeof account.capability !== 'string') return undefined
+  return getService()?.issueAccountCredential(account.audience, account.capability)
 }
 
 export async function retryEnterpriseIdentity(): Promise<OrgSignInState> {
